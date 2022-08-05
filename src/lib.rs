@@ -1,6 +1,8 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{builder::ValueHint, Parser};
 use log::debug;
 use url::Url;
@@ -27,5 +29,21 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     debug!("Args: {:#?}", args);
+
+    let mut urls = args.urls;
+
+    // Grab all urls from the provided file
+    if let Some(file) = args.url_file {
+        let file = File::open(file)?;
+        let reader = BufReader::new(file);
+
+        let mut file_urls: Vec<Url> = reader
+            .lines()
+            .map(|s| s.expect("Unable to parse line."))
+            .map(|l| Url::parse(&l).expect("Unable to parse url"))
+            .collect();
+        urls.append(&mut file_urls);
+    };
+
     Ok(())
 }
