@@ -7,8 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
+use indicatif::ParallelProgressIterator;
 use log::{debug, info, trace, warn};
-use rayon::prelude::*;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
@@ -87,6 +88,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let feeds: Vec<Feed> = urls
         .par_iter()
+        .progress_count(urls.len() as u64)
         .filter_map(|url| {
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
@@ -134,13 +136,15 @@ pub fn run(args: Args) -> Result<()> {
                     {
                         let summary = match item.description() {
                             Some(s) => s.to_string(),
-                            None => match item.content() {
-                                Some(s) => s.to_string(),
-                                None => {
-                                    warn!("Skipping `{}`, no summary or content.", link);
-                                    continue;
+                            None => {
+                                match item.content() {
+                                    Some(s) => s.to_string(),
+                                    None => {
+                                        warn!("Skipping `{}`, no summary or content provided in feed.", link);
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                         };
                         let safe_summary = ammonia::clean(&summary);
                         articles.push(Article {
