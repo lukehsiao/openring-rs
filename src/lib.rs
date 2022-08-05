@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
-use indicatif::ParallelProgressIterator;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, info, trace, warn};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
@@ -86,10 +86,16 @@ pub fn run(args: Args) -> Result<()> {
         .user_agent(concat!(crate_name!(), '/', crate_version!()))
         .build();
 
+    let m = MultiProgress::new();
+
     let feeds: Vec<Feed> = urls
         .par_iter()
-        .progress_count(urls.len() as u64)
-        .filter_map(|url| {
+        .enumerate()
+        .filter_map(|(idx, url)| {
+            let pb = m.add(ProgressBar::new(2));
+            pb.set_style(ProgressStyle::with_template("{prefix:.bold.dim} {wide_msg}").unwrap());
+            pb.set_prefix(format!("[{}/{}]", idx, urls.len()));
+            pb.set_message(url.as_str().to_string());
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
                 Err(e) => {
@@ -97,10 +103,12 @@ pub fn run(args: Args) -> Result<()> {
                     None
                 }
             };
+            pb.inc(1);
+
             if let Some(feed_str) = body {
                 match feed_str.parse::<Feed>() {
                     Ok(feed) => {
-                        debug!("Fetched: `{}`", url);
+                        pb.finish_and_clear();
                         Some(feed)
                     }
                     Err(e) => {
@@ -109,14 +117,20 @@ pub fn run(args: Args) -> Result<()> {
                             url.as_str(),
                             e
                         );
+                        pb.finish_with_message(format!(
+                            "Failed to parse feed from `{}`",
+                            url.as_str()
+                        ));
                         None
                     }
                 }
             } else {
+                pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
                 None
             }
         })
         .collect();
+    m.clear()?;
 
     let mut articles = Vec::new();
     for feed in feeds {
@@ -136,15 +150,13 @@ pub fn run(args: Args) -> Result<()> {
                     {
                         let summary = match item.description() {
                             Some(s) => s.to_string(),
-                            None => {
-                                match item.content() {
-                                    Some(s) => s.to_string(),
-                                    None => {
-                                        warn!("Skipping `{}`, no summary or content provided in feed.", link);
-                                        continue;
-                                    }
+                            None => match item.content() {
+                                Some(s) => s.to_string(),
+                                None => {
+                                    warn!("Skipping `{}` from `{}`, no summary or content provided in feed.", link, source_link);
+                                    continue;
                                 }
-                            }
+                            },
                         };
                         let safe_summary = ammonia::clean(&summary);
                         articles.push(Article {
@@ -182,6 +194,7 @@ pub fn run(args: Args) -> Result<()> {
                                 None => match item.content().map(|c| c.value()) {
                                     Some(Some(v)) => v.to_string(),
                                     _ => {
+                                        warn!("Skipping `{}` from `{}`, no summary or content provided in feed.", item.links()[0].href(), source_link);
                                         continue;
                                     }
                                 },
@@ -224,7 +237,6 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
-    info!("Grabbed all articles.");
 
     articles.sort_unstable_by(|a, b| a.date.cmp(&b.date).reverse());
     let articles = if articles.len() >= args.num_articles {
