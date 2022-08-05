@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
+use anyhow::Result;
 use clap::{builder::ValueHint, Parser};
+use log::debug;
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -23,9 +25,10 @@ struct Args {
     urls: Vec<Url>,
 }
 
-fn main() {
+fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
+    debug!("Args: {:#?}", args);
 
-    dbg!(args);
-    println!("Hello, world!");
+    Ok(())
 }
