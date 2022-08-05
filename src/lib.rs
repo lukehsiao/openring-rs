@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use log::{debug, info, trace, warn};
+use rayon::prelude::*;
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
@@ -85,7 +86,7 @@ pub fn run(args: Args) -> Result<()> {
         .build();
 
     let feeds: Vec<Feed> = urls
-        .iter()
+        .par_iter()
         .filter_map(|url| {
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
