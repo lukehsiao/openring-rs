@@ -5,14 +5,23 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{serde::ts_seconds, DateTime, Utc};
+use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use log::{debug, info, trace, warn};
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
+use thiserror::Error;
 use ureq::{Agent, AgentBuilder};
 use url::Url;
+
+#[derive(Error, Debug)]
+pub enum OpenringError {
+    #[error("No valid published or updated date found.")]
+    DateError,
+    #[error(transparent)]
+    ChronoError(#[from] chrono::ParseError),
+}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -41,12 +50,11 @@ pub struct Article {
     summary: String,
     source_link: Url,
     source_title: String,
-    #[serde(with = "ts_seconds")]
-    date: DateTime<Utc>,
+    date: DateTime<FixedOffset>,
 }
 
 pub fn run(args: Args) -> Result<()> {
-    debug!("Args: {:#?}", args);
+    trace!("Args: {:#?}", args);
     let mut urls = args.urls;
 
     if let Some(file) = args.url_file {
@@ -60,7 +68,10 @@ pub fn run(args: Args) -> Result<()> {
             .collect();
         urls.append(&mut file_urls);
     };
-    debug!("Fetching these urls: {:#?}", urls);
+    debug!(
+        "Fetching these urls: {:#?}",
+        urls.iter().map(|url| url.as_str()).collect::<Vec<&str>>()
+    );
 
     let template = fs::read_to_string(&args.template_file)
         .with_context(|| format!("Failed to read file `{:?}`", args.template_file))?;
@@ -69,7 +80,7 @@ pub fn run(args: Args) -> Result<()> {
     info!("Fetching feeds...");
 
     let agent: Agent = AgentBuilder::new()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .user_agent(concat!(crate_name!(), '/', crate_version!()))
         .build();
 
@@ -85,7 +96,10 @@ pub fn run(args: Args) -> Result<()> {
             };
             if let Some(feed_str) = body {
                 match feed_str.parse::<Feed>() {
-                    Ok(feed) => Some(feed),
+                    Ok(feed) => {
+                        debug!("Fetched: `{}`", url);
+                        Some(feed)
+                    }
                     Err(e) => {
                         warn!(
                             "Failed to parse RSS/Atom feed from `{}`\n\nCaused By:\n{}",
@@ -105,8 +119,13 @@ pub fn run(args: Args) -> Result<()> {
     for feed in feeds {
         match feed {
             Feed::RSS(c) => {
-                let items = &c.items()[0..args.per_source];
-                let source_link = Url::parse(c.link())?;
+                let items = if c.items().len() >= args.per_source {
+                    &c.items()[0..args.per_source]
+                } else {
+                    c.items()
+                };
+                let source_link = Url::parse(c.link())
+                    .with_context(|| format!("Unabled to parse url `{}`", c.link()))?;
                 let source_title = c.title().to_string();
                 for item in items {
                     if let (Some(link), Some(title), Some(date)) =
@@ -124,12 +143,16 @@ pub fn run(args: Args) -> Result<()> {
                         };
                         let safe_summary = ammonia::clean(&summary);
                         articles.push(Article {
-                            link: Url::parse(link)?,
+                            link: Url::parse(link)
+                                .with_context(|| format!("Unabled to parse url `{}`", c.link()))?,
                             title: title.to_string(),
                             summary: safe_summary,
                             source_link: source_link.clone(),
                             source_title: source_title.clone(),
-                            date: date.parse::<DateTime<Utc>>()?,
+                            date: date
+                                .parse::<DateTime<FixedOffset>>()
+                                .or_else(|_| DateTime::parse_from_rfc2822(date))
+                                .with_context(|| format!("Unabled to parse date `{}`", date))?,
                         });
                     } else {
                         debug!("Skipping `{:#?}`, must have link, title, and date", item);
@@ -143,7 +166,9 @@ pub fn run(args: Args) -> Result<()> {
                     trace!("Feed links: {:#?}", feed_links);
 
                     // TODO: just using the first for simplicity
-                    let source_link = Url::parse(f.links()[0].href())?;
+                    let source_link = Url::parse(f.links()[0].href()).with_context(|| {
+                        format!("Unabled to parse url `{}`", f.links()[0].href())
+                    })?;
                     let source_title = f.title().to_string();
                     for item in items {
                         if !item.links().is_empty() {
@@ -157,14 +182,34 @@ pub fn run(args: Args) -> Result<()> {
                                 },
                             };
                             let safe_summary = ammonia::clean(&summary);
-                            let link = Url::parse(item.links()[0].href())?;
+                            let link = Url::parse(item.links()[0].href()).with_context(|| {
+                                format!("Unabled to parse url `{}`", f.links()[0].href())
+                            })?;
                             articles.push(Article {
                                 link,
                                 title: item.title().to_string(),
                                 summary: safe_summary,
                                 source_link: source_link.clone(),
                                 source_title: source_title.clone(),
-                                date: item.updated().parse::<DateTime<Utc>>()?,
+                                date: item
+                                    .updated()
+                                    .parse::<DateTime<FixedOffset>>()
+                                    .or_else(|_| DateTime::parse_from_rfc2822(item.updated()))
+                                    .or_else(|_| {
+                                        debug!(
+                                            "Using published date, rather than last updated date."
+                                        );
+                                        if let Some(date) = item.published() {
+                                            date.parse::<DateTime<FixedOffset>>()
+                                                .or_else(|_| DateTime::parse_from_rfc2822(date))
+                                                .map_err(OpenringError::ChronoError)
+                                        } else {
+                                            Err(OpenringError::DateError)
+                                        }
+                                    })
+                                    .with_context(|| {
+                                        format!("Unabled to parse date `{}`", item.updated())
+                                    })?,
                             });
                         } else {
                             debug!("Skipping `{:#?}`, must have links", item);
@@ -174,9 +219,14 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
+    info!("Grabbed all articles.");
 
     articles.sort_unstable_by(|a, b| a.date.cmp(&b.date).reverse());
-    let articles = &articles[0..args.num_articles];
+    let articles = if articles.len() >= args.num_articles {
+        &articles[0..args.num_articles]
+    } else {
+        &articles
+    };
 
     context.insert("articles", articles);
     // TODO: this validation of the template should come before all the time spent fetching feeds.

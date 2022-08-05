@@ -745,6 +745,7 @@ dependencies = [
  "serde_json",
  "syndication",
  "tera",
+ "thiserror",
  "ureq",
  "url",
 ]
