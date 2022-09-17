@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -21,6 +21,8 @@ use url::Url;
 pub enum OpenringError {
     #[error("No valid published or updated date found.")]
     DateError,
+    #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
+    FeedMissing,
     #[error(transparent)]
     ChronoError(#[from] chrono::ParseError),
 }
@@ -34,7 +36,7 @@ pub struct Args {
     /// Number of most recent articles to get from each feed
     #[clap(short, long, value_parser, default_value_t = 1)]
     per_source: usize,
-    /// File with URLs of RSS feeds to read
+    /// File with URLs of RSS feeds to read (one URL per line)
     #[clap(short = 'S', long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
     url_file: Option<PathBuf>,
     /// Tera template file
@@ -74,6 +76,10 @@ pub fn run(args: Args) -> Result<()> {
         "Fetching these urls: {:#?}",
         urls.iter().map(|url| url.as_str()).collect::<Vec<&str>>()
     );
+
+    if urls.is_empty() {
+        bail!(OpenringError::FeedMissing)
+    }
 
     let template = fs::read_to_string(&args.template_file)
         .with_context(|| format!("Failed to read file `{:?}`", args.template_file))?;
