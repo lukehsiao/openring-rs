@@ -22,7 +22,7 @@ OPTIONS:
     -n, --num-articles <NUM_ARTICLES>    Total number of articles to fetch [default: 3]
     -p, --per-source <PER_SOURCE>        Number of most recent articles to get from each feed [default: 1]
     -s, --urls <URLS>                    A specific URL to consider (can be repeated)
-    -S, --url-file <FILE>                File with URLs of RSS feeds to read
+    -S, --url-file <FILE>                File with URLs of RSS feeds to read (one URL per line)
     -t, --template-file <FILE>           Tera template file
     -V, --version                        Print version information
 ```
