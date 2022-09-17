@@ -2,6 +2,13 @@
 name = "openring"
 version = "0.1.0"
 edition = "2021"
+authors = ["Luke Hsiao <luke@hsiao.dev>"]
+description = "A webring for static site generators written in Rust"
+repository = "https://github.com/lukehsiao/openring-rs"
+homepage = "https://github.com/lukehsiao/openring-rs"
+license = "MIT OR Apache-2.0"
+keywords = ["webring"]
+categories = ["command-line-utilities"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
