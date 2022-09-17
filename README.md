@@ -9,6 +9,12 @@ primary differences being:
 articles from those feeds and embed them in your own blog. An example template is provided in
 `in.html`.
 
+## Install
+
+```
+cargo install openring
+```
+
 ## Usage
 
 ```
