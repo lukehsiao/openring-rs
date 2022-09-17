@@ -94,6 +94,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let m = MultiProgress::new();
 
+    // TODO: this could be done concurrently
     let feeds: Vec<Feed> = urls
         .par_iter()
         .enumerate()
