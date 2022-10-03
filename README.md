@@ -18,19 +18,18 @@ cargo install openring
 ## Usage
 
 ```
-openring 0.1.0
+A webring for static site generators written in Rust
 
-USAGE:
-    openring [OPTIONS] --template-file <FILE>
+Usage: openring [OPTIONS] --template-file <FILE>
 
-OPTIONS:
-    -h, --help                           Print help information
-    -n, --num-articles <NUM_ARTICLES>    Total number of articles to fetch [default: 3]
-    -p, --per-source <PER_SOURCE>        Number of most recent articles to get from each feed [default: 1]
-    -s, --urls <URLS>                    A specific URL to consider (can be repeated)
-    -S, --url-file <FILE>                File with URLs of RSS feeds to read (one URL per line)
-    -t, --template-file <FILE>           Tera template file
-    -V, --version                        Print version information
+Options:
+  -n, --num-articles <NUM_ARTICLES>  Total number of articles to fetch [default: 3]
+  -p, --per-source <PER_SOURCE>      Number of most recent articles to get from each feed [default: 1]
+  -S, --url-file <FILE>              File with URLs of RSS feeds to read (one URL per line)
+  -t, --template-file <FILE>         Tera template file
+  -s, --urls <URLS>                  A specific URL to consider (can be repeated)
+  -h, --help                         Print help information
+  -V, --version                      Print version information
 ```
 
 ## Using Tera Templates

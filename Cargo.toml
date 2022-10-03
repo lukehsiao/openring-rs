@@ -16,7 +16,7 @@ categories = ["command-line-utilities"]
 ammonia = "3.2.1"
 anyhow = "1.0.65"
 chrono = { version = "0.4.22", features = ["serde"] }
-clap = { version = "3.2.22", features = ["derive", "wrap_help", "cargo"] }
+clap = { version = "4.0.8", features = ["derive", "wrap_help", "cargo"] }
 env_logger = "0.9.0"
 indicatif = { version = "0.17.1", features = ["rayon"] }
 log = "0.4.17"

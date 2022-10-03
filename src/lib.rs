@@ -28,22 +28,22 @@ pub enum OpenringError {
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about)]
+#[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Total number of articles to fetch
-    #[clap(short, long, value_parser, default_value_t = 3)]
+    #[arg(short, long, default_value_t = 3)]
     num_articles: usize,
     /// Number of most recent articles to get from each feed
-    #[clap(short, long, value_parser, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 1)]
     per_source: usize,
     /// File with URLs of RSS feeds to read (one URL per line)
-    #[clap(short = 'S', long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
+    #[arg(short = 'S', long, value_name = "FILE", value_hint=ValueHint::FilePath)]
     url_file: Option<PathBuf>,
     /// Tera template file
-    #[clap(short, long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
+    #[arg(short, long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
     template_file: PathBuf,
     /// A specific URL to consider (can be repeated)
-    #[clap(short = 's', long, value_parser, value_hint=ValueHint::Url)]
+    #[arg(short = 's', long, value_hint=ValueHint::Url)]
     urls: Vec<Url>,
 }
 
