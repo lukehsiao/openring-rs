@@ -167,7 +167,7 @@ pub fn run(args: Args) -> Result<()> {
                                 }
                             },
                         };
-                        let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
+                        let safe_summary = ammonia::clean(&summary).replace("&nbsp;", "");
                         articles.push(Article {
                             link: Url::parse(link)
                                 .with_context(|| format!("Unabled to parse url `{}`", c.link()))?,
@@ -212,7 +212,7 @@ pub fn run(args: Args) -> Result<()> {
                                     }
                                 },
                             };
-                            let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
+                            let safe_summary = ammonia::clean(&summary).replace("&nbsp;", "");
                             // Uses the last link, since blogspot puts the article link last.
                             let link = Url::parse(
                                 item.links()
