@@ -1,5 +1,5 @@
 <h1 align="center">
-    :chains:<br>
+    ⛓<br>
     openring-rs
 </h1>
 
