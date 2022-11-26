@@ -1,4 +1,13 @@
-# openring-rs
+<h1 align="center">
+    :chains:<br>
+    openring-rs
+</h1>
+
+<div align="center">
+    <strong>A tool for generating a webring from RSS feeds.</strong>
+</div>
+<br>
+<br>
 
 This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the
 primary differences being:
