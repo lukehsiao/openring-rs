@@ -1,15 +1,27 @@
 use anyhow::Result;
 
 use clap::Parser;
+
 use openring::{self, Args};
 
 fn main() -> Result<()> {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "openring=warn,html5ever=off")
-    }
-    env_logger::init();
     let args = Args::parse();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(convert_filter(args.verbose.log_level_filter()))
+        .init();
+
     openring::run(args)
+}
+
+fn convert_filter(filter: log::LevelFilter) -> String {
+    let filter = match filter {
+        log::LevelFilter::Off => "off",
+        log::LevelFilter::Error => "error",
+        log::LevelFilter::Warn => "warn",
+        log::LevelFilter::Info => "info",
+        log::LevelFilter::Debug => "debug",
+        log::LevelFilter::Trace => "trace",
+    };
+    format!("openring={},html5ever=off,ureq=off", filter)
 }

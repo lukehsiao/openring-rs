@@ -7,13 +7,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
+use clap_verbosity_flag::Verbosity;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, info, trace, warn};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
 use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 use ureq::{Agent, AgentBuilder};
 use url::Url;
 
@@ -45,6 +46,8 @@ pub struct Args {
     /// A specific URL to consider (can be repeated)
     #[arg(short = 's', long, value_hint=ValueHint::Url)]
     urls: Vec<Url>,
+    #[clap(flatten)]
+    pub verbose: Verbosity,
 }
 
 #[derive(Serialize, Debug)]
@@ -94,7 +97,6 @@ pub fn run(args: Args) -> Result<()> {
 
     let m = MultiProgress::new();
 
-    // TODO: this could be done concurrently
     let feeds: Vec<Feed> = urls
         .par_iter()
         .enumerate()

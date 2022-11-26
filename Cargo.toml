@@ -17,7 +17,7 @@ ammonia = "3.2.1"
 anyhow = "1.0.66"
 chrono = { version = "0.4.23", features = ["serde"] }
 clap = { version = "4.0.27", features = ["derive", "wrap_help", "cargo"] }
-env_logger = "0.10.0"
+clap-verbosity-flag = "2.0.0"
 indicatif = { version = "0.17.2", features = ["rayon"] }
 log = "0.4.17"
 rayon = "1.6.0"
@@ -26,5 +26,7 @@ serde_json = "1.0.89"
 syndication = "0.5.0"
 tera = "1.17.1"
 thiserror = "1.0.37"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
 ureq = "2.5.0"
 url = { version = "2.3.1", features = ["serde"] }
