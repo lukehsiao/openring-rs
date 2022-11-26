@@ -209,9 +209,11 @@ pub fn run(args: Args) -> Result<()> {
                                 },
                             };
                             let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
-                            let link = Url::parse(item.links()[0].href()).with_context(|| {
-                                format!("Unabled to parse url `{}`", f.links()[0].href())
-                            })?;
+                            // Uses the last link, since blogspot puts the article link last.
+                            let link = Url::parse(item.links().last().unwrap().href())
+                                .with_context(|| {
+                                    format!("Unabled to parse url `{}`", f.links()[0].href())
+                                })?;
                             articles.push(Article {
                                 link,
                                 title: item.title().to_string(),
