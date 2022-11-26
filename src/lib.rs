@@ -167,7 +167,7 @@ pub fn run(args: Args) -> Result<()> {
                                 }
                             },
                         };
-                        let safe_summary = ammonia::clean(&summary);
+                        let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
                         articles.push(Article {
                             link: Url::parse(link)
                                 .with_context(|| format!("Unabled to parse url `{}`", c.link()))?,
@@ -208,7 +208,7 @@ pub fn run(args: Args) -> Result<()> {
                                     }
                                 },
                             };
-                            let safe_summary = ammonia::clean(&summary);
+                            let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
                             let link = Url::parse(item.links()[0].href()).with_context(|| {
                                 format!("Unabled to parse url `{}`", f.links()[0].href())
                             })?;
