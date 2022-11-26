@@ -1,3 +1,13 @@
+## 0.1.4 - 2022-11-26
+
+### Bug Fixes
+- Properly decode html entities
+
+See the commits here: [0.1.4]
+
+[0.1.4]: https://github.com/lukehsiao/openring-rs/compare/v0.1.3...v0.1.4
+
+
 ## 0.1.3 - 2022-11-26
 
 ### Bug Fixes
