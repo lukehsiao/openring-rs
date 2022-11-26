@@ -1,3 +1,13 @@
+## 0.1.5 - 2022-11-26
+
+### Bug Fixes
+- Trim whitespace around summaries
+
+See the commits here: [0.1.5]
+
+[0.1.5]: https://github.com/lukehsiao/openring-rs/compare/v0.1.4...v0.1.5
+
+
 ## 0.1.4 - 2022-11-26
 
 ### Bug Fixes
