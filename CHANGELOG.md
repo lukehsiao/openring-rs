@@ -1,3 +1,13 @@
+## 0.1.3 - 2022-11-26
+
+### Bug Fixes
+- Include the semicolon when stripping nbsp
+
+See the commits here: [0.1.3]
+
+[0.1.3]: https://github.com/lukehsiao/openring-rs/compare/v0.1.2...v0.1.3
+
+
 ## 0.1.2 - 2022-11-26
 
 ### Bug Fixes
