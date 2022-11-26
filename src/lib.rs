@@ -191,10 +191,14 @@ pub fn run(args: Args) -> Result<()> {
                 if !feed_links.is_empty() {
                     trace!("Feed links: {:#?}", feed_links);
 
-                    // TODO: just using the first for simplicity
-                    let source_link = Url::parse(f.links()[0].href()).with_context(|| {
-                        format!("Unabled to parse url `{}`", f.links()[0].href())
-                    })?;
+                    let source_link = Url::parse(
+                        f.links()
+                            .iter()
+                            .find(|l| l.rel() == "alternate")
+                            .unwrap()
+                            .href(),
+                    )
+                    .with_context(|| format!("Unabled to parse url `{}`", f.links()[0].href()))?;
                     let source_title = f.title().to_string();
                     for item in items {
                         if !item.links().is_empty() {
@@ -210,10 +214,16 @@ pub fn run(args: Args) -> Result<()> {
                             };
                             let safe_summary = ammonia::clean(&summary).replace("&nbsp", "");
                             // Uses the last link, since blogspot puts the article link last.
-                            let link = Url::parse(item.links().last().unwrap().href())
-                                .with_context(|| {
-                                    format!("Unabled to parse url `{}`", f.links()[0].href())
-                                })?;
+                            let link = Url::parse(
+                                item.links()
+                                    .iter()
+                                    .find(|l| l.rel() == "alternate")
+                                    .unwrap()
+                                    .href(),
+                            )
+                            .with_context(|| {
+                                format!("Unabled to parse url `{}`", f.links()[0].href())
+                            })?;
                             articles.push(Article {
                                 link,
                                 title: item.title().to_string(),
