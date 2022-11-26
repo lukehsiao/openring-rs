@@ -172,12 +172,11 @@ pub fn run(args: Args) -> Result<()> {
                             ammonia::clean(&summary),
                             &mut safe_summary,
                         );
-                        warn!("summary: {:#?}", safe_summary);
                         articles.push(Article {
                             link: Url::parse(link)
                                 .with_context(|| format!("Unabled to parse url `{}`", c.link()))?,
                             title: title.to_string(),
-                            summary: safe_summary.to_string(),
+                            summary: safe_summary.trim().to_string(),
                             source_link: source_link.clone(),
                             source_title: source_title.clone(),
                             date: date
@@ -222,7 +221,6 @@ pub fn run(args: Args) -> Result<()> {
                                 ammonia::clean(&summary),
                                 &mut safe_summary,
                             );
-                            warn!("summary: {:#?}", safe_summary);
                             // Uses the last link, since blogspot puts the article link last.
                             let link = Url::parse(
                                 item.links()
@@ -237,7 +235,7 @@ pub fn run(args: Args) -> Result<()> {
                             articles.push(Article {
                                 link,
                                 title: item.title().to_string(),
-                                summary: safe_summary.to_string(),
+                                summary: safe_summary.trim().to_string(),
                                 source_link: source_link.clone(),
                                 source_title: source_title.clone(),
                                 date: item
