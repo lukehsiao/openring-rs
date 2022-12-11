@@ -1,3 +1,13 @@
+## 0.1.6 - 2022-12-11
+
+### Features
+- Add `--before` to allow filtering to posts before a given date
+
+See the commits here: [0.1.6]
+
+[0.1.6]: https://github.com/lukehsiao/openring-rs/compare/v0.1.5...v0.1.6
+
+
 ## 0.1.5 - 2022-11-26
 
 ### Bug Fixes
