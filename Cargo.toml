@@ -1,6 +1,6 @@
 [package]
 name = "openring"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["Luke Hsiao <luke@hsiao.dev>"]
 description = "A webring for static site generators written in Rust"
