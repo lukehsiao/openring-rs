@@ -10,7 +10,6 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(convert_filter(args.verbose.log_level_filter()))
         .init();
-
     openring::run(args)
 }
 

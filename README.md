@@ -13,6 +13,8 @@ This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 primary differences being:
 - the template is provided as a argument, not read from stdin
 - we show a little progress bar
+- we fetch all feeds concurrently
+- we allow filtering feeds with `--before`.
 
 `openring-rs` is a tool for generating a webring from RSS feeds, so you can populate a template with
 articles from those feeds and embed them in your own blog. An example template is provided in
@@ -37,7 +39,10 @@ Options:
   -S, --url-file <FILE>              File with URLs of RSS feeds to read (one URL per line)
   -t, --template-file <FILE>         Tera template file
   -s, --urls <URLS>                  A specific URL to consider (can be repeated)
-  -h, --help                         Print help information
+  -b, --before <BEFORE>              Only include articles before this date (in YYYY-MM-DD format)
+  -v, --verbose...                   More output per occurrence
+  -q, --quiet...                     Less output per occurrence
+  -h, --help                         Print help information (use `--help` for more detail)
   -V, --version                      Print version information
 ```
 

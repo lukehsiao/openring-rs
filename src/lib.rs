@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, FixedOffset};
+use chrono::{naive::NaiveDate, DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::Verbosity;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -46,6 +46,13 @@ pub struct Args {
     /// A specific URL to consider (can be repeated)
     #[arg(short = 's', long, value_hint=ValueHint::Url)]
     urls: Vec<Url>,
+    /// Only include articles before this date (in YYYY-MM-DD format).
+    ///
+    /// This is naive (no timezone), so articles close to the boundary in different timezones might
+    /// be unexpectedly filtered. In addition, some feeds are truncated, and may have already pruned
+    /// away articles before this date from the feed itself.
+    #[arg(short, long, value_parser = parse_naive_date)]
+    before: Option<NaiveDate>,
     #[clap(flatten)]
     pub verbose: Verbosity,
 }
@@ -58,6 +65,10 @@ pub struct Article {
     source_link: Url,
     source_title: String,
     date: DateTime<FixedOffset>,
+}
+
+fn parse_naive_date(input: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(input, "%Y-%m-%d").map_err(|e| e.into())
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -157,6 +168,18 @@ pub fn run(args: Args) -> Result<()> {
                     if let (Some(link), Some(title), Some(date)) =
                         (item.link(), item.title(), item.pub_date())
                     {
+                        let date = date
+                            .parse::<DateTime<FixedOffset>>()
+                            .or_else(|_| DateTime::parse_from_rfc2822(date))
+                            .with_context(|| format!("Unabled to parse date `{}`", date))?;
+
+                        // Skip articles after args.before, if present
+                        if let Some(before) = args.before {
+                            if date.date_naive() > before {
+                                continue;
+                            }
+                        }
+
                         let summary = match item.description() {
                             Some(s) => s.to_string(),
                             None => match item.content() {
@@ -179,10 +202,7 @@ pub fn run(args: Args) -> Result<()> {
                             summary: safe_summary.trim().to_string(),
                             source_link: source_link.clone(),
                             source_title: source_title.clone(),
-                            date: date
-                                .parse::<DateTime<FixedOffset>>()
-                                .or_else(|_| DateTime::parse_from_rfc2822(date))
-                                .with_context(|| format!("Unabled to parse date `{}`", date))?,
+                            date,
                         });
                     } else {
                         debug!("Skipping `{:#?}`, must have link, title, and date", item);
@@ -206,6 +226,31 @@ pub fn run(args: Args) -> Result<()> {
                     let source_title = f.title().to_string();
                     for item in items {
                         if !item.links().is_empty() {
+                            let date = item
+                                .updated()
+                                .parse::<DateTime<FixedOffset>>()
+                                .or_else(|_| DateTime::parse_from_rfc2822(item.updated()))
+                                .or_else(|_| {
+                                    debug!("Using published date, rather than last updated date.");
+                                    if let Some(date) = item.published() {
+                                        date.parse::<DateTime<FixedOffset>>()
+                                            .or_else(|_| DateTime::parse_from_rfc2822(date))
+                                            .map_err(OpenringError::ChronoError)
+                                    } else {
+                                        Err(OpenringError::DateError)
+                                    }
+                                })
+                                .with_context(|| {
+                                    format!("Unabled to parse date `{}`", item.updated())
+                                })?;
+
+                            // Skip articles after args.before, if present
+                            if let Some(before) = args.before {
+                                if date.date_naive() > before {
+                                    continue;
+                                }
+                            }
+
                             let summary = match item.summary() {
                                 Some(s) => s.to_string(),
                                 None => match item.content().map(|c| c.value()) {
@@ -216,11 +261,13 @@ pub fn run(args: Args) -> Result<()> {
                                     }
                                 },
                             };
+
                             let mut safe_summary = String::new();
                             html_escape::decode_html_entities_to_string(
                                 ammonia::clean(&summary),
                                 &mut safe_summary,
                             );
+                            warn!("{:#?}", safe_summary);
                             // Uses the last link, since blogspot puts the article link last.
                             let link = Url::parse(
                                 item.links()
@@ -238,25 +285,7 @@ pub fn run(args: Args) -> Result<()> {
                                 summary: safe_summary.trim().to_string(),
                                 source_link: source_link.clone(),
                                 source_title: source_title.clone(),
-                                date: item
-                                    .updated()
-                                    .parse::<DateTime<FixedOffset>>()
-                                    .or_else(|_| DateTime::parse_from_rfc2822(item.updated()))
-                                    .or_else(|_| {
-                                        debug!(
-                                            "Using published date, rather than last updated date."
-                                        );
-                                        if let Some(date) = item.published() {
-                                            date.parse::<DateTime<FixedOffset>>()
-                                                .or_else(|_| DateTime::parse_from_rfc2822(date))
-                                                .map_err(OpenringError::ChronoError)
-                                        } else {
-                                            Err(OpenringError::DateError)
-                                        }
-                                    })
-                                    .with_context(|| {
-                                        format!("Unabled to parse date `{}`", item.updated())
-                                    })?,
+                                date,
                             });
                         } else {
                             debug!("Skipping `{:#?}`, must have links", item);
@@ -280,4 +309,14 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("Failed to parse Tera template:\n{}", template))?;
     println!("{output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use crate::*;
+    #[test]
+    fn verify_app() {
+        use clap::CommandFactory;
+        Args::command().debug_assert()
+    }
 }
