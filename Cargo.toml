@@ -13,21 +13,21 @@ categories = ["command-line-utilities"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ammonia = "3.2.1"
-anyhow = "1.0.66"
-chrono = { version = "0.4.23", features = ["serde"] }
-clap = { version = "4.0.27", features = ["derive", "wrap_help", "cargo"] }
-clap-verbosity-flag = "2.0.0"
-html-escape = "0.2.12"
-indicatif = { version = "0.17.2", features = ["rayon"] }
+ammonia = "3.3.0"
+anyhow = "1.0.70"
+chrono = { version = "0.4.24", features = ["serde"] }
+clap = { version = "4.2.4", features = ["derive", "wrap_help", "cargo"] }
+clap-verbosity-flag = "2.0.1"
+html-escape = "0.2.13"
+indicatif = { version = "0.17.3", features = ["rayon"] }
 log = "0.4.17"
-rayon = "1.6.0"
-serde = { version = "1.0.147", features = ["derive"] }
-serde_json = "1.0.89"
+rayon = "1.7.0"
+serde = { version = "1.0.160", features = ["derive"] }
+serde_json = "1.0.96"
 syndication = "0.5.0"
-tera = "1.17.1"
-thiserror = "1.0.37"
+tera = "1.18.1"
+thiserror = "1.0.40"
 tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt"] }
-ureq = "2.5.0"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt"] }
+ureq = "2.6.2"
 url = { version = "2.3.1", features = ["serde"] }
