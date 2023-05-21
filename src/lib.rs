@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use chrono::{naive::NaiveDate, DateTime, FixedOffset};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
-use clap_verbosity_flag::Verbosity;
+use clap_verbosity_flag::{Verbosity, WarnLevel};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
@@ -54,7 +54,7 @@ pub struct Args {
     #[arg(short, long, value_parser = parse_naive_date)]
     before: Option<NaiveDate>,
     #[clap(flatten)]
-    pub verbose: Verbosity,
+    pub verbose: Verbosity<WarnLevel>,
 }
 
 #[derive(Serialize, Debug)]
@@ -267,7 +267,7 @@ pub fn run(args: Args) -> Result<()> {
                                 ammonia::clean(&summary),
                                 &mut safe_summary,
                             );
-                            warn!("{:#?}", safe_summary);
+                            info!("{:#?}", safe_summary);
                             // Uses the last link, since blogspot puts the article link last.
                             let link = Url::parse(
                                 item.links()
