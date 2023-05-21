@@ -4,8 +4,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use chrono::{naive::NaiveDate, DateTime, FixedOffset};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{
+    naive::{NaiveDate, NaiveDateTime},
+    DateTime, FixedOffset, Local, TimeZone,
+};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -171,6 +174,17 @@ pub fn run(args: Args) -> Result<()> {
                         let date = date
                             .parse::<DateTime<FixedOffset>>()
                             .or_else(|_| DateTime::parse_from_rfc2822(date))
+                            .or_else(|_| {
+                                let naive_dt =
+                                    NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S")?;
+                                let fixed_offset =
+                                    FixedOffset::east_opt(Local::now().offset().local_minus_utc())
+                                        .unwrap();
+                                fixed_offset
+                                    .from_local_datetime(&naive_dt)
+                                    .earliest()
+                                    .ok_or(anyhow!("Failed to parse naive datetime."))
+                            })
                             .with_context(|| format!("Failed to parse date `{}`", date))?;
 
                         // Skip articles after args.before, if present
@@ -231,13 +245,45 @@ pub fn run(args: Args) -> Result<()> {
                                 .parse::<DateTime<FixedOffset>>()
                                 .or_else(|_| DateTime::parse_from_rfc2822(item.updated()))
                                 .or_else(|_| {
+                                    let naive_dt = NaiveDateTime::parse_from_str(
+                                        item.updated(),
+                                        "%Y-%m-%dT%H:%M:%S",
+                                    )?;
+                                    let fixed_offset = FixedOffset::east_opt(
+                                        Local::now().offset().local_minus_utc(),
+                                    )
+                                    .unwrap();
+                                    fixed_offset
+                                        .from_local_datetime(&naive_dt)
+                                        .earliest()
+                                        .ok_or(anyhow!("Failed to parse naive datetime."))
+                                })
+                                .or_else(|_| {
                                     debug!("Using published date, rather than last updated date.");
                                     if let Some(date) = item.published() {
                                         date.parse::<DateTime<FixedOffset>>()
                                             .or_else(|_| DateTime::parse_from_rfc2822(date))
-                                            .map_err(OpenringError::ChronoError)
+                                            .or_else(|_| {
+                                                let naive_dt = NaiveDateTime::parse_from_str(
+                                                    date,
+                                                    "%Y-%m-%dT%H:%M:%S",
+                                                )?;
+                                                let fixed_offset = FixedOffset::east_opt(
+                                                    Local::now().offset().local_minus_utc(),
+                                                )
+                                                .unwrap();
+                                                fixed_offset
+                                                    .from_local_datetime(&naive_dt)
+                                                    .earliest()
+                                                    .ok_or(anyhow!(
+                                                        "Failed to parse naive datetime."
+                                                    ))
+                                            })
+                                            .with_context(|| {
+                                                format!("Failed to parse date `{}`", date)
+                                            })
                                     } else {
-                                        Err(OpenringError::DateError)
+                                        Err(OpenringError::DateError.into())
                                     }
                                 })
                                 .with_context(|| {
