@@ -1,3 +1,28 @@
+## 0.1.7 - 2023-05-21
+
+### Build and Dependencies
+- (deps) Update all dependencies
+- (deps) Update all dependencies
+- (deps) Bump serde from 1.0.162 to 1.0.163
+- (deps) Bump clap from 4.2.7 to 4.3.0
+- (deps) Update lockfile
+
+### CI/CD
+- Add basic workflow and dependabot config
+- Check all targets/features
+
+### Features
+- Support naive datetime of form `%Y-%m-%dT%H:%M:%S`
+
+### Refactor
+- Use WarnLevel by default
+- s/unable/failed/
+
+See the commits here: [0.1.7]
+
+[0.1.7]: https://github.com/lukehsiao/openring-rs/compare/v0.1.6...v0.1.7
+
+
 ## 0.1.6 - 2022-12-11
 
 ### Features
