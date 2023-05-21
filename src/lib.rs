@@ -81,8 +81,8 @@ pub fn run(args: Args) -> Result<()> {
 
         let mut file_urls: Vec<Url> = reader
             .lines()
-            .map(|s| s.expect("Unable to parse line."))
-            .map(|l| Url::parse(&l).expect("Unable to parse url"))
+            .map(|s| s.expect("Failed to parse line."))
+            .map(|l| Url::parse(&l).expect("Failed to parse url"))
             .collect();
         urls.append(&mut file_urls);
     };
@@ -119,7 +119,7 @@ pub fn run(args: Args) -> Result<()> {
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
                 Err(e) => {
-                    warn!("Unable to get feed `{}`\n\nCaused By:\n{}", url.as_str(), e);
+                    warn!("Failed to get feed `{}`\n\nCaused By:\n{}", url.as_str(), e);
                     None
                 }
             };
@@ -162,7 +162,7 @@ pub fn run(args: Args) -> Result<()> {
                     c.items()
                 };
                 let source_link = Url::parse(c.link())
-                    .with_context(|| format!("Unabled to parse url `{}`", c.link()))?;
+                    .with_context(|| format!("Failed to parse url `{}`", c.link()))?;
                 let source_title = c.title().to_string();
                 for item in items {
                     if let (Some(link), Some(title), Some(date)) =
@@ -171,7 +171,7 @@ pub fn run(args: Args) -> Result<()> {
                         let date = date
                             .parse::<DateTime<FixedOffset>>()
                             .or_else(|_| DateTime::parse_from_rfc2822(date))
-                            .with_context(|| format!("Unabled to parse date `{}`", date))?;
+                            .with_context(|| format!("Failed to parse date `{}`", date))?;
 
                         // Skip articles after args.before, if present
                         if let Some(before) = args.before {
@@ -197,7 +197,7 @@ pub fn run(args: Args) -> Result<()> {
                         );
                         articles.push(Article {
                             link: Url::parse(link)
-                                .with_context(|| format!("Unabled to parse url `{}`", c.link()))?,
+                                .with_context(|| format!("Failed to parse url `{}`", c.link()))?,
                             title: title.to_string(),
                             summary: safe_summary.trim().to_string(),
                             source_link: source_link.clone(),
@@ -222,7 +222,7 @@ pub fn run(args: Args) -> Result<()> {
                             .unwrap()
                             .href(),
                     )
-                    .with_context(|| format!("Unabled to parse url `{}`", f.links()[0].href()))?;
+                    .with_context(|| format!("Failed to parse url `{}`", f.links()[0].href()))?;
                     let source_title = f.title().to_string();
                     for item in items {
                         if !item.links().is_empty() {
@@ -241,7 +241,7 @@ pub fn run(args: Args) -> Result<()> {
                                     }
                                 })
                                 .with_context(|| {
-                                    format!("Unabled to parse date `{}`", item.updated())
+                                    format!("Failed to parse date `{}`", item.updated())
                                 })?;
 
                             // Skip articles after args.before, if present
@@ -277,7 +277,7 @@ pub fn run(args: Args) -> Result<()> {
                                     .href(),
                             )
                             .with_context(|| {
-                                format!("Unabled to parse url `{}`", f.links()[0].href())
+                                format!("Failed to parse url `{}`", f.links()[0].href())
                             })?;
                             articles.push(Article {
                                 link,
