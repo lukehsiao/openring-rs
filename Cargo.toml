@@ -19,7 +19,7 @@ chrono = { version = "0.4.26", features = ["serde"] }
 clap = { version = "4.3.2", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "2.0.1"
 html-escape = "0.2.13"
-indicatif = { version = "0.17.4", features = ["rayon"] }
+indicatif = { version = "0.17.5", features = ["rayon"] }
 log = "0.4.18"
 rayon = "1.7.0"
 serde = { version = "1.0.163", features = ["derive"] }
