@@ -29,5 +29,5 @@ tera = "1.19.0"
 thiserror = "1.0.40"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt"] }
-ureq = "2.6.2"
+ureq = "2.7.0"
 url = { version = "2.4.0", features = ["serde"] }
