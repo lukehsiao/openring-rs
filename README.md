@@ -2,11 +2,18 @@
     ⛓<br>
     openring-rs
 </h1>
-
 <div align="center">
     <strong>A tool for generating a webring from RSS feeds.</strong>
 </div>
 <br>
+<div align="center">
+  <a href="https://github.com/lukehsiao/openring-rs/actions/workflows/general.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/lukehsiao/openring-rs/general.yml" alt="Build Status"></a>
+  <a href="https://crates.io/crates/openring">
+    <img src="https://img.shields.io/crates/v/openring" alt="Version">
+  </a>
+  <img src="https://img.shields.io/crates/l/openring" alt="License">
+</div>
 <br>
 
 This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the
