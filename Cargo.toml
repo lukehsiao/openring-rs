@@ -6,7 +6,7 @@ authors = ["Luke Hsiao <luke@hsiao.dev>"]
 description = "A webring for static site generators written in Rust"
 repository = "https://github.com/lukehsiao/openring-rs"
 homepage = "https://github.com/lukehsiao/openring-rs"
-license = "MIT OR Apache-2.0"
+license = "BlueOak-1.0.0"
 keywords = ["webring"]
 categories = ["command-line-utilities"]
 
