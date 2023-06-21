@@ -1,3 +1,16 @@
+## 0.1.8 - 2023-06-21
+
+### Documentation
+- (README) Add badges
+
+### Miscellaneous Tasks
+- Relicense to `BlueOak-1.0.0`
+
+See the commits here: [0.1.8]
+
+[0.1.8]: https://github.com/lukehsiao/openring-rs/compare/v0.1.7...v0.1.8
+
+
 ## 0.1.7 - 2023-05-21
 
 ### Build and Dependencies
