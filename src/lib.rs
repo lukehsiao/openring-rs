@@ -1,10 +1,11 @@
-use std::fs::{self, File};
+use std::{
+    fs::{self, File},
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    result,
+    time::Duration,
+};
 
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::time::Duration;
-
-use anyhow::{anyhow, bail, Context, Result};
 use chrono::{
     naive::{NaiveDate, NaiveDateTime},
     DateTime, FixedOffset, Local, TimeZone,
@@ -12,23 +13,65 @@ use chrono::{
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use syndication::Feed;
 use tera::Tera;
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use ureq::{Agent, AgentBuilder};
 use url::Url;
 
-#[derive(Error, Debug)]
+type Result<T> = result::Result<T, OpenringError>;
+
+#[derive(Error, Debug, Diagnostic)]
 pub enum OpenringError {
     #[error("No valid published or updated date found.")]
     DateError,
     #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
     FeedMissing,
+    #[error("Failed to parse naive date.")]
+    NaiveDateError(#[from] chrono::ParseError),
     #[error(transparent)]
-    ChronoError(#[from] chrono::ParseError),
+    #[diagnostic(transparent)]
+    ChronoError(#[from] ChronoError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    FeedUrlError(#[from] FeedUrlError),
+    #[error("Failed to open file.")]
+    #[diagnostic(code(openring::io_error))]
+    IoError(#[from] std::io::Error),
+    #[error("Failed to parse URL.")]
+    #[diagnostic(code(openring::url_parse_error))]
+    UrlParseError(#[from] url::ParseError),
+    #[error("Failed to parse tera template.")]
+    #[diagnostic(code(openring::template_error))]
+    TemplateError(#[from] tera::Error),
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("Failed to parse datetime.")]
+#[diagnostic(code(openring::chrono_error))]
+pub struct ChronoError {
+    #[source_code]
+    pub src: NamedSource,
+    #[label("this date is invalid")]
+    pub span: SourceSpan,
+    #[help]
+    pub help: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("Failed to parse feed url.")]
+#[diagnostic(code(openring::url_parse_error))]
+pub struct FeedUrlError {
+    #[source_code]
+    pub src: NamedSource,
+    #[label("this url is invalid")]
+    pub span: SourceSpan,
+    #[help]
+    pub help: String,
 }
 
 #[derive(Parser, Debug)]
@@ -40,13 +83,13 @@ pub struct Args {
     /// Number of most recent articles to get from each feed
     #[arg(short, long, default_value_t = 1)]
     per_source: usize,
-    /// File with URLs of RSS feeds to read (one URL per line)
+    /// File with URLs of RSS feeds to read (one URL per line, lines starting with '#' or "//" ignored)
     #[arg(short = 'S', long, value_name = "FILE", value_hint=ValueHint::FilePath)]
     url_file: Option<PathBuf>,
     /// Tera template file
     #[arg(short, long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
     template_file: PathBuf,
-    /// A specific URL to consider (can be repeated)
+    /// A single URL to consider (can be repeated to specify multiple)
     #[arg(short = 's', long, value_hint=ValueHint::Url)]
     urls: Vec<Url>,
     /// Only include articles before this date (in YYYY-MM-DD format).
@@ -74,36 +117,42 @@ fn parse_naive_date(input: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(input, "%Y-%m-%d").map_err(|e| e.into())
 }
 
-pub fn run(args: Args) -> Result<()> {
-    trace!("Args: {:#?}", args);
-    let mut urls = args.urls;
+fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
+    let file = File::open(path.clone())?;
+    let reader = BufReader::new(file);
 
-    if let Some(file) = args.url_file {
-        let file = File::open(file)?;
-        let reader = BufReader::new(file);
+    reader
+        .lines()
+        // Allow '#' or "//" comments in the urls file
+        .filter(|l| {
+            let line = l.as_ref().unwrap();
+            let trimmed = line.trim();
+            !(trimmed.starts_with('#') || trimmed.starts_with("//"))
+        })
+        .map(|line| {
+            let line = &line.unwrap();
+            Url::parse(line).map_err(|e| {
+                // Give a nice diagnostic error
+                let file_src = fs::read_to_string(path.clone()).unwrap();
+                let offset = file_src.find(line).unwrap();
+                FeedUrlError {
+                    src: NamedSource::new(
+                        path.clone().into_os_string().to_string_lossy(),
+                        file_src,
+                    ),
+                    span: (offset..offset + line.len()).into(),
+                    help: e.to_string(),
+                }
+                .into()
+            })
+        })
+        .collect()
+}
 
-        let mut file_urls: Vec<Url> = reader
-            .lines()
-            .map(|s| s.expect("Failed to parse line."))
-            .map(|l| Url::parse(&l).expect("Failed to parse url"))
-            .collect();
-        urls.append(&mut file_urls);
-    };
-    debug!(
-        "Fetching these urls: {:#?}",
-        urls.iter().map(|url| url.as_str()).collect::<Vec<&str>>()
-    );
-
-    if urls.is_empty() {
-        bail!(OpenringError::FeedMissing)
-    }
-
-    let template = fs::read_to_string(&args.template_file)
-        .with_context(|| format!("Failed to read file `{:?}`", args.template_file))?;
-    let mut context = tera::Context::new();
-
-    info!("Fetching feeds...");
-
+// Get all feeds from URLs concurrently.
+//
+// Skips feeds if there are errors. Shows progress.
+fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
     let agent: Agent = AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!(crate_name!(), '/', crate_version!()))
@@ -111,7 +160,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let m = MultiProgress::new();
 
-    let feeds: Vec<Feed> = urls
+    let feeds: Vec<(Feed, Url)> = urls
         .par_iter()
         .enumerate()
         .filter_map(|(idx, url)| {
@@ -122,7 +171,7 @@ pub fn run(args: Args) -> Result<()> {
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
                 Err(e) => {
-                    warn!("Failed to get feed `{}`\n\nCaused By:\n{}", url.as_str(), e);
+                    warn!(url=%url.as_str(), error=%e, "Failed to get feed");
                     None
                 }
             };
@@ -132,13 +181,13 @@ pub fn run(args: Args) -> Result<()> {
                 match feed_str.parse::<Feed>() {
                     Ok(feed) => {
                         pb.finish_and_clear();
-                        Some(feed)
+                        Some((feed, url.clone()))
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to parse RSS/Atom feed from `{}`\n\nCaused By:\n{}",
-                            url.as_str(),
-                            e
+                            url=%url.as_str(),
+                            error=%e,
+                            "Failed to parse RSS/Atom feed."
                         );
                         pb.finish_with_message(format!(
                             "Failed to parse feed from `{}`",
@@ -154,9 +203,46 @@ pub fn run(args: Args) -> Result<()> {
         })
         .collect();
     m.clear()?;
+    Ok(feeds)
+}
+
+// Parse the date, falling back to naive parsing if necessary.
+fn parse_date(date: &str) -> Result<DateTime<FixedOffset>> {
+    date.parse::<DateTime<FixedOffset>>()
+        .or_else(|_| DateTime::parse_from_rfc2822(date))
+        .or_else(|_| DateTime::parse_from_rfc3339(date))
+        .or_else(|_| {
+            debug!(?date, "attempting to parse non-standard date");
+            let naive_dt = NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S")?;
+            let fixed_offset =
+                FixedOffset::east_opt(Local::now().offset().local_minus_utc()).unwrap();
+            fixed_offset
+                .from_local_datetime(&naive_dt)
+                .earliest()
+                .ok_or(OpenringError::DateError)
+        })
+}
+
+pub fn run(args: Args) -> Result<()> {
+    debug!(?args);
+    let mut urls = args.urls;
+
+    if let Some(path) = args.url_file {
+        let mut file_urls = parse_urls_from_file(path)?;
+        urls.append(&mut file_urls);
+    };
+
+    if urls.is_empty() {
+        return Err(OpenringError::FeedMissing);
+    }
+
+    let feeds = get_feeds_from_urls(urls)?;
+
+    let template = fs::read_to_string(&args.template_file)?;
+    let mut context = tera::Context::new();
 
     let mut articles = Vec::new();
-    for feed in feeds {
+    for (feed, url) in feeds {
         match feed {
             Feed::RSS(c) => {
                 let items = if c.items().len() >= args.per_source {
@@ -164,29 +250,13 @@ pub fn run(args: Args) -> Result<()> {
                 } else {
                     c.items()
                 };
-                let source_link = Url::parse(c.link())
-                    .with_context(|| format!("Failed to parse url `{}`", c.link()))?;
+                let source_link = Url::parse(c.link())?;
                 let source_title = c.title().to_string();
                 for item in items {
                     if let (Some(link), Some(title), Some(date)) =
                         (item.link(), item.title(), item.pub_date())
                     {
-                        let date = date
-                            .parse::<DateTime<FixedOffset>>()
-                            .or_else(|_| DateTime::parse_from_rfc2822(date))
-                            .or_else(|_| {
-                                let naive_dt =
-                                    NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S")?;
-                                let fixed_offset =
-                                    FixedOffset::east_opt(Local::now().offset().local_minus_utc())
-                                        .unwrap();
-                                fixed_offset
-                                    .from_local_datetime(&naive_dt)
-                                    .earliest()
-                                    .ok_or(anyhow!("Failed to parse naive datetime."))
-                            })
-                            .with_context(|| format!("Failed to parse date `{}`", date))?;
-
+                        let date = parse_date(date)?;
                         // Skip articles after args.before, if present
                         if let Some(before) = args.before {
                             if date.date_naive() > before {
@@ -199,7 +269,7 @@ pub fn run(args: Args) -> Result<()> {
                             None => match item.content() {
                                 Some(s) => s.to_string(),
                                 None => {
-                                    warn!("Skipping `{}` from `{}`, no summary or content provided in feed.", link, source_link);
+                                    warn!(?link, ?source_link, "Skipping link from feed: no summary or content provided in feed.");
                                     continue;
                                 }
                             },
@@ -210,8 +280,7 @@ pub fn run(args: Args) -> Result<()> {
                             &mut safe_summary,
                         );
                         articles.push(Article {
-                            link: Url::parse(link)
-                                .with_context(|| format!("Failed to parse url `{}`", c.link()))?,
+                            link: Url::parse(link)?,
                             title: title.to_string(),
                             summary: safe_summary.trim().to_string(),
                             source_link: source_link.clone(),
@@ -219,15 +288,15 @@ pub fn run(args: Args) -> Result<()> {
                             date,
                         });
                     } else {
-                        debug!("Skipping `{:#?}`, must have link, title, and date", item);
+                        debug!(?item, "Skipping. Must have link, title, and date");
                     }
                 }
             }
-            Feed::Atom(f) => {
+            Feed::Atom(ref f) => {
                 let items = &f.entries()[0..args.per_source];
                 let feed_links = f.links();
                 if !feed_links.is_empty() {
-                    trace!("Feed links: {:#?}", feed_links);
+                    debug!(?feed_links);
 
                     let source_link = Url::parse(
                         f.links()
@@ -235,60 +304,28 @@ pub fn run(args: Args) -> Result<()> {
                             .find(|l| l.rel() == "alternate")
                             .unwrap()
                             .href(),
-                    )
-                    .with_context(|| format!("Failed to parse url `{}`", f.links()[0].href()))?;
+                    )?;
                     let source_title = f.title().to_string();
                     for item in items {
                         if !item.links().is_empty() {
-                            let date = item
-                                .updated()
-                                .parse::<DateTime<FixedOffset>>()
-                                .or_else(|_| DateTime::parse_from_rfc2822(item.updated()))
-                                .or_else(|_| {
-                                    let naive_dt = NaiveDateTime::parse_from_str(
-                                        item.updated(),
-                                        "%Y-%m-%dT%H:%M:%S",
-                                    )?;
-                                    let fixed_offset = FixedOffset::east_opt(
-                                        Local::now().offset().local_minus_utc(),
-                                    )
-                                    .unwrap();
-                                    fixed_offset
-                                        .from_local_datetime(&naive_dt)
-                                        .earliest()
-                                        .ok_or(anyhow!("Failed to parse naive datetime."))
-                                })
-                                .or_else(|_| {
-                                    debug!("Using published date, rather than last updated date.");
-                                    if let Some(date) = item.published() {
-                                        date.parse::<DateTime<FixedOffset>>()
-                                            .or_else(|_| DateTime::parse_from_rfc2822(date))
-                                            .or_else(|_| {
-                                                let naive_dt = NaiveDateTime::parse_from_str(
-                                                    date,
-                                                    "%Y-%m-%dT%H:%M:%S",
-                                                )?;
-                                                let fixed_offset = FixedOffset::east_opt(
-                                                    Local::now().offset().local_minus_utc(),
-                                                )
-                                                .unwrap();
-                                                fixed_offset
-                                                    .from_local_datetime(&naive_dt)
-                                                    .earliest()
-                                                    .ok_or(anyhow!(
-                                                        "Failed to parse naive datetime."
-                                                    ))
-                                            })
-                                            .with_context(|| {
-                                                format!("Failed to parse date `{}`", date)
-                                            })
-                                    } else {
-                                        Err(OpenringError::DateError.into())
-                                    }
-                                })
-                                .with_context(|| {
-                                    format!("Failed to parse date `{}`", item.updated())
-                                })?;
+                            let date = parse_date(item.updated()).or_else(|_| {
+                                debug!("using published date, rather than last updated date");
+                                if let Some(date) = item.published() {
+                                    parse_date(date).map_err(|e| {
+                                        let feed_src = feed.to_string();
+                                        let start = feed_src.find(date).unwrap();
+                                        let len = date.len();
+                                        ChronoError {
+                                            src: NamedSource::new(url.as_str(), feed_src),
+                                            span: (start..start + len).into(),
+                                            help: e.to_string(),
+                                        }
+                                        .into()
+                                    })
+                                } else {
+                                    Err(OpenringError::DateError)
+                                }
+                            })?;
 
                             // Skip articles after args.before, if present
                             if let Some(before) = args.before {
@@ -302,7 +339,7 @@ pub fn run(args: Args) -> Result<()> {
                                 None => match item.content().map(|c| c.value()) {
                                     Some(Some(v)) => v.to_string(),
                                     _ => {
-                                        warn!("Skipping `{}` from `{}`, no summary or content provided in feed.", item.links()[0].href(), source_link);
+                                        warn!(link=%item.links()[0].href(), ?source_link, "Skipping link from feed: no summary or content provided in feed.");
                                         continue;
                                     }
                                 },
@@ -313,7 +350,7 @@ pub fn run(args: Args) -> Result<()> {
                                 ammonia::clean(&summary),
                                 &mut safe_summary,
                             );
-                            info!("{:#?}", safe_summary);
+                            info!(summary = %summary);
                             // Uses the last link, since blogspot puts the article link last.
                             let link = Url::parse(
                                 item.links()
@@ -321,10 +358,7 @@ pub fn run(args: Args) -> Result<()> {
                                     .find(|l| l.rel() == "alternate")
                                     .unwrap()
                                     .href(),
-                            )
-                            .with_context(|| {
-                                format!("Failed to parse url `{}`", f.links()[0].href())
-                            })?;
+                            )?;
                             articles.push(Article {
                                 link,
                                 title: item.title().to_string(),
@@ -334,7 +368,7 @@ pub fn run(args: Args) -> Result<()> {
                                 date,
                             });
                         } else {
-                            debug!("Skipping `{:#?}`, must have links", item);
+                            debug!(?item, "Skipping. Must have links.");
                         }
                     }
                 }
@@ -351,8 +385,7 @@ pub fn run(args: Args) -> Result<()> {
 
     context.insert("articles", articles);
     // TODO: this validation of the template should come before all the time spent fetching feeds.
-    let output = Tera::one_off(&template, &context, true)
-        .with_context(|| format!("Failed to parse Tera template:\n{}", template))?;
+    let output = Tera::one_off(&template, &context, true)?;
     println!("{output}");
     Ok(())
 }
