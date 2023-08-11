@@ -46,7 +46,7 @@ Options:
   -p, --per-source <PER_SOURCE>      Number of most recent articles to get from each feed [default: 1]
   -S, --url-file <FILE>              File with URLs of RSS feeds to read (one URL per line, lines starting with '#' or "//" ignored)
   -t, --template-file <FILE>         Tera template file
-  -s, --urls <URLS>                  A single URL to consider (can be repeated to specify multiple)
+  -s, --url <URL>                    A single URL to consider (can be repeated to specify multiple)
   -b, --before <BEFORE>              Only include articles before this date (in YYYY-MM-DD format)
   -v, --verbose...                   More output per occurrence
   -q, --quiet...                     Less output per occurrence

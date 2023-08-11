@@ -91,7 +91,7 @@ pub struct Args {
     template_file: PathBuf,
     /// A single URL to consider (can be repeated to specify multiple)
     #[arg(short = 's', long, value_hint=ValueHint::Url)]
-    urls: Vec<Url>,
+    url: Vec<Url>,
     /// Only include articles before this date (in YYYY-MM-DD format).
     ///
     /// This is naive (no timezone), so articles close to the boundary in different timezones might
@@ -225,7 +225,7 @@ fn parse_date(date: &str) -> Result<DateTime<FixedOffset>> {
 
 pub fn run(args: Args) -> Result<()> {
     debug!(?args);
-    let mut urls = args.urls;
+    let mut urls = args.url;
 
     if let Some(path) = args.url_file {
         let mut file_urls = parse_urls_from_file(path)?;
