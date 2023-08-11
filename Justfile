@@ -7,6 +7,10 @@ _default:
 check:
 	cargo clippy --locked -- -D warnings
 
+# Check links in markdown files
+link-check:
+	-lychee -E '**/*.md'
+
 # Runs nextest
 test:
 	cargo nextest run
