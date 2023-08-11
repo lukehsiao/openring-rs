@@ -1,3 +1,13 @@
+## 0.1.9 - 2023-08-11
+
+### Features
+- Provide `miette`-powered error diagnostics
+
+See the commits here: [0.1.9]
+
+[0.1.9]: https://github.com/lukehsiao/openring-rs/compare/v0.1.8...v0.1.9
+
+
 ## 0.1.8 - 2023-06-21
 
 ### Documentation
