@@ -6,20 +6,17 @@ use std::{
     time::Duration,
 };
 
-use chrono::{
-    naive::{NaiveDate, NaiveDateTime},
-    DateTime, FixedOffset, Local, TimeZone,
-};
+use chrono::{naive::NaiveDate, DateTime, Utc};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
+use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
-use syndication::Feed;
 use tera::Tera;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use ureq::{Agent, AgentBuilder};
 use url::Url;
 
@@ -31,6 +28,9 @@ pub enum OpenringError {
     DateError,
     #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
     FeedMissing,
+    #[error("The feed at `{0}` has a bad a title (e.g., missing link or title).")]
+    #[diagnostic(code(openring::feed_title_error))]
+    FeedBadTitle(String),
     #[error("Failed to parse naive date.")]
     NaiveDateError(#[from] chrono::ParseError),
     #[error(transparent)]
@@ -110,7 +110,7 @@ pub struct Article {
     summary: String,
     source_link: Url,
     source_title: String,
-    date: DateTime<FixedOffset>,
+    date: DateTime<Utc>,
 }
 
 fn parse_naive_date(input: &str) -> Result<NaiveDate> {
@@ -178,7 +178,7 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
             pb.inc(1);
 
             if let Some(feed_str) = body {
-                match feed_str.parse::<Feed>() {
+                match parser::parse(feed_str.as_bytes()) {
                     Ok(feed) => {
                         pb.finish_and_clear();
                         Some((feed, url.clone()))
@@ -206,23 +206,6 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
     Ok(feeds)
 }
 
-// Parse the date, falling back to naive parsing if necessary.
-fn parse_date(date: &str) -> Result<DateTime<FixedOffset>> {
-    date.parse::<DateTime<FixedOffset>>()
-        .or_else(|_| DateTime::parse_from_rfc2822(date))
-        .or_else(|_| DateTime::parse_from_rfc3339(date))
-        .or_else(|_| {
-            debug!(?date, "attempting to parse non-standard date");
-            let naive_dt = NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S")?;
-            let fixed_offset =
-                FixedOffset::east_opt(Local::now().offset().local_minus_utc()).unwrap();
-            fixed_offset
-                .from_local_datetime(&naive_dt)
-                .earliest()
-                .ok_or(OpenringError::DateError)
-        })
-}
-
 pub fn run(args: Args) -> Result<()> {
     debug!(?args);
     let mut urls = args.url;
@@ -241,137 +224,125 @@ pub fn run(args: Args) -> Result<()> {
     let template = fs::read_to_string(&args.template_file)?;
     let mut context = tera::Context::new();
 
+    // Grab articles from all the feeds
     let mut articles = Vec::new();
     for (feed, url) in feeds {
-        match feed {
-            Feed::RSS(c) => {
-                let items = if c.items().len() >= args.per_source {
-                    &c.items()[0..args.per_source]
-                } else {
-                    c.items()
-                };
-                let source_link = Url::parse(c.link())?;
-                let source_title = c.title().to_string();
-                for item in items {
-                    if let (Some(link), Some(title), Some(date)) =
-                        (item.link(), item.title(), item.pub_date())
-                    {
-                        let date = parse_date(date)?;
-                        // Skip articles after args.before, if present
-                        if let Some(before) = args.before {
-                            if date.date_naive() > before {
-                                continue;
-                            }
-                        }
+        let entries = if feed.entries.len() >= args.per_source {
+            &feed.entries[0..args.per_source]
+        } else {
+            &feed.entries
+        };
 
-                        let summary = match item.description() {
-                            Some(s) => s.to_string(),
-                            None => match item.content() {
-                                Some(s) => s.to_string(),
-                                None => {
-                                    warn!(?link, ?source_link, "Skipping link from feed: no summary or content provided in feed.");
-                                    continue;
-                                }
-                            },
-                        };
-                        let mut safe_summary = String::new();
-                        html_escape::decode_html_entities_to_string(
-                            ammonia::clean(&summary),
-                            &mut safe_summary,
-                        );
-                        articles.push(Article {
-                            link: Url::parse(link)?,
-                            title: title.to_string(),
-                            summary: safe_summary.trim().to_string(),
-                            source_link: source_link.clone(),
-                            source_title: source_title.clone(),
-                            date,
-                        });
-                    } else {
-                        debug!(?item, "Skipping. Must have link, title, and date");
+        if feed.title.is_none() {
+            return Err(OpenringError::FeedBadTitle(url.to_string()));
+        }
+        let source_title = feed.title.clone().unwrap().content;
+        let source_link = match &feed.title.as_ref().unwrap().src {
+            None => {
+                // Then, look for links
+                match feed
+                    .links
+                    .iter()
+                    .find(|l| {
+                        if let Some(rel) = &l.rel {
+                            rel == "alternate"
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|l| &l.href)
+                {
+                    None => {
+                        // If an alternate link is missing just grab one of them
+                        match feed.links.into_iter().next().map(|l| l.href) {
+                            Some(s) => Url::parse(&s)?,
+                            None => return Err(OpenringError::FeedBadTitle(url.to_string())),
+                        }
                     }
+                    Some(s) => Url::parse(s)?,
                 }
             }
-            Feed::Atom(ref f) => {
-                let items = &f.entries()[0..args.per_source];
-                let feed_links = f.links();
-                if !feed_links.is_empty() {
-                    debug!(?feed_links);
-
-                    let source_link = Url::parse(
-                        f.links()
-                            .iter()
-                            .find(|l| l.rel() == "alternate")
-                            .unwrap()
-                            .href(),
-                    )?;
-                    let source_title = f.title().to_string();
-                    for item in items {
-                        if !item.links().is_empty() {
-                            let date = parse_date(item.updated()).or_else(|_| {
-                                debug!("using published date, rather than last updated date");
-                                if let Some(date) = item.published() {
-                                    parse_date(date).map_err(|e| {
-                                        let feed_src = feed.to_string();
-                                        let start = feed_src.find(date).unwrap();
-                                        let len = date.len();
-                                        ChronoError {
-                                            src: NamedSource::new(url.as_str(), feed_src),
-                                            span: (start..start + len).into(),
-                                            help: e.to_string(),
-                                        }
-                                        .into()
-                                    })
-                                } else {
-                                    Err(OpenringError::DateError)
-                                }
-                            })?;
-
-                            // Skip articles after args.before, if present
-                            if let Some(before) = args.before {
-                                if date.date_naive() > before {
-                                    continue;
-                                }
-                            }
-
-                            let summary = match item.summary() {
-                                Some(s) => s.to_string(),
-                                None => match item.content().map(|c| c.value()) {
-                                    Some(Some(v)) => v.to_string(),
-                                    _ => {
-                                        warn!(link=%item.links()[0].href(), ?source_link, "Skipping link from feed: no summary or content provided in feed.");
-                                        continue;
-                                    }
-                                },
-                            };
-
-                            let mut safe_summary = String::new();
-                            html_escape::decode_html_entities_to_string(
-                                ammonia::clean(&summary),
-                                &mut safe_summary,
-                            );
-                            info!(summary = %summary);
-                            // Uses the last link, since blogspot puts the article link last.
-                            let link = Url::parse(
-                                item.links()
-                                    .iter()
-                                    .find(|l| l.rel() == "alternate")
-                                    .unwrap()
-                                    .href(),
-                            )?;
-                            articles.push(Article {
-                                link,
-                                title: item.title().to_string(),
-                                summary: safe_summary.trim().to_string(),
-                                source_link: source_link.clone(),
-                                source_title: source_title.clone(),
-                                date,
-                            });
+            Some(s) => Url::parse(s)?,
+        };
+        for entry in entries.iter() {
+            if let (Some(link), Some(title), Some(date)) = (
+                match entry
+                    .links
+                    .iter()
+                    .find(|l| {
+                        if let Some(rel) = &l.rel {
+                            rel == "alternate"
                         } else {
-                            debug!(?item, "Skipping. Must have links.");
+                            false
+                        }
+                    })
+                    .map(|l| &l.href)
+                {
+                    Some(s) => Url::parse(s).ok(),
+                    None => {
+                        // If an alternate link is missing just grab one of them
+                        match entry.links.clone().into_iter().next().map(|l| l.href) {
+                            Some(s) => Url::parse(&s).ok(),
+                            None => return Err(OpenringError::FeedBadTitle(url.to_string())),
                         }
                     }
+                },
+                entry.title.as_ref().map(|t| &t.content),
+                entry.published.or(entry.updated),
+            ) {
+                // Skip articles after args.before, if present
+                if let Some(before) = args.before {
+                    if date.date_naive() > before {
+                        continue;
+                    }
                 }
+
+                let summary = match &entry.summary {
+                    Some(s) => &s.content,
+                    None => match &entry.content {
+                        Some(c) => match &c.body {
+                            Some(b) => b,
+                            None => {
+                                warn!(
+                                    ?link,
+                                    ?source_link,
+                                    "Skipping link from feed: no summary or content provided."
+                                );
+                                continue;
+                            }
+                        },
+                        None => {
+                            warn!(
+                                ?link,
+                                ?source_link,
+                                "Skipping link from feed: no summary or content provided."
+                            );
+                            continue;
+                        }
+                    },
+                };
+
+                let mut safe_summary = String::new();
+                html_escape::decode_html_entities_to_string(
+                    ammonia::clean(summary),
+                    &mut safe_summary,
+                );
+                articles.push(Article {
+                    link,
+                    title: title.to_string(),
+                    summary: safe_summary.trim().to_string(),
+                    source_link: source_link.clone(),
+                    source_title: source_title.clone(),
+                    date,
+                });
+            } else {
+                warn!(
+                    link=?entry.links,
+                    title=?entry.title,
+                    published=?entry.published,
+                    updated=?entry.updated,
+                    "Skipping. Must have link, title, and a date."
+                );
             }
         }
     }
