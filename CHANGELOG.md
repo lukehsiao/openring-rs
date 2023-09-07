@@ -1,3 +1,15 @@
+## 0.1.10 - 2023-09-07
+
+### Refactor
+- Rename `--urls` to just `--url`
+- Switch to `feed-rs`
+    - **BREAKING**: We no longer can parse feeds whose dates do not include
+      timezones. Support for this will need to be fixed upstream.
+
+See the commits here: [0.1.10]
+
+[0.1.10]: https://github.com/lukehsiao/openring-rs/compare/v0.1.10...v0.1.10
+
 ## 0.1.9 - 2023-08-11
 
 ### Features
@@ -6,7 +18,6 @@
 See the commits here: [0.1.9]
 
 [0.1.9]: https://github.com/lukehsiao/openring-rs/compare/v0.1.8...v0.1.9
-
 
 ## 0.1.8 - 2023-06-21
 
@@ -19,7 +30,6 @@ See the commits here: [0.1.9]
 See the commits here: [0.1.8]
 
 [0.1.8]: https://github.com/lukehsiao/openring-rs/compare/v0.1.7...v0.1.8
-
 
 ## 0.1.7 - 2023-05-21
 
@@ -45,7 +55,6 @@ See the commits here: [0.1.7]
 
 [0.1.7]: https://github.com/lukehsiao/openring-rs/compare/v0.1.6...v0.1.7
 
-
 ## 0.1.6 - 2022-12-11
 
 ### Features
@@ -54,7 +63,6 @@ See the commits here: [0.1.7]
 See the commits here: [0.1.6]
 
 [0.1.6]: https://github.com/lukehsiao/openring-rs/compare/v0.1.5...v0.1.6
-
 
 ## 0.1.5 - 2022-11-26
 
@@ -65,7 +73,6 @@ See the commits here: [0.1.5]
 
 [0.1.5]: https://github.com/lukehsiao/openring-rs/compare/v0.1.4...v0.1.5
 
-
 ## 0.1.4 - 2022-11-26
 
 ### Bug Fixes
@@ -75,7 +82,6 @@ See the commits here: [0.1.4]
 
 [0.1.4]: https://github.com/lukehsiao/openring-rs/compare/v0.1.3...v0.1.4
 
-
 ## 0.1.3 - 2022-11-26
 
 ### Bug Fixes
@@ -84,7 +90,6 @@ See the commits here: [0.1.4]
 See the commits here: [0.1.3]
 
 [0.1.3]: https://github.com/lukehsiao/openring-rs/compare/v0.1.2...v0.1.3
-
 
 ## 0.1.2 - 2022-11-26
 
@@ -102,7 +107,6 @@ See the commits here: [0.1.3]
 See the commits here: [0.1.2]
 
 [0.1.2]: https://github.com/lukehsiao/openring-rs/compare/v0.1.1...v0.1.2
-
 
 ## 0.1.1 - 2022-11-26
 
