@@ -171,7 +171,7 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
             let body = match agent.get(url.as_str()).call() {
                 Ok(r) => r.into_string().ok(),
                 Err(e) => {
-                    warn!(url=%url.as_str(), error=%e, "Failed to get feed");
+                    warn!(url=%url.as_str(), error=%e, "failed to get feed.");
                     None
                 }
             };
@@ -187,7 +187,7 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
                         warn!(
                             url=%url.as_str(),
                             error=%e,
-                            "Failed to parse RSS/Atom feed."
+                            "failed to parse feed."
                         );
                         pb.finish_with_message(format!(
                             "Failed to parse feed from `{}`",
@@ -306,7 +306,7 @@ pub fn run(args: Args) -> Result<()> {
                                 warn!(
                                     ?link,
                                     ?source_link,
-                                    "Skipping link from feed: no summary or content provided."
+                                    "skipping link from feed: no summary or content provided."
                                 );
                                 continue;
                             }
@@ -315,7 +315,7 @@ pub fn run(args: Args) -> Result<()> {
                             warn!(
                                 ?link,
                                 ?source_link,
-                                "Skipping link from feed: no summary or content provided."
+                                "skipping link from feed: no summary or content provided."
                             );
                             continue;
                         }
@@ -337,11 +337,12 @@ pub fn run(args: Args) -> Result<()> {
                 });
             } else {
                 warn!(
-                    link=?entry.links,
-                    title=?entry.title,
-                    published=?entry.published,
-                    updated=?entry.updated,
-                    "Skipping. Must have link, title, and a date."
+                    entry_links=?entry.links,
+                    entry_title=?entry.title,
+                    entry_published=?entry.published,
+                    entry_updated=?entry.updated,
+                    source=url.as_str(),
+                    "skipping entry: must have link, title, and a date."
                 );
             }
         }
