@@ -1,5 +1,6 @@
 use clap::Parser;
 use miette::{Context, Result};
+use std::io;
 
 use openring::{self, Args};
 
@@ -11,6 +12,7 @@ fn main() -> Result<()> {
             "openring={},html5ever=off,ureq=off",
             convert_filter(args.verbose.log_level_filter())
         ))
+        .with_writer(io::stderr)
         .init();
     // I feel like I shouldn't need wrap_err, but it doesn't work without it.
     openring::run(args).wrap_err("runtime error")
