@@ -22,7 +22,7 @@ articles from those feeds and embed them in your own blog. An example template i
 
 This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the
 primary differences being:
-- the template is provided as a argument, not read from stdin
+- the template is provided as an argument, not read from stdin
 - we show a little progress bar
 - we fetch all feeds concurrently
 - we allow filtering feeds with `--before`
