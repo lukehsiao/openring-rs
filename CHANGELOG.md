@@ -1,3 +1,19 @@
+## 0.1.11 - 2023-09-07
+
+### Bug Fixes
+- Log to stderr, not stdout
+
+### Documentation
+- (README) Fix grammar error
+- (README) Suggest using `--locked` on install
+
+### Refactor
+- Standardize and clarify logs
+
+See the commits here: [0.1.11]
+
+[0.1.11]: https://github.com/lukehsiao/openring-rs/compare/v0.1.11...v0.1.11
+
 ## 0.1.10 - 2023-09-07
 
 ### Refactor
