@@ -31,7 +31,7 @@ primary differences being:
 ## Install
 
 ```
-cargo install openring
+cargo install --locked openring
 ```
 
 ## Usage
