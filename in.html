@@ -6,7 +6,7 @@
             <h4 class="title" dir="auto">
                 <a href="{{ article.link }}" target="_blank" rel="noopener">{{ article.title }}</a>
             </h4>
-            <p class="summary" dir="auto">{{ article.summary | striptags | truncate(length=256) }}</p>
+            <p class="summary" dir="auto">{{ article.summary | striptags | trim | truncate(length=256) }}</p>
             <small class="source"> via <a href="{{ article.source_link }}">{{ article.source_title }}</a></small>
             <small class="date">{{ article.date | date(format="%B %d, %Y")}}</small>
         </div>
