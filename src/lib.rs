@@ -233,10 +233,16 @@ pub fn run(args: Args) -> Result<()> {
             &feed.entries
         };
 
-        if feed.title.is_none() {
-            return Err(OpenringError::FeedBadTitle(url.to_string()));
-        }
-        let source_title = feed.title.clone().unwrap().content;
+        let source_title = match feed.title {
+            Some(ref t) => {
+                if t.content.is_empty() {
+                    url.domain().unwrap().to_owned()
+                } else {
+                    t.content.clone()
+                }
+            }
+            None => url.domain().unwrap().to_owned(),
+        };
         let source_link = match &feed.title.as_ref().unwrap().src {
             None => {
                 // Then, look for links
