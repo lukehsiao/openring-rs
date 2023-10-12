@@ -1,3 +1,12 @@
+## 0.1.12 - 2023-10-12
+
+### Features
+- Support feeds with relative URLs
+
+See the commits here: [0.1.12]
+
+[0.1.12]: https://github.com/lukehsiao/openring-rs/compare/v0.1.12...v0.1.12
+
 ## 0.1.11 - 2023-09-07
 
 ### Bug Fixes
