@@ -1,3 +1,16 @@
+## 0.1.13 - 2023-10-12
+
+### Bug Fixes
+- Make relative urls relative to origin
+- Ignore "self" rel on links
+
+### Features
+- Default to domain name if feed title is empty
+
+See the commits here: [0.1.13]
+
+[0.1.13]: https://github.com/lukehsiao/openring-rs/compare/v0.1.13...v0.1.13
+
 ## 0.1.12 - 2023-10-12
 
 ### Features
