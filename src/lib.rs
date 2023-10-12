@@ -260,7 +260,13 @@ pub fn run(args: Args) -> Result<()> {
                 {
                     None => {
                         // If an alternate link is missing just grab one of them
-                        match feed.links.into_iter().next().map(|l| l.href) {
+                        match feed
+                            .links
+                            .into_iter()
+                            // Ignore "self" rels, which usually link to feed
+                            .find(|l| !l.rel.as_ref().is_some_and(|r| r == "self"))
+                            .map(|l| l.href)
+                        {
                             Some(s) => {
                                 match Url::parse(&s) {
                                     Ok(u) => u,
