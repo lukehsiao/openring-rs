@@ -18,7 +18,7 @@ use tera::Tera;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ureq::{Agent, AgentBuilder};
-use url::Url;
+use url::{ParseError, Url};
 
 type Result<T> = result::Result<T, OpenringError>;
 
@@ -255,14 +255,30 @@ pub fn run(args: Args) -> Result<()> {
                     None => {
                         // If an alternate link is missing just grab one of them
                         match feed.links.into_iter().next().map(|l| l.href) {
-                            Some(s) => Url::parse(&s)?,
+                            Some(s) => match Url::parse(&s) {
+                                Ok(u) => u,
+                                Err(ParseError::RelativeUrlWithoutBase) => {
+                                    Url::parse(&format!("{}{}", url, &s))?
+                                }
+                                Err(e) => return Err(OpenringError::UrlParseError(e)),
+                            },
                             None => return Err(OpenringError::FeedBadTitle(url.to_string())),
                         }
                     }
-                    Some(s) => Url::parse(s)?,
+                    Some(s) => match Url::parse(s) {
+                        Ok(u) => u,
+                        Err(ParseError::RelativeUrlWithoutBase) => {
+                            Url::parse(&format!("{}{}", url, &s))?
+                        }
+                        Err(e) => return Err(OpenringError::UrlParseError(e)),
+                    },
                 }
             }
-            Some(s) => Url::parse(s)?,
+            Some(s) => match Url::parse(s) {
+                Ok(u) => u,
+                Err(ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("{}{}", url, &s))?,
+                Err(e) => return Err(OpenringError::UrlParseError(e)),
+            },
         };
         for entry in entries.iter() {
             if let (Some(link), Some(title), Some(date)) = (
@@ -278,11 +294,23 @@ pub fn run(args: Args) -> Result<()> {
                     })
                     .map(|l| &l.href)
                 {
-                    Some(s) => Url::parse(s).ok(),
+                    Some(s) => match Url::parse(s) {
+                        Ok(u) => Some(u),
+                        Err(ParseError::RelativeUrlWithoutBase) => {
+                            Url::parse(&format!("{}{}", url, &s)).ok()
+                        }
+                        Err(_) => None,
+                    },
                     None => {
                         // If an alternate link is missing just grab one of them
                         match entry.links.clone().into_iter().next().map(|l| l.href) {
-                            Some(s) => Url::parse(&s).ok(),
+                            Some(s) => match Url::parse(&s) {
+                                Ok(u) => Some(u),
+                                Err(ParseError::RelativeUrlWithoutBase) => {
+                                    Url::parse(&format!("{}{}", url, &s)).ok()
+                                }
+                                Err(_) => None,
+                            },
                             None => return Err(OpenringError::FeedBadTitle(url.to_string())),
                         }
                     }
