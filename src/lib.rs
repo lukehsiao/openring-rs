@@ -255,20 +255,22 @@ pub fn run(args: Args) -> Result<()> {
                     None => {
                         // If an alternate link is missing just grab one of them
                         match feed.links.into_iter().next().map(|l| l.href) {
-                            Some(s) => match Url::parse(&s) {
-                                Ok(u) => u,
-                                Err(ParseError::RelativeUrlWithoutBase) => {
-                                    Url::parse(&format!("{}{}", url, &s))?
+                            Some(s) => {
+                                match Url::parse(&s) {
+                                    Ok(u) => u,
+                                    Err(ParseError::RelativeUrlWithoutBase) => Url::parse(
+                                        &format!("{}{}", url.origin().ascii_serialization(), &s),
+                                    )?,
+                                    Err(e) => return Err(OpenringError::UrlParseError(e)),
                                 }
-                                Err(e) => return Err(OpenringError::UrlParseError(e)),
-                            },
+                            }
                             None => return Err(OpenringError::FeedBadTitle(url.to_string())),
                         }
                     }
                     Some(s) => match Url::parse(s) {
                         Ok(u) => u,
                         Err(ParseError::RelativeUrlWithoutBase) => {
-                            Url::parse(&format!("{}{}", url, &s))?
+                            Url::parse(&format!("{}{}", url.origin().ascii_serialization(), &s))?
                         }
                         Err(e) => return Err(OpenringError::UrlParseError(e)),
                     },
@@ -276,48 +278,54 @@ pub fn run(args: Args) -> Result<()> {
             }
             Some(s) => match Url::parse(s) {
                 Ok(u) => u,
-                Err(ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("{}{}", url, &s))?,
+                Err(ParseError::RelativeUrlWithoutBase) => {
+                    Url::parse(&format!("{}{}", url.origin().ascii_serialization(), &s))?
+                }
                 Err(e) => return Err(OpenringError::UrlParseError(e)),
             },
         };
         for entry in entries.iter() {
-            if let (Some(link), Some(title), Some(date)) = (
-                match entry
-                    .links
-                    .iter()
-                    .find(|l| {
-                        if let Some(rel) = &l.rel {
-                            rel == "alternate"
-                        } else {
-                            false
+            if let (Some(link), Some(title), Some(date)) =
+                (
+                    match entry
+                        .links
+                        .iter()
+                        .find(|l| {
+                            if let Some(rel) = &l.rel {
+                                rel == "alternate"
+                            } else {
+                                false
+                            }
+                        })
+                        .map(|l| &l.href)
+                    {
+                        Some(s) => match Url::parse(s) {
+                            Ok(u) => Some(u),
+                            Err(ParseError::RelativeUrlWithoutBase) => {
+                                Url::parse(&format!("{}{}", url.origin().ascii_serialization(), &s))
+                                    .ok()
+                            }
+                            Err(_) => None,
+                        },
+                        None => {
+                            // If an alternate link is missing just grab one of them
+                            match entry.links.clone().into_iter().next().map(|l| l.href) {
+                                Some(s) => match Url::parse(&s) {
+                                    Ok(u) => Some(u),
+                                    Err(ParseError::RelativeUrlWithoutBase) => Url::parse(
+                                        &format!("{}{}", url.origin().ascii_serialization(), &s),
+                                    )
+                                    .ok(),
+                                    Err(_) => None,
+                                },
+                                None => return Err(OpenringError::FeedBadTitle(url.to_string())),
+                            }
                         }
-                    })
-                    .map(|l| &l.href)
-                {
-                    Some(s) => match Url::parse(s) {
-                        Ok(u) => Some(u),
-                        Err(ParseError::RelativeUrlWithoutBase) => {
-                            Url::parse(&format!("{}{}", url, &s)).ok()
-                        }
-                        Err(_) => None,
                     },
-                    None => {
-                        // If an alternate link is missing just grab one of them
-                        match entry.links.clone().into_iter().next().map(|l| l.href) {
-                            Some(s) => match Url::parse(&s) {
-                                Ok(u) => Some(u),
-                                Err(ParseError::RelativeUrlWithoutBase) => {
-                                    Url::parse(&format!("{}{}", url, &s)).ok()
-                                }
-                                Err(_) => None,
-                            },
-                            None => return Err(OpenringError::FeedBadTitle(url.to_string())),
-                        }
-                    }
-                },
-                entry.title.as_ref().map(|t| &t.content),
-                entry.published.or(entry.updated),
-            ) {
+                    entry.title.as_ref().map(|t| &t.content),
+                    entry.published.or(entry.updated),
+                )
+            {
                 // Skip articles after args.before, if present
                 if let Some(before) = args.before {
                     if date.date_naive() > before {
