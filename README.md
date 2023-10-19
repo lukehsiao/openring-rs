@@ -12,7 +12,9 @@
   <a href="https://crates.io/crates/openring">
     <img src="https://img.shields.io/crates/v/openring" alt="Version">
   </a>
-  <img src="https://img.shields.io/crates/l/openring" alt="License">
+  <a href="https://github.com/lukehsiao/openring-rs/blob/main/LICENSE">
+    <img src="https://img.shields.io/crates/l/openring" alt="License">
+  </a>
 </div>
 <br>
 
