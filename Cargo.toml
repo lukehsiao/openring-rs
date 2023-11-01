@@ -17,7 +17,7 @@ ammonia = "3.3.0"
 anyhow = "1.0.75"
 chrono = { version = "0.4.31", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4.4.6", features = ["derive", "wrap_help", "cargo"] }
-clap-verbosity-flag = "2.0.1"
+clap-verbosity-flag = "2.1.0"
 feed-rs = "1.3.0"
 html-escape = "0.2.13"
 indicatif = { version = "0.17.7", features = ["rayon"] }
