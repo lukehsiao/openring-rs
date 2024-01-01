@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 ammonia = "3.3.0"
-anyhow = "1.0.75"
+anyhow = "1.0.78"
 chrono = { version = "0.4.31", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4.4.11", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "2.1.1"
