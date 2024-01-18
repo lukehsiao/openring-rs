@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{naive::NaiveDate, DateTime, Utc};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
-use clap_verbosity_flag::{Verbosity, WarnLevel};
+use clap_verbosity_flag::{Verbosity};
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -100,7 +100,7 @@ pub struct Args {
     #[arg(short, long, value_parser = parse_naive_date)]
     before: Option<NaiveDate>,
     #[clap(flatten)]
-    pub verbose: Verbosity<WarnLevel>,
+    pub verbose: Verbosity,
 }
 
 #[derive(Serialize, Debug)]
