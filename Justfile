@@ -39,7 +39,7 @@ _update_changelog version:
 	    exit
 	fi
 
-	git-cliff --unreleased --tag {{version}} --prepend CHANGELOG.md
+	git-cliff --bump --unreleased --prepend CHANGELOG.md
 	${EDITOR:-vi} CHANGELOG.md
 	git commit CHANGELOG.md -m "docs(CHANGELOG): add entry for {{version}}"
 

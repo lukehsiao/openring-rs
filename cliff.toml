@@ -1,46 +1,52 @@
-# configuration file for git-cliff (0.1.0)
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
 
 [changelog]
 # changelog header
 header = """
+# Changelog\n
+All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.\n
 """
 # template for the changelog body
-# https://tera.netlify.app/docs/#introduction
+# https://keats.github.io/tera/docs/#introduction
 body = """
-{% if version -%}
-    ## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}
-{% else -%}
-    ## [Unreleased]
-{%- endif %}
-{% for group, commits in commits | group_by(attribute="group") -%}
-    ### {{ group | upper_first }}
-    {% for commit in commits -%}
-        {% if commit.scope -%}
-            - ({{commit.scope}}) {{ commit.message | upper_first }}
+---
+{% if version %}\
+    {% if previous.version %}\
+        ## [{{ version | trim_start_matches(pat="v") }}]($REPO/compare/{{ previous.version }}..{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% else %}\
+        ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% endif %}\
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits
+    | filter(attribute="scope")
+    | sort(attribute="scope") %}
+        - **({{commit.scope}})**{% if commit.breaking %} [**breaking**]{% endif %} \
+            {{ commit.message }} - ([{{ commit.id | truncate(length=7, end="") }}]($REPO/commit/{{ commit.id }})) - {{ commit.author.name }}
+    {%- endfor -%}
+    {% raw %}\n{% endraw %}\
+    {%- for commit in commits %}
+        {%- if commit.scope -%}
         {% else -%}
-            - {{ commit.message | upper_first }}
+            - {% if commit.breaking %} [**breaking**]{% endif %}\
+                {{ commit.message }} - ([{{ commit.id | truncate(length=7, end="") }}]($REPO/commit/{{ commit.id }})) - {{ commit.author.name }}
         {% endif -%}
-        {% if commit.breaking -%}
-            {% raw %}    {% endraw %}- **BREAKING**: {{commit.breaking_description | upper_first }}
-        {% endif -%}
-    {% endfor %}
-{% endfor -%}
-See the commits here: [{{ version | trim_start_matches(pat="v") }}]
-{% if previous.version %}
-    {% if version -%}
-        [{{ version | trim_start_matches(pat="v") }}]: https://github.com/lukehsiao/openring-rs/compare/{{ previous.version }}...{{ version }}
-    {% else -%}
-        [Unreleased]: https://github.com/lukehsiao/openring-rs/compare/{{ previous.version }}...main
-    {% endif -%}
-{% endif %}
-
-
+    {% endfor -%}
+{% endfor %}\n
 """
-# remove the leading and trailing whitespaces from the template
-trim = true
-# changelog footer
+# template for the changelog footer
 footer = """
 """
+# remove the leading and trailing whitespace from the templates
+trim = true
+# postprocessors
+postprocessors = [
+    { pattern = '\$REPO', replace = "https://github.com/lukehsiao/openring-rs" }, # replace repository URL
+]
 
 [git]
 # parse the commits based on https://www.conventionalcommits.org
