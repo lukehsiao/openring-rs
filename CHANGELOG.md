@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.1.14](https://github.com/lukehsiao/openring-rs/compare/v0.1.13..0.1.14) - 2024-01-18
+
+### Documentation
+
+- **(README)** link license badge to license - ([0ce9e45](https://github.com/lukehsiao/openring-rs/commit/0ce9e4547946d7fa1aa931adae7d950b4f4a6f7f)) - Luke Hsiao
+
+### Refactor
+
+- default to error-level logs - ([23e355a](https://github.com/lukehsiao/openring-rs/commit/23e355a3fdc39f4e10bc496458b6588e20fb7b85)) - Luke Hsiao
+
+---
 ## [0.1.13](https://github.com/lukehsiao/openring-rs/compare/v0.1.12..v0.1.13) - 2023-10-12
 
 ### Bug Fixes
