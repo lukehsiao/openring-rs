@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [0.1.14](https://github.com/lukehsiao/openring-rs/compare/v0.1.13..0.1.14) - 2024-01-18
+## [0.1.14](https://github.com/lukehsiao/openring-rs/compare/v0.1.13..v0.1.14) - 2024-01-18
 
 ### Documentation
 
