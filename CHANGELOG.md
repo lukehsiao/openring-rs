@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file. See [conven
 
 ### Documentation
 
+- **(CHANGELOG)** add entry for v0.1.14 - ([487c784](https://github.com/lukehsiao/openring-rs/commit/487c784e84af5c34da6d680625187328a0f101f1)) - Luke Hsiao
 - **(README)** link license badge to license - ([0ce9e45](https://github.com/lukehsiao/openring-rs/commit/0ce9e4547946d7fa1aa931adae7d950b4f4a6f7f)) - Luke Hsiao
 
 ### Refactor
@@ -67,7 +68,7 @@ All notable changes to this project will be documented in this file. See [conven
 ### Refactor
 
 - rename `--urls` to just `--url` - ([178788b](https://github.com/lukehsiao/openring-rs/commit/178788b37e05dbd8db6c2f371473dba0ae4cb739)) - Luke Hsiao
--  [**breaking**]switch to `feed-rs` - ([032add1](https://github.com/lukehsiao/openring-rs/commit/032add1034cfc72786957a34b1705606fd1f6488)) - Luke Hsiao
+-  [**breaking**] switch to `feed-rs` - ([032add1](https://github.com/lukehsiao/openring-rs/commit/032add1034cfc72786957a34b1705606fd1f6488)) - Luke Hsiao
 
 ---
 ## [0.1.9](https://github.com/lukehsiao/openring-rs/compare/v0.1.8..v0.1.9) - 2023-08-11
@@ -201,3 +202,4 @@ All notable changes to this project will be documented in this file. See [conven
 - allow parsing a url file - ([3a2374d](https://github.com/lukehsiao/openring-rs/commit/3a2374dd2238b1e8e02b2cccd66f05fe8b6d2aa4)) - Luke Hsiao
 - setup structure for tera - ([435b181](https://github.com/lukehsiao/openring-rs/commit/435b181c044e9f69ee74afa9d136dc4f98ac28a5)) - Luke Hsiao
 - error if no feed urls are provided - ([65393eb](https://github.com/lukehsiao/openring-rs/commit/65393eb0c96d203b6b459667e067feb3594cf247)) - Luke Hsiao
+
