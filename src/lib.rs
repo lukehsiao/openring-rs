@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{naive::NaiveDate, DateTime, Utc};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
-use clap_verbosity_flag::{Verbosity};
+use clap_verbosity_flag::Verbosity;
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{Diagnostic, NamedSource, SourceSpan};
