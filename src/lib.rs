@@ -55,7 +55,7 @@ pub enum OpenringError {
 #[diagnostic(code(openring::chrono_error))]
 pub struct ChronoError {
     #[source_code]
-    pub src: NamedSource,
+    pub src: NamedSource<String>,
     #[label("this date is invalid")]
     pub span: SourceSpan,
     #[help]
@@ -67,7 +67,7 @@ pub struct ChronoError {
 #[diagnostic(code(openring::url_parse_error))]
 pub struct FeedUrlError {
     #[source_code]
-    pub src: NamedSource,
+    pub src: NamedSource<String>,
     #[label("this url is invalid")]
     pub span: SourceSpan,
     #[help]

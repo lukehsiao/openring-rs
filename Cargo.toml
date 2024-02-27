@@ -14,21 +14,21 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 ammonia = "3.3.0"
-anyhow = "1.0.79"
-chrono = { version = "0.4.33", default-features = false, features = ["serde", "clock"] }
-clap = { version = "4.4.18", features = ["derive", "wrap_help", "cargo"] }
-clap-verbosity-flag = "2.1.2"
+anyhow = "1.0.80"
+chrono = { version = "0.4.34", default-features = false, features = ["serde", "clock"] }
+clap = { version = "4.5.1", features = ["derive", "wrap_help", "cargo"] }
+clap-verbosity-flag = "2.2.0"
 feed-rs = "1.4.0"
 html-escape = "0.2.13"
-indicatif = { version = "0.17.7", features = ["rayon"] }
+indicatif = { version = "0.17.8", features = ["rayon"] }
 log = "0.4.20"
-miette = { version = "5.10.0", features = ["fancy"] }
+miette = { version = "7.1.0", features = ["fancy"] }
 rayon = "1.8.1"
-serde = { version = "1.0.196", features = ["derive"] }
-serde_json = "1.0.113"
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
 tera = "1.19.1"
-thiserror = "1.0.56"
+thiserror = "1.0.57"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
-ureq = "2.9.1"
+ureq = "2.9.6"
 url = { version = "2.5.0", features = ["serde"] }
