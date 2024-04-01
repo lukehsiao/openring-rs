@@ -13,7 +13,7 @@ categories = ["command-line-utilities"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ammonia = "3.3.0"
+ammonia = "4.0.0"
 anyhow = "1.0.80"
 chrono = { version = "0.4.37", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4.5.4", features = ["derive", "wrap_help", "cargo"] }
