@@ -8,7 +8,8 @@
 <br>
 <div align="center">
   <a href="https://github.com/lukehsiao/openring-rs/actions/workflows/general.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/lukehsiao/openring-rs/general.yml" alt="Build Status"></a>
+    <img src="https://img.shields.io/github/actions/workflow/status/lukehsiao/openring-rs/general.yml" alt="Build Status">
+  </a>
   <a href="https://crates.io/crates/openring">
     <img src="https://img.shields.io/crates/v/openring" alt="Version">
   </a>
@@ -18,12 +19,9 @@
 </div>
 <br>
 
-`openring-rs` is a tool for generating a webring from RSS feeds, so you can populate a template with
-articles from those feeds and embed them in your own blog. An example template is provided in
-`in.html`.
+`openring-rs` is a tool for generating a webring from RSS feeds, so you can populate a template with articles from those feeds and embed them in your own blog. An example template is provided in `in.html`.
 
-This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the
-primary differences being:
+This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the primary differences being:
 - the template is provided as an argument, not read from stdin
 - we show a little progress bar
 - we fetch all feeds concurrently
@@ -58,9 +56,9 @@ Options:
 
 ## Using Tera Templates
 
-The templates supported by `openring-rs` are written using [Tera](https://tera.netlify.app/). Please
-refer to the Tera documentation for details.
+The templates supported by `openring-rs` are written using [Tera](https://tera.netlify.app/).
+Please refer to the Tera documentation for details.
 
 ## Why a Rust Port?
 
-Just for fun. You probably want to use Drew's stuff, it's likely better. But, this works for me.
+Just for fun.
