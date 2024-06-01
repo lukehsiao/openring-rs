@@ -18,7 +18,7 @@ anyhow = "1.0.82"
 chrono = { version = "0.4.38", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4.5.4", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "2.2.0"
-feed-rs = "1.4.0"
+feed-rs = "1.5.3"
 html-escape = "0.2.13"
 indicatif = { version = "0.17.8", features = ["rayon"] }
 log = "0.4.21"
