@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.1.15](https://github.com/lukehsiao/openring-rs/compare/v0.1.14..v0.1.15) - 2024-06-04
+
+### Dependencies
+- Bump to `feed-rs` v2.0.0 - Luke Hsiao
+
+### Styling
+
+- **(README)** 1 sentence per line and consistent indentation - ([04bbb05](https://github.com/lukehsiao/openring-rs/commit/04bbb05abfc296d52963bdf8e36dcbbe6ecc1b98)) - Luke Hsiao
+- run rustfmt - ([25413ff](https://github.com/lukehsiao/openring-rs/commit/25413ffb423b7f7bc6d22bd61c4af5b6e97da121)) - Luke Hsiao
+
+---
 ## [0.1.14](https://github.com/lukehsiao/openring-rs/compare/v0.1.13..v0.1.14) - 2024-01-18
 
 ### Documentation
