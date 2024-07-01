@@ -31,4 +31,4 @@ thiserror = "1.0.61"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
 ureq = "2.9.7"
-url = { version = "2.5.0", features = ["serde"] }
+url = { version = "2.5.2", features = ["serde"] }
