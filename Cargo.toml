@@ -16,7 +16,7 @@ categories = ["command-line-utilities"]
 ammonia = "4.0.0"
 anyhow = "1.0.86"
 chrono = { version = "0.4.38", default-features = false, features = ["serde", "clock"] }
-clap = { version = "4.5.4", features = ["derive", "wrap_help", "cargo"] }
+clap = { version = "4.5.8", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "2.2.0"
 feed-rs = "2.0.0"
 html-escape = "0.2.13"
