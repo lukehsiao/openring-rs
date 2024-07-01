@@ -25,7 +25,7 @@ log = "0.4.22"
 miette = { version = "7.2.0", features = ["fancy"] }
 rayon = "1.10.0"
 serde = { version = "1.0.203", features = ["derive"] }
-serde_json = "1.0.117"
+serde_json = "1.0.120"
 tera = "1.20.0"
 thiserror = "1.0.61"
 tracing = "0.1.40"
