@@ -61,7 +61,7 @@ _tlog describe version:
 	@git stats -r {{describe}}..HEAD
 
 # Target can be ["major", "minor", "patch", or a version]
-release target: semver
+release target: && semver
 	#!/usr/bin/env python3
 	# Inspired-by: https://git.sr.ht/~sircmpwn/dotfiles/tree/master/bin/semver
 	import os
