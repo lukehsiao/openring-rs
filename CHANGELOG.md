@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.2.0](https://github.com/lukehsiao/openring-rs/compare/v0.1.15..v0.2.0) - 2024-07-29
+
+In this release, the only meaningful change is changing from `chrono` to `jiff` as a dependency.
+However, this does also rename `article.date` to `article.timestamp` to better reflect reality.
+It is likely you will simply need to update your template to `s/article.date/article.timestamp/` and be on your way.
+
+### Build and Dependencies
+
+- **(deps)** [**breaking**] switch from `chrono` to `jiff` - ([485fe4e](https://github.com/lukehsiao/openring-rs/commit/485fe4ef480c9f08a1c895b9e6b75b8c2b6f3774)) - Luke Hsiao
+
+---
 ## [0.1.15](https://github.com/lukehsiao/openring-rs/compare/v0.1.14..v0.1.15) - 2024-06-04
 
 ### Dependencies
