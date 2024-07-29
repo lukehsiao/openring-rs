@@ -15,13 +15,13 @@ categories = ["command-line-utilities"]
 [dependencies]
 ammonia = "4.0.0"
 anyhow = "1.0.86"
-chrono = { version = "0.4.38", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4.5.11", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "2.2.1"
 feed-rs = "2.1.0"
 html-escape = "0.2.13"
 indicatif = { version = "0.17.8", features = ["rayon"] }
 log = "0.4.22"
+jiff = { version = "0.1.2", features = ["serde"] }
 miette = { version = "7.2.0", features = ["fancy"] }
 rayon = "1.10.0"
 serde = { version = "1.0.204", features = ["derive"] }

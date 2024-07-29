@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
-use chrono::{naive::NaiveDate, DateTime, Utc};
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::Verbosity;
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use jiff::{civil::Date, tz::TimeZone, Timestamp};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
@@ -31,8 +31,8 @@ pub enum OpenringError {
     #[error("The feed at `{0}` has a bad a title (e.g., missing link or title).")]
     #[diagnostic(code(openring::feed_title_error))]
     FeedBadTitle(String),
-    #[error("Failed to parse naive date.")]
-    NaiveDateError(#[from] chrono::ParseError),
+    #[error("Failed to parse civil date.")]
+    CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
     ChronoError(#[from] ChronoError),
@@ -97,8 +97,8 @@ pub struct Args {
     /// This is naive (no timezone), so articles close to the boundary in different timezones might
     /// be unexpectedly filtered. In addition, some feeds are truncated, and may have already pruned
     /// away articles before this date from the feed itself.
-    #[arg(short, long, value_parser = parse_naive_date)]
-    before: Option<NaiveDate>,
+    #[arg(short, long)]
+    before: Option<Date>,
     #[clap(flatten)]
     pub verbose: Verbosity,
 }
@@ -110,11 +110,7 @@ pub struct Article {
     summary: String,
     source_link: Url,
     source_title: String,
-    date: DateTime<Utc>,
-}
-
-fn parse_naive_date(input: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(input, "%Y-%m-%d").map_err(|e| e.into())
+    timestamp: Timestamp,
 }
 
 fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
@@ -339,8 +335,9 @@ pub fn run(args: Args) -> Result<()> {
                 )
             {
                 // Skip articles after args.before, if present
+                let timestamp = Timestamp::from_second(date.timestamp())?;
                 if let Some(before) = args.before {
-                    if date.date_naive() > before {
+                    if timestamp > before.to_zoned(TimeZone::system())?.timestamp() {
                         continue;
                     }
                 }
@@ -381,7 +378,7 @@ pub fn run(args: Args) -> Result<()> {
                     summary: safe_summary.trim().to_string(),
                     source_link: source_link.clone(),
                     source_title: source_title.clone(),
-                    date,
+                    timestamp,
                 });
             } else {
                 warn!(
@@ -396,7 +393,7 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
-    articles.sort_unstable_by(|a, b| a.date.cmp(&b.date).reverse());
+    articles.sort_unstable_by(|a, b| a.timestamp.cmp(&b.timestamp).reverse());
     let articles = if articles.len() >= args.num_articles {
         &articles[0..args.num_articles]
     } else {

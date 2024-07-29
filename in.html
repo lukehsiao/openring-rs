@@ -6,9 +6,11 @@
       <h4 class="title" dir="auto">
         <a href="{{ article.link | safe }}" target="_blank" rel="noopener">{{ article.title | safe }}</a>
       </h4>
-      <p class="summary" dir="auto">{{ article.summary | linebreaksbr | replace(from="<br>", to=" ") | striptags | trim | truncate(length=256) | safe }}</p>
-      <small class="source"> via <a href="{{ article.source_link | safe }}">{{ article.source_title | safe }}</a></small>
-      <small class="date">{{ article.date | date(format="%B %d, %Y") }}</small>
+      <p class="summary" dir="auto">{{ article.summary | linebreaksbr | replace(from="<br>", to=" ") | striptags | trim
+        | truncate(length=256) | safe }}</p>
+      <small class="source"> via <a href="{{ article.source_link | safe }}">{{ article.source_title | safe
+          }}</a></small>
+      <small class="date">{{ article.timestamp | date(format="%B %d, %Y") }}</small>
     </div>
     {% endfor %}
   </section>
