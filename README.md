@@ -25,6 +25,7 @@ This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 - the template is provided as an argument, not read from stdin
 - we show a little progress bar
 - we fetch all feeds concurrently
+- we respect throttling and send conditional requests when using `--cache` (recommended!)
 - we allow filtering feeds with `--before`
 - we provide better error messages (via [miette](https://github.com/zkat/miette))
 
@@ -42,16 +43,18 @@ A webring for static site generators written in Rust
 Usage: openring [OPTIONS] --template-file <FILE>
 
 Options:
-  -n, --num-articles <NUM_ARTICLES>  Total number of articles to fetch [default: 3]
-  -p, --per-source <PER_SOURCE>      Number of most recent articles to get from each feed [default: 1]
-  -S, --url-file <FILE>              File with URLs of RSS feeds to read (one URL per line, lines starting with '#' or "//" ignored)
-  -t, --template-file <FILE>         Tera template file
-  -s, --url <URL>                    A single URL to consider (can be repeated to specify multiple)
-  -b, --before <BEFORE>              Only include articles before this date (in YYYY-MM-DD format)
-  -v, --verbose...                   More output per occurrence
-  -q, --quiet...                     Less output per occurrence
-  -h, --help                         Print help (see more with '--help')
-  -V, --version                      Print version
+  -n, --num-articles <NUM_ARTICLES>    Total number of articles to fetch [default: 3]
+  -p, --per-source <PER_SOURCE>        Number of most recent articles to get from each feed [default: 1]
+  -S, --url-file <FILE>                File with URLs of RSS feeds to read (one URL per line, lines starting with '#' or "//" ignored)
+  -t, --template-file <FILE>           Tera template file
+  -s, --url <URL>                      A single URL to consider (can be repeated to specify multiple)
+  -b, --before <BEFORE>                Only include articles before this date (in YYYY-MM-DD format)
+  -c, --cache                          Use request cache stored on disk at `.openringcache`
+      --max-cache-age <MAX_CACHE_AGE>  Discard all cached requests older than this duration [default: 7d]
+  -v, --verbose...                     Increase logging verbosity
+  -q, --quiet...                       Decrease logging verbosity
+  -h, --help                           Print help (see more with '--help')
+  -V, --version                        Print version
 ```
 
 ## Using Tera Templates

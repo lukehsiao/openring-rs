@@ -1,26 +1,31 @@
 use std::{
+    cmp::Ordering,
     fs::{self, File},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     result,
+    sync::Arc,
     time::Duration,
 };
 
 use clap::{builder::ValueHint, crate_name, crate_version, Parser};
 use clap_verbosity_flag::Verbosity;
+use dashmap::DashMap;
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use jiff::{civil::Date, tz::TimeZone, Timestamp};
+use jiff::{civil::Date, tz::TimeZone, Timestamp, ToSpan, Span};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tera::Tera;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use ureq::{Agent, AgentBuilder};
 use url::{ParseError, Url};
 
 type Result<T> = result::Result<T, OpenringError>;
+
+const OPENRING_CACHE_FILE: &str = ".openringcache";
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum OpenringError {
@@ -48,6 +53,12 @@ pub enum OpenringError {
     #[error("Failed to parse tera template.")]
     #[diagnostic(code(openring::template_error))]
     TemplateError(#[from] tera::Error),
+    #[error("Invalid cache file found.")]
+    #[diagnostic(code(openring::cache_error))]
+    CsvError(#[from] csv::Error),
+    #[error("Invalid cache file found.")]
+    #[diagnostic(code(openring::cache_error))]
+    TryFromIntError(#[from] std::num::TryFromIntError),
 }
 
 #[derive(Error, Diagnostic, Debug)]
@@ -99,8 +110,75 @@ pub struct Args {
     /// away articles before this date from the feed itself.
     #[arg(short, long)]
     before: Option<Date>,
+    /// Use request cache stored on disk at `.openringcache`
+    ///
+    /// Note that this only prevents refetching if the feed source sets a
+    /// Retry-After header. Otherwise, the existence of a cache file just allows
+    /// openring to respect ETag and Last-Modified headers for conditional
+    /// requests.
+    #[arg(short, long)]
+    cache: bool,
+    /// Discard all cached requests older than this duration
+    #[arg(
+        long,
+        value_parser = humantime::parse_duration,
+        default_value = "7d"
+    )]
+    max_cache_age: Duration,
     #[clap(flatten)]
     pub verbose: Verbosity,
+}
+
+/// Describes a feed fetch result that can be serialized to disk
+#[derive(Serialize, Deserialize, Debug)]
+struct CacheValue {
+    timestamp: Timestamp,
+    retry_after: Option<Span>,
+    last_modified: Option<String>,
+    etag: Option<String>,
+    body: Option<String>,
+}
+
+type Cache = DashMap<Url, CacheValue>;
+
+trait StoreExt {
+    /// Store the cache under the given path. Update access timestamps
+    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()>;
+
+    /// Load cache from path. Discard entries older than `max_age_secs`
+    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64) -> Result<Cache>;
+}
+
+impl StoreExt for Cache {
+    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()> {
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_path(path)?;
+        for result in self {
+            wtr.serialize((result.key(), result.value()))?;
+        }
+        Ok(())
+    }
+
+    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64) -> Result<Cache> {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_path(path)?;
+
+        let map = DashMap::new();
+        let current_ts = Timestamp::now();
+        for result in rdr.deserialize() {
+            let (url, value): (Url, CacheValue) = result?;
+            // Discard entries older than `max_age_secs`.
+            // This allows gradually updating the cache over multiple runs.
+            if (current_ts - value.timestamp).compare(i64::try_from(max_age_secs)?.seconds())?
+                == Ordering::Less
+            {
+                map.insert(url, value);
+            }
+        }
+        Ok(map)
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -111,6 +189,51 @@ pub struct Article {
     source_link: Url,
     source_title: String,
     timestamp: Timestamp,
+}
+
+/// Load cache (if exists and is still valid).
+/// This returns an `Option` as starting without a cache is a common scenario
+/// and we silently discard errors on purpose.
+fn load_cache(args: &Args) -> Option<Cache> {
+    if !args.cache {
+        return None;
+    }
+
+    // Discard entire cache if it hasn't been updated since `max_cache_age`.
+    // This is an optimization, which avoids iterating over the file and
+    // checking the age of each entry.
+    match fs::metadata(OPENRING_CACHE_FILE) {
+        Err(_e) => {
+            // No cache found; silently start with empty cache
+            return None;
+        }
+        Ok(metadata) => {
+            let modified = metadata.modified().ok()?;
+            let elapsed = modified.elapsed().ok()?;
+            if elapsed > args.max_cache_age {
+                warn!(
+                    "Cache is too old (age: {:#?}, max age: {:#?}). Discarding and recreating.",
+                    Duration::from_secs(elapsed.as_secs()),
+                    Duration::from_secs(args.max_cache_age.as_secs())
+                );
+                return None;
+            }
+            info!(
+                "Cache is recent (age: {:#?}, max age: {:#?}). Using.",
+                Duration::from_secs(elapsed.as_secs()),
+                Duration::from_secs(args.max_cache_age.as_secs())
+            );
+        }
+    }
+
+    let cache = Cache::load(OPENRING_CACHE_FILE, args.max_cache_age.as_secs());
+    match cache {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            warn!("Error while loading cache: {e}. Continuing without.");
+            None
+        }
+    }
 }
 
 fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
@@ -148,7 +271,7 @@ fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
 // Get all feeds from URLs concurrently.
 //
 // Skips feeds if there are errors. Shows progress.
-fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
+fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
     let agent: Agent = AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!(crate_name!(), '/', crate_version!()))
@@ -159,16 +282,130 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
     let feeds: Vec<(Feed, Url)> = urls
         .par_iter()
         .enumerate()
-        .filter_map(|(idx, url)| {
+        .filter_map(|(idx, url)| 'a: {
             let pb = m.add(ProgressBar::new(2));
             pb.set_style(ProgressStyle::with_template("{prefix:.bold.dim} {wide_msg}").unwrap());
             pb.set_prefix(format!("[{}/{}]", idx, urls.len()));
             pb.set_message(url.as_str().to_string());
-            let body = match agent.get(url.as_str()).call() {
-                Ok(r) => r.into_string().ok(),
+
+            let cache_value = cache.get_mut(url);
+
+            // Respect Retry-After Header
+            if let Some(ref cv) = cache_value {
+                if let Some(retry) = cv.retry_after {
+                    if cv.timestamp + retry > Timestamp::now() {
+                        debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
+
+                        let body = cv.body.clone();
+
+                        // TODO: This is just copy-pasted, should be reused
+                        pb.inc(1);
+                        if let Some(feed_str) = body {
+                            match parser::parse(feed_str.as_bytes()) {
+                                Ok(feed) => {
+                                    pb.finish_and_clear();
+                                    break 'a Some((feed, url.clone()));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        url=%url.as_str(),
+                                        error=%e,
+                                        "failed to parse feed."
+                                    );
+                                    pb.finish_with_message(format!(
+                                        "Failed to parse feed from `{}`",
+                                        url.as_str()
+                                    ));
+                                    break 'a None;
+                                }
+                            }
+                        } else {
+                            pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
+                            break 'a None;
+                        }
+                    }
+                }
+            }
+            
+            let req = {
+                let mut r = agent.get(url.as_str());
+                // Add friendly headers if cache is available
+                if let Some(ref cv) = cache_value {
+                    if let Some(last_modified) = &cv.last_modified {
+                        r = r.set("If-Modified-Since", last_modified);
+                    }
+                    if let Some(etag) = &cv.etag {
+                        r = r.set("If-None-Match", etag);
+                    }
+                }
+                debug!(url=%url, if_modified_since=r.header("if-modified-since"), etag=r.header("if-none-match"), "sending request");
+                r
+            };
+
+            let body = match req.call() {
+                Ok(r) => {
+                    // ETag values must have the actual quotes
+                    let etag = r.header("etag").map(|s| {
+                        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with("W/\"") && s.ends_with('"')) {
+                            s.to_string()
+                        } else {
+                            format!("\"{}\"", s)
+                        }}
+                    );
+                    let last_modified = r.header("last-modified").map(|s| s.to_string());
+                    // Assumes the value is in seconds.
+                    let retry_after= r.header("retry-after").map(|s| s.parse::<Span>().ok()).unwrap_or(None);
+                    let status = r.status();
+                    let mut body = r.into_string().ok();
+
+                    // Update cache
+                    if let Some(mut cv) = cache_value {
+                        match status {
+                            304 => {
+                                debug!(url=%url, status=status, "got 304, using feed from cache");
+                                body = cv.body.clone();
+                            },                        
+                            _ =>  {
+                                debug!(url=%url, status=status, "cache hit, using feed from body");
+                                cv.etag = etag;
+                                cv.last_modified = last_modified;
+                                cv.body = body.clone();
+                            }
+                        }
+                        cv.timestamp = Timestamp::now();
+                    } else {
+                        debug!(url=%url, status=status, "using feed from body and adding to cache");
+                        cache.insert(
+                            url.clone(),
+                            CacheValue {
+                                timestamp: Timestamp::now(),
+                                retry_after,
+                                etag,
+                                last_modified,
+                                body: body.clone(),
+                            },
+                        );
+                    }
+                    body
+                }
                 Err(e) => {
-                    warn!(url=%url.as_str(), error=%e, "failed to get feed.");
-                    None
+                    if let Some(mut cv) = cache_value {
+                        cv.timestamp = Timestamp::now();
+                        match e {
+                            ureq::Error::Status(status, r) if status == 429 => {
+                                let retry_after= r.header("retry-after").map(|s| s.parse::<i64>().map(|n| n.seconds()).ok()).unwrap_or(None);
+                                debug!(url=%url, status=status, retry_after=r.header("retry-after"), "got 429, using feed from cache");
+                                dbg!(&retry_after);
+                                cv.timestamp = Timestamp::now();
+                                cv.retry_after = retry_after;
+                                cv.body.clone()
+                            },                        
+                            _ => None
+                        }
+                    } else {
+                        warn!(url=%url.as_str(), error=%e, "failed to get feed.");
+                        None
+                    }
                 }
             };
             pb.inc(1);
@@ -204,6 +441,9 @@ fn get_feeds_from_urls(urls: Vec<Url>) -> Result<Vec<(Feed, Url)>> {
 
 pub fn run(args: Args) -> Result<()> {
     debug!(?args);
+    let cache = load_cache(&args).unwrap_or_default();
+    let cache = Arc::new(cache);
+
     let mut urls = args.url;
 
     if let Some(path) = args.url_file {
@@ -215,7 +455,11 @@ pub fn run(args: Args) -> Result<()> {
         return Err(OpenringError::FeedMissing);
     }
 
-    let feeds = get_feeds_from_urls(urls)?;
+    let feeds = get_feeds_from_urls(urls, &cache)?;
+
+    if args.cache {
+        cache.store(OPENRING_CACHE_FILE)?;
+    }
 
     let template = fs::read_to_string(&args.template_file)?;
     let mut context = tera::Context::new();
