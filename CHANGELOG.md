@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.2.3](https://github.com/lukehsiao/openring-rs/compare/v0.2.2..v0.2.3) - 2024-08-08
+
+### Bug Fixes
+
+- adjust log levels - ([9c86048](https://github.com/lukehsiao/openring-rs/commit/9c860488cd4a555867bfe95cafc61b53cfd62d5e)) - Luke Hsiao
+
+---
 ## [0.2.2](https://github.com/lukehsiao/openring-rs/compare/v0.2.1..v0.2.2) - 2024-08-08
 
 Minor release that now allows feed entries without summary/content.
