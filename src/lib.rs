@@ -595,18 +595,18 @@ pub fn run(args: Args) -> Result<()> {
                                 warn!(
                                     ?link,
                                     ?source_link,
-                                    "skipping link from feed: no summary or content provided."
+                                    "no summary or content provided."
                                 );
-                                continue;
+                                ""
                             }
                         },
                         None => {
                             warn!(
                                 ?link,
                                 ?source_link,
-                                "skipping link from feed: no summary or content provided."
+                                "no summary or content provided."
                             );
-                            continue;
+                            ""
                         }
                     },
                 };
