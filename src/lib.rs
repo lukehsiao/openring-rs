@@ -320,6 +320,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                                 }
                             }
                         } else {
+                            warn!(url=url.as_str(), "empty feed");
                             pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
                             break 'a None;
                         }
@@ -430,6 +431,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                     }
                 }
             } else {
+                warn!(url=url.as_str(), "empty feed");
                 pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
                 None
             }
@@ -592,7 +594,7 @@ pub fn run(args: Args) -> Result<()> {
                         Some(c) => match &c.body {
                             Some(b) => b,
                             None => {
-                                warn!(
+                                info!(
                                     ?link,
                                     ?source_link,
                                     "no summary or content provided."
@@ -601,7 +603,7 @@ pub fn run(args: Args) -> Result<()> {
                             }
                         },
                         None => {
-                            warn!(
+                            info!(
                                 ?link,
                                 ?source_link,
                                 "no summary or content provided."
