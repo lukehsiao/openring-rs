@@ -3,6 +3,34 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.2.1](https://github.com/lukehsiao/openring-rs/compare/v0.2.0..v0.2.1) - 2024-08-08
+
+**This release adds a nice quality of life feature: local caching.**
+
+We want to respect `Etag` and `Last-Modified` headers when sending requests to reduce resource strain on the servers providing feeds.
+Similarly, we want to respect `Retry-After` if a server provides that header when responding with an HTTP 429.
+
+This patch respects both by introducing a local cache option in `.openringcache`, which is a simple CSV file with the schema: url, timestamp, retry_after, last_modified, etag, and body, where body is the entire content of the response body last time we fetched the feed.
+
+With this local cache, if we have a value for Retry-After, we know we were throttled, so we skip sending a request and just use the feed from the cache.
+
+Otherwise, if we have a cache value, we send a conditional request, setting `If-Modified-Since` and `Etag` headers in the request.
+
+If we don't have a cache value, we send an unconditional request.
+
+### Features
+
+- add caching options to respect headers - ([0b51bc9](https://github.com/lukehsiao/openring-rs/commit/0b51bc93a0b73a00cbc8c5220cffcc02a92f89ea)) - Luke Hsiao
+
+### Build and Dependencies
+
+- **(deps)** bump clap from 4.5.11 to 4.5.13 - ([2896fc0](https://github.com/lukehsiao/openring-rs/commit/2896fc02e6a8c9710812ea0b9e2c2e6682c7cd64)) - dependabot[bot]
+- **(deps)** bump jiff from 0.1.2 to 0.1.3 - ([f0927d2](https://github.com/lukehsiao/openring-rs/commit/f0927d2b2f2429233a8edcc97ff789e33c65074d)) - dependabot[bot]
+- **(deps)** bump serde_json from 1.0.121 to 1.0.122 - ([2b5ec04](https://github.com/lukehsiao/openring-rs/commit/2b5ec04296851c77b09cf074733b9faec288d666)) - dependabot[bot]
+- **(deps)** upgrade all dependencies - ([32248c0](https://github.com/lukehsiao/openring-rs/commit/32248c0c4059f0eb91947c7129243371d80e50f6)) - Luke Hsiao
+- tweak changelog and order of release checks - ([c8c6ebe](https://github.com/lukehsiao/openring-rs/commit/c8c6ebeb25f9f15a4fdeac437a3b2804c92e00b2)) - Luke Hsiao
+
+---
 ## [0.2.0](https://github.com/lukehsiao/openring-rs/compare/v0.1.15..v0.2.0) - 2024-07-29
 
 In this release, the only meaningful change is changing from `chrono` to `jiff` as a dependency.
