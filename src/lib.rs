@@ -13,7 +13,7 @@ use clap_verbosity_flag::Verbosity;
 use dashmap::DashMap;
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use jiff::{civil::Date, tz::TimeZone, Timestamp, ToSpan, Span};
+use jiff::{civil::Date, tz::TimeZone, Span, Timestamp, ToSpan};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -327,7 +327,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                     }
                 }
             }
-            
+
             let req = {
                 let mut r = agent.get(url.as_str());
                 // Add friendly headers if cache is available
@@ -365,7 +365,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                             304 => {
                                 debug!(url=%url, status=status, "got 304, using feed from cache");
                                 body = cv.body.clone();
-                            },                        
+                            },
                             _ =>  {
                                 debug!(url=%url, status=status, "cache hit, using feed from body");
                                 cv.etag = etag;
@@ -400,7 +400,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                                 cv.timestamp = Timestamp::now();
                                 cv.retry_after = retry_after;
                                 cv.body.clone()
-                            },                        
+                            },
                             _ => None
                         }
                     } else {
@@ -594,20 +594,12 @@ pub fn run(args: Args) -> Result<()> {
                         Some(c) => match &c.body {
                             Some(b) => b,
                             None => {
-                                info!(
-                                    ?link,
-                                    ?source_link,
-                                    "no summary or content provided."
-                                );
+                                info!(?link, ?source_link, "no summary or content provided.");
                                 ""
                             }
                         },
                         None => {
-                            info!(
-                                ?link,
-                                ?source_link,
-                                "no summary or content provided."
-                            );
+                            info!(?link, ?source_link, "no summary or content provided.");
                             ""
                         }
                     },
