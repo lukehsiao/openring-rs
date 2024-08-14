@@ -29,6 +29,12 @@ This is a rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 - we allow filtering feeds with `--before`
 - we provide better error messages (via [miette](https://github.com/zkat/miette))
 
+## Demo
+
+To see this in action, you can look at the footer of this blog post.
+
+<https://luke.hsiao.dev/blog/openring-rs/>
+
 ## Install
 
 ```
