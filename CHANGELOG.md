@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.2.4](https://github.com/lukehsiao/openring-rs/compare/v0.2.3..v0.2.4) - 2024-08-14
+
+### Bug Fixes
+
+- default to 4hrs when receiving a 429 - ([351d563](https://github.com/lukehsiao/openring-rs/commit/351d563efd5c556517ac99d0fdb37e0b5034323b)) - Luke Hsiao
+
+### Documentation
+
+- **(README)** add link to demo of the webring - ([09e1b3c](https://github.com/lukehsiao/openring-rs/commit/09e1b3c58726b3c3345c8bced1bf825174dd4a71)) - Luke Hsiao
+
+---
 ## [0.2.3](https://github.com/lukehsiao/openring-rs/compare/v0.2.2..v0.2.3) - 2024-08-08
 
 ### Bug Fixes
