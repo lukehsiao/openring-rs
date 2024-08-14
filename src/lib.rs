@@ -94,7 +94,7 @@ pub struct Args {
     /// Number of most recent articles to get from each feed
     #[arg(short, long, default_value_t = 1)]
     per_source: usize,
-    /// File with URLs of RSS feeds to read (one URL per line, lines starting with '#' or "//" ignored)
+    /// File with URLs of Atom/RSS feeds to read (one URL per line, lines starting with '#' or "//" are ignored)
     #[arg(short = 'S', long, value_name = "FILE", value_hint=ValueHint::FilePath)]
     url_file: Option<PathBuf>,
     /// Tera template file
@@ -112,17 +112,17 @@ pub struct Args {
     before: Option<Date>,
     /// Use request cache stored on disk at `.openringcache`
     ///
-    /// Note that this only prevents refetching if the feed source sets a
-    /// Retry-After header. Otherwise, the existence of a cache file just allows
-    /// openring to respect ETag and Last-Modified headers for conditional
-    /// requests.
+    /// Note that this only prevents refetching if the feed source responds
+    /// with a 429. In this case, we respect Retry-After, or default to 4h.
+    /// Otherwise, the existence of a cache file just allows openring to respect
+    /// ETag and Last-Modified headers for conditional requests.
     #[arg(short, long)]
     cache: bool,
     /// Discard all cached requests older than this duration
     #[arg(
         long,
         value_parser = humantime::parse_duration,
-        default_value = "7d"
+        default_value = "14d"
     )]
     max_cache_age: Duration,
     #[clap(flatten)]
@@ -354,8 +354,6 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                         }}
                     );
                     let last_modified = r.header("last-modified").map(|s| s.to_string());
-                    // Assumes the value is in seconds.
-                    let retry_after= r.header("retry-after").map(|s| s.parse::<Span>().ok()).unwrap_or(None);
                     let status = r.status();
                     let mut body = r.into_string().ok();
 
@@ -380,7 +378,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                             url.clone(),
                             CacheValue {
                                 timestamp: Timestamp::now(),
-                                retry_after,
+                                retry_after: None,
                                 etag,
                                 last_modified,
                                 body: body.clone(),
@@ -394,7 +392,8 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
                         cv.timestamp = Timestamp::now();
                         match e {
                             ureq::Error::Status(status, r) if status == 429 => {
-                                let retry_after= r.header("retry-after").map(|s| s.parse::<i64>().map(|n| n.seconds()).ok()).unwrap_or(None);
+                                // Default to waiting 4 hrs if no Retry-After
+                                let retry_after= r.header("retry-after").map(|s| s.parse::<i64>().map(|n| n.seconds()).ok()).unwrap_or(Some(4.hours()));
                                 debug!(url=%url, status=status, retry_after=r.header("retry-after"), "got 429, using feed from cache");
                                 dbg!(&retry_after);
                                 cv.timestamp = Timestamp::now();
