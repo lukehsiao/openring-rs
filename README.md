@@ -71,3 +71,8 @@ Please refer to the Tera documentation for details.
 ## Why a Rust Port?
 
 Just for fun.
+
+## Roadmap
+
+- The current parallel feed implementation uses `rayon` for convenience, but using tokio for these highly I/O-bound feed fetching would be more efficient.
+  I would like to switch at some point.
