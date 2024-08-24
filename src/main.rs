@@ -2,7 +2,7 @@ use clap::Parser;
 use miette::{Context, Result};
 use std::io;
 
-use openring::{self, Args};
+use openring::{self, args::Args};
 
 fn main() -> Result<()> {
     let args = Args::parse();

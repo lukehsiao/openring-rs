@@ -1,185 +1,32 @@
+pub mod args;
+pub mod cache;
+pub mod error;
+
 use std::{
-    cmp::Ordering,
     fs::{self, File},
     io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    result,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use clap::{builder::ValueHint, crate_name, crate_version, Parser};
-use clap_verbosity_flag::Verbosity;
-use dashmap::DashMap;
+use clap::{crate_name, crate_version};
 use feed_rs::{model::Feed, parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use jiff::{civil::Date, tz::TimeZone, Span, Timestamp, ToSpan};
-use miette::{Diagnostic, NamedSource, SourceSpan};
+use jiff::{tz::TimeZone, Timestamp, ToSpan};
+use miette::NamedSource;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tera::Tera;
-use thiserror::Error;
 use tracing::{debug, info, warn};
 use ureq::{Agent, AgentBuilder};
 use url::{ParseError, Url};
 
-type Result<T> = result::Result<T, OpenringError>;
-
-const OPENRING_CACHE_FILE: &str = ".openringcache";
-
-#[derive(Error, Debug, Diagnostic)]
-pub enum OpenringError {
-    #[error("No valid published or updated date found.")]
-    DateError,
-    #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
-    FeedMissing,
-    #[error("The feed at `{0}` has a bad a title (e.g., missing link or title).")]
-    #[diagnostic(code(openring::feed_title_error))]
-    FeedBadTitle(String),
-    #[error("Failed to parse civil date.")]
-    CivilDateError(#[from] jiff::Error),
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ChronoError(#[from] ChronoError),
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    FeedUrlError(#[from] FeedUrlError),
-    #[error("Failed to open file.")]
-    #[diagnostic(code(openring::io_error))]
-    IoError(#[from] std::io::Error),
-    #[error("Failed to parse URL.")]
-    #[diagnostic(code(openring::url_parse_error))]
-    UrlParseError(#[from] url::ParseError),
-    #[error("Failed to parse tera template.")]
-    #[diagnostic(code(openring::template_error))]
-    TemplateError(#[from] tera::Error),
-    #[error("Invalid cache file found.")]
-    #[diagnostic(code(openring::cache_error))]
-    CsvError(#[from] csv::Error),
-    #[error("Invalid cache file found.")]
-    #[diagnostic(code(openring::cache_error))]
-    TryFromIntError(#[from] std::num::TryFromIntError),
-}
-
-#[derive(Error, Diagnostic, Debug)]
-#[error("Failed to parse datetime.")]
-#[diagnostic(code(openring::chrono_error))]
-pub struct ChronoError {
-    #[source_code]
-    pub src: NamedSource<String>,
-    #[label("this date is invalid")]
-    pub span: SourceSpan,
-    #[help]
-    pub help: String,
-}
-
-#[derive(Error, Diagnostic, Debug)]
-#[error("Failed to parse feed url.")]
-#[diagnostic(code(openring::url_parse_error))]
-pub struct FeedUrlError {
-    #[source_code]
-    pub src: NamedSource<String>,
-    #[label("this url is invalid")]
-    pub span: SourceSpan,
-    #[help]
-    pub help: String,
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-pub struct Args {
-    /// Total number of articles to fetch
-    #[arg(short, long, default_value_t = 3)]
-    num_articles: usize,
-    /// Number of most recent articles to get from each feed
-    #[arg(short, long, default_value_t = 1)]
-    per_source: usize,
-    /// File with URLs of Atom/RSS feeds to read (one URL per line, lines starting with '#' or "//" are ignored)
-    #[arg(short = 'S', long, value_name = "FILE", value_hint=ValueHint::FilePath)]
-    url_file: Option<PathBuf>,
-    /// Tera template file
-    #[arg(short, long, value_parser, value_name = "FILE", value_hint=ValueHint::FilePath)]
-    template_file: PathBuf,
-    /// A single URL to consider (can be repeated to specify multiple)
-    #[arg(short = 's', long, value_hint=ValueHint::Url)]
-    url: Vec<Url>,
-    /// Only include articles before this date (in YYYY-MM-DD format).
-    ///
-    /// This is naive (no timezone), so articles close to the boundary in different timezones might
-    /// be unexpectedly filtered. In addition, some feeds are truncated, and may have already pruned
-    /// away articles before this date from the feed itself.
-    #[arg(short, long)]
-    before: Option<Date>,
-    /// Use request cache stored on disk at `.openringcache`
-    ///
-    /// Note that this only prevents refetching if the feed source responds
-    /// with a 429. In this case, we respect Retry-After, or default to 4h.
-    /// Otherwise, the existence of a cache file just allows openring to respect
-    /// ETag and Last-Modified headers for conditional requests.
-    #[arg(short, long)]
-    cache: bool,
-    /// Discard all cached requests older than this duration
-    #[arg(
-        long,
-        value_parser = humantime::parse_duration,
-        default_value = "14d"
-    )]
-    max_cache_age: Duration,
-    #[clap(flatten)]
-    pub verbose: Verbosity,
-}
-
-/// Describes a feed fetch result that can be serialized to disk
-#[derive(Serialize, Deserialize, Debug)]
-struct CacheValue {
-    timestamp: Timestamp,
-    retry_after: Option<Span>,
-    last_modified: Option<String>,
-    etag: Option<String>,
-    body: Option<String>,
-}
-
-type Cache = DashMap<Url, CacheValue>;
-
-trait StoreExt {
-    /// Store the cache under the given path. Update access timestamps
-    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()>;
-
-    /// Load cache from path. Discard entries older than `max_age_secs`
-    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64) -> Result<Cache>;
-}
-
-impl StoreExt for Cache {
-    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()> {
-        let mut wtr = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_path(path)?;
-        for result in self {
-            wtr.serialize((result.key(), result.value()))?;
-        }
-        Ok(())
-    }
-
-    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64) -> Result<Cache> {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_path(path)?;
-
-        let map = DashMap::new();
-        let current_ts = Timestamp::now();
-        for result in rdr.deserialize() {
-            let (url, value): (Url, CacheValue) = result?;
-            // Discard entries older than `max_age_secs`.
-            // This allows gradually updating the cache over multiple runs.
-            if (current_ts - value.timestamp).compare(i64::try_from(max_age_secs)?.seconds())?
-                == Ordering::Less
-            {
-                map.insert(url, value);
-            }
-        }
-        Ok(map)
-    }
-}
+use crate::{
+    args::Args,
+    cache::{Cache, CacheValue, StoreExt, OPENRING_CACHE_FILE},
+    error::{FeedUrlError, OpenringError, Result},
+};
 
 #[derive(Serialize, Debug)]
 pub struct Article {
@@ -189,51 +36,6 @@ pub struct Article {
     source_link: Url,
     source_title: String,
     timestamp: Timestamp,
-}
-
-/// Load cache (if exists and is still valid).
-/// This returns an `Option` as starting without a cache is a common scenario
-/// and we silently discard errors on purpose.
-fn load_cache(args: &Args) -> Option<Cache> {
-    if !args.cache {
-        return None;
-    }
-
-    // Discard entire cache if it hasn't been updated since `max_cache_age`.
-    // This is an optimization, which avoids iterating over the file and
-    // checking the age of each entry.
-    match fs::metadata(OPENRING_CACHE_FILE) {
-        Err(_e) => {
-            // No cache found; silently start with empty cache
-            return None;
-        }
-        Ok(metadata) => {
-            let modified = metadata.modified().ok()?;
-            let elapsed = modified.elapsed().ok()?;
-            if elapsed > args.max_cache_age {
-                warn!(
-                    "Cache is too old (age: {:#?}, max age: {:#?}). Discarding and recreating.",
-                    Duration::from_secs(elapsed.as_secs()),
-                    Duration::from_secs(args.max_cache_age.as_secs())
-                );
-                return None;
-            }
-            info!(
-                "Cache is recent (age: {:#?}, max age: {:#?}). Using.",
-                Duration::from_secs(elapsed.as_secs()),
-                Duration::from_secs(args.max_cache_age.as_secs())
-            );
-        }
-    }
-
-    let cache = Cache::load(OPENRING_CACHE_FILE, args.max_cache_age.as_secs());
-    match cache {
-        Ok(cache) => Some(cache),
-        Err(e) => {
-            warn!("Error while loading cache: {e}. Continuing without.");
-            None
-        }
-    }
 }
 
 fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
@@ -442,7 +244,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
 
 pub fn run(args: Args) -> Result<()> {
     debug!(?args);
-    let cache = load_cache(&args).unwrap_or_default();
+    let cache = cache::load_cache(&args).unwrap_or_default();
     let cache = Arc::new(cache);
 
     let mut urls = args.url;
@@ -642,14 +444,4 @@ pub fn run(args: Args) -> Result<()> {
     let output = Tera::one_off(&template, &context, true)?;
     println!("{output}");
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-    use crate::*;
-    #[test]
-    fn verify_app() {
-        use clap::CommandFactory;
-        Args::command().debug_assert()
-    }
 }
