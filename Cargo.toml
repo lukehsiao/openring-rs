@@ -21,7 +21,7 @@ feed-rs = "2.1.0"
 html-escape = "0.2.13"
 indicatif = { version = "0.17.8", features = ["rayon"] }
 log = "0.4.22"
-jiff = { version = "0.1.4", features = ["serde"] }
+jiff = { version = "0.1.12", features = ["serde"] }
 miette = { version = "7.2.0", features = ["fancy"] }
 rayon = "1.10.0"
 serde = { version = "1.0.205", features = ["derive"] }
