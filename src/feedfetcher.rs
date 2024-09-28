@@ -18,7 +18,7 @@ impl FeedFetcher for Url {
     /// Fetch a feed for a URL
     fn fetch_feed(&self, cache: &Arc<Cache>) -> Option<(Feed, Url)> {
         let agent: Agent = AgentBuilder::new()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .user_agent(concat!(crate_name!(), '/', crate_version!()))
             .build();
         let cache_value = cache.get_mut(self);
