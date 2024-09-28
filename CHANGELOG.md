@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.2.5](https://github.com/lukehsiao/openring-rs/compare/v0.2.4..v0.2.5) - 2024-09-28
+
+### Bug Fixes
+
+- increase timeout from 10s to 30s - ([20f9c55](https://github.com/lukehsiao/openring-rs/commit/20f9c55c69e054d00423c9bbbddce4fe8cd7f3f6)) - Luke Hsiao
+
+### Documentation
+
+- **(README)** add roadmap - ([319c891](https://github.com/lukehsiao/openring-rs/commit/319c8910d72a1b32d55929bf2e250808d746fd34)) - Luke Hsiao
+
+### Refactor
+
+- split into modules - ([fc5c9a5](https://github.com/lukehsiao/openring-rs/commit/fc5c9a50f0b28edabb0b8f6c8a88e481983960b1)) - Luke Hsiao
+- pull feed fetching logic into a trait - ([c17f57a](https://github.com/lukehsiao/openring-rs/commit/c17f57aa38273af8b16611ef3234d0a495b58154)) - Luke Hsiao
+
+---
 ## [0.2.4](https://github.com/lukehsiao/openring-rs/compare/v0.2.3..v0.2.4) - 2024-08-14
 
 ### Bug Fixes
