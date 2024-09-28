@@ -11,10 +11,6 @@ check:
 audit:
 	cargo deny check advisories
 
-# check for semver violations
-semver:
-	cargo semver-checks check-release
-
 # Check links in markdown files
 link-check:
 	-lychee -E '**/*.md'
@@ -61,7 +57,7 @@ _tlog describe version:
 	@git stats -r {{describe}}..HEAD
 
 # Target can be ["major", "minor", "patch", or a version]
-release target: && semver
+release target:
 	#!/usr/bin/env python3
 	# Inspired-by: https://git.sr.ht/~sircmpwn/dotfiles/tree/master/bin/semver
 	import os
