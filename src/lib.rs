@@ -1,31 +1,30 @@
 pub mod args;
 pub mod cache;
 pub mod error;
+pub mod feedfetcher;
 
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
-use clap::{crate_name, crate_version};
-use feed_rs::{model::Feed, parser};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use jiff::{tz::TimeZone, Timestamp, ToSpan};
+use feed_rs::model::Feed;
+use indicatif::{ProgressBar, ProgressStyle};
+use jiff::{tz::TimeZone, Timestamp};
 use miette::NamedSource;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use tera::Tera;
 use tracing::{debug, info, warn};
-use ureq::{Agent, AgentBuilder};
 use url::{ParseError, Url};
 
 use crate::{
     args::Args,
-    cache::{Cache, CacheValue, StoreExt, OPENRING_CACHE_FILE},
+    cache::{Cache, StoreExt, OPENRING_CACHE_FILE},
     error::{FeedUrlError, OpenringError, Result},
+    feedfetcher::FeedFetcher,
 };
 
 #[derive(Serialize, Debug)]
@@ -38,6 +37,7 @@ pub struct Article {
     timestamp: Timestamp,
 }
 
+/// Parse the file into a vector of URLs.
 fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
     let file = File::open(path.clone())?;
     let reader = BufReader::new(file);
@@ -74,171 +74,20 @@ fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
 //
 // Skips feeds if there are errors. Shows progress.
 fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
-    let agent: Agent = AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .user_agent(concat!(crate_name!(), '/', crate_version!()))
-        .build();
-
-    let m = MultiProgress::new();
+    let pb = ProgressBar::new(urls.len() as u64).with_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:.cyan/blue}] ({human_pos}/{human_len}) {msg}").unwrap());
 
     let feeds: Vec<(Feed, Url)> = urls
         .par_iter()
-        .enumerate()
-        .filter_map(|(idx, url)| 'a: {
-            let pb = m.add(ProgressBar::new(2));
-            pb.set_style(ProgressStyle::with_template("{prefix:.bold.dim} {wide_msg}").unwrap());
-            pb.set_prefix(format!("[{}/{}]", idx, urls.len()));
-            pb.set_message(url.as_str().to_string());
-
-            let cache_value = cache.get_mut(url);
-
-            // Respect Retry-After Header
-            if let Some(ref cv) = cache_value {
-                if let Some(retry) = cv.retry_after {
-                    if cv.timestamp + retry > Timestamp::now() {
-                        debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
-
-                        let body = cv.body.clone();
-
-                        // TODO: This is just copy-pasted, should be reused
-                        pb.inc(1);
-                        if let Some(feed_str) = body {
-                            match parser::parse(feed_str.as_bytes()) {
-                                Ok(feed) => {
-                                    pb.finish_and_clear();
-                                    break 'a Some((feed, url.clone()));
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        url=%url.as_str(),
-                                        error=%e,
-                                        "failed to parse feed."
-                                    );
-                                    pb.finish_with_message(format!(
-                                        "Failed to parse feed from `{}`",
-                                        url.as_str()
-                                    ));
-                                    break 'a None;
-                                }
-                            }
-                        } else {
-                            warn!(url=url.as_str(), "empty feed");
-                            pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
-                            break 'a None;
-                        }
-                    }
-                }
-            }
-
-            let req = {
-                let mut r = agent.get(url.as_str());
-                // Add friendly headers if cache is available
-                if let Some(ref cv) = cache_value {
-                    if let Some(last_modified) = &cv.last_modified {
-                        r = r.set("If-Modified-Since", last_modified);
-                    }
-                    if let Some(etag) = &cv.etag {
-                        r = r.set("If-None-Match", etag);
-                    }
-                }
-                debug!(url=%url, if_modified_since=r.header("if-modified-since"), etag=r.header("if-none-match"), "sending request");
-                r
-            };
-
-            let body = match req.call() {
-                Ok(r) => {
-                    // ETag values must have the actual quotes
-                    let etag = r.header("etag").map(|s| {
-                        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with("W/\"") && s.ends_with('"')) {
-                            s.to_string()
-                        } else {
-                            format!("\"{}\"", s)
-                        }}
-                    );
-                    let last_modified = r.header("last-modified").map(|s| s.to_string());
-                    let status = r.status();
-                    let mut body = r.into_string().ok();
-
-                    // Update cache
-                    if let Some(mut cv) = cache_value {
-                        match status {
-                            304 => {
-                                debug!(url=%url, status=status, "got 304, using feed from cache");
-                                body = cv.body.clone();
-                            },
-                            _ =>  {
-                                debug!(url=%url, status=status, "cache hit, using feed from body");
-                                cv.etag = etag;
-                                cv.last_modified = last_modified;
-                                cv.body = body.clone();
-                            }
-                        }
-                        cv.timestamp = Timestamp::now();
-                    } else {
-                        debug!(url=%url, status=status, "using feed from body and adding to cache");
-                        cache.insert(
-                            url.clone(),
-                            CacheValue {
-                                timestamp: Timestamp::now(),
-                                retry_after: None,
-                                etag,
-                                last_modified,
-                                body: body.clone(),
-                            },
-                        );
-                    }
-                    body
-                }
-                Err(e) => {
-                    if let Some(mut cv) = cache_value {
-                        cv.timestamp = Timestamp::now();
-                        match e {
-                            ureq::Error::Status(status, r) if status == 429 => {
-                                // Default to waiting 4 hrs if no Retry-After
-                                let retry_after= r.header("retry-after").map(|s| s.parse::<i64>().map(|n| n.seconds()).ok()).unwrap_or(Some(4.hours()));
-                                debug!(url=%url, status=status, retry_after=r.header("retry-after"), "got 429, using feed from cache");
-                                dbg!(&retry_after);
-                                cv.timestamp = Timestamp::now();
-                                cv.retry_after = retry_after;
-                                cv.body.clone()
-                            },
-                            _ => None
-                        }
-                    } else {
-                        warn!(url=%url.as_str(), error=%e, "failed to get feed.");
-                        None
-                    }
-                }
-            };
+        .filter_map(|url| {
+            pb.set_message(format!("{}", url));
+            let result = url.fetch_feed(cache);
             pb.inc(1);
 
-            if let Some(feed_str) = body {
-                match parser::parse(feed_str.as_bytes()) {
-                    Ok(feed) => {
-                        pb.finish_and_clear();
-                        Some((feed, url.clone()))
-                    }
-                    Err(e) => {
-                        warn!(
-                            url=%url.as_str(),
-                            error=%e,
-                            "failed to parse feed."
-                        );
-                        pb.finish_with_message(format!(
-                            "Failed to parse feed from `{}`",
-                            url.as_str()
-                        ));
-                        None
-                    }
-                }
-            } else {
-                warn!(url=url.as_str(), "empty feed");
-                pb.finish_with_message(format!("Empty feed: `{}`", url.as_str()));
-                None
-            }
+            result
         })
         .collect();
-    m.clear()?;
+
+    pb.finish_and_clear();
     Ok(feeds)
 }
 
