@@ -28,34 +28,35 @@ impl FeedFetcher for Url {
             .timeout(Duration::from_secs(30))
             .user_agent(concat!(crate_name!(), '/', crate_version!()))
             .build()?;
-        let cache_value = cache.get_mut(self);
-
-        // Respect Retry-After Header if set in cache
-        if let Some(ref cv) = cache_value {
-            if let Some(retry) = cv.retry_after {
-                if cv.timestamp + retry > Timestamp::now() {
-                    debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
-
-                    // TODO: This is just copy-pasted, should be reused
-                    if let Some(ref feed_str) = cv.body {
-                        return match parser::parse(feed_str.as_bytes()) {
-                            Ok(feed) => Ok((feed, self.clone())),
-                            Err(e) => {
-                                warn!(
-                                    url=%self.as_str(),
-                                    error=%e,
-                                    "failed to parse feed."
-                                );
-                                Err(e.into())
-                            }
-                        };
-                    }
-                    warn!(url = %self.as_str(), "empty feed");
-                }
-            }
-        }
 
         let req = {
+            let cache_value = cache.get(self);
+
+            // Respect Retry-After Header if set in cache
+            if let Some(ref cv) = cache_value {
+                if let Some(retry) = cv.retry_after {
+                    if cv.timestamp + retry > Timestamp::now() {
+                        debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
+
+                        // TODO: This is just copy-pasted, should be reused
+                        if let Some(ref feed_str) = cv.body {
+                            return match parser::parse(feed_str.as_bytes()) {
+                                Ok(feed) => Ok((feed, self.clone())),
+                                Err(e) => {
+                                    warn!(
+                                        url=%self.as_str(),
+                                        error=%e,
+                                        "failed to parse feed."
+                                    );
+                                    Err(e.into())
+                                }
+                            };
+                        }
+                        warn!(url = %self.as_str(), "empty feed");
+                    }
+                }
+            }
+
             let mut r = client.get(self.as_str());
             // Add friendly headers if cache is available
             if let Some(ref cv) = cache_value {
@@ -95,33 +96,37 @@ impl FeedFetcher for Url {
                         let mut body = r.text().await.ok();
 
                         // Update cache
-                        if let Some(mut cv) = cache_value {
-                            if status == StatusCode::NOT_MODIFIED {
-                                debug!(url=%self, status=status.as_str(), "got 304, using feed from cache");
-                                body.clone_from(&cv.body);
+                        {
+                            let cache_value = cache.get_mut(self);
+                            if let Some(mut cv) = cache_value {
+                                if status == StatusCode::NOT_MODIFIED {
+                                    debug!(url=%self, status=status.as_str(), "got 304, using feed from cache");
+                                    body.clone_from(&cv.body);
+                                } else {
+                                    debug!(url=%self, status=status.as_str(), "cache hit, using feed from body");
+                                    cv.etag = etag;
+                                    cv.last_modified = last_modified;
+                                    cv.body.clone_from(&body);
+                                }
+                                cv.timestamp = Timestamp::now();
                             } else {
-                                debug!(url=%self, status=status.as_str(), "cache hit, using feed from body");
-                                cv.etag = etag;
-                                cv.last_modified = last_modified;
-                                cv.body.clone_from(&body);
+                                debug!(url=%self, status=status.as_str(), "using feed from body and adding to cache");
+                                cache.insert(
+                                    self.clone(),
+                                    CacheValue {
+                                        timestamp: Timestamp::now(),
+                                        retry_after: None,
+                                        etag,
+                                        last_modified,
+                                        body: body.clone(),
+                                    },
+                                );
                             }
-                            cv.timestamp = Timestamp::now();
-                        } else {
-                            debug!(url=%self, status=status.as_str(), "using feed from body and adding to cache");
-                            cache.insert(
-                                self.clone(),
-                                CacheValue {
-                                    timestamp: Timestamp::now(),
-                                    retry_after: None,
-                                    etag,
-                                    last_modified,
-                                    body: body.clone(),
-                                },
-                            );
                         }
                         body.ok_or(OpenringError::EmptyFeedError(self.as_str().to_string()))
                     }
                     StatusCode::TOO_MANY_REQUESTS => {
+                        let cache_value = cache.get_mut(self);
                         if let Some(mut cv) = cache_value {
                             cv.timestamp = Timestamp::now();
                             // Default to waiting 4 hrs if no Retry-After
