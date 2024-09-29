@@ -80,7 +80,7 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
         .par_iter()
         .filter_map(|url| {
             pb.set_message(format!("{}", url));
-            let result = url.fetch_feed(cache);
+            let result = url.fetch_feed(cache).ok();
             pb.inc(1);
 
             result

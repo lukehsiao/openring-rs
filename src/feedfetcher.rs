@@ -7,16 +7,19 @@ use tracing::{debug, warn};
 use ureq::{Agent, AgentBuilder};
 use url::Url;
 
-use crate::cache::{Cache, CacheValue};
+use crate::{
+    cache::{Cache, CacheValue},
+    error::OpenringError,
+};
 
 pub(crate) trait FeedFetcher {
     /// Fetch a feed
-    fn fetch_feed(&self, cache: &Arc<Cache>) -> Option<(Feed, Url)>;
+    fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError>;
 }
 
 impl FeedFetcher for Url {
     /// Fetch a feed for a URL
-    fn fetch_feed(&self, cache: &Arc<Cache>) -> Option<(Feed, Url)> {
+    fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError> {
         let agent: Agent = AgentBuilder::new()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!(crate_name!(), '/', crate_version!()))
@@ -32,14 +35,14 @@ impl FeedFetcher for Url {
                     // TODO: This is just copy-pasted, should be reused
                     if let Some(ref feed_str) = cv.body {
                         return match parser::parse(feed_str.as_bytes()) {
-                            Ok(feed) => Some((feed, self.clone())),
+                            Ok(feed) => Ok((feed, self.clone())),
                             Err(e) => {
                                 warn!(
                                     url=%self.as_str(),
                                     error=%e,
                                     "failed to parse feed."
                                 );
-                                None
+                                Err(e.into())
                             }
                         };
                     } else {
@@ -108,7 +111,7 @@ impl FeedFetcher for Url {
                         },
                     );
                 }
-                body
+                body.ok_or(OpenringError::EmptyFeedError(self.as_str().to_string()))
             }
             Err(e) => {
                 if let Some(mut cv) = cache_value {
@@ -124,32 +127,32 @@ impl FeedFetcher for Url {
                             dbg!(&retry_after);
                             cv.timestamp = Timestamp::now();
                             cv.retry_after = retry_after;
-                            cv.body.clone()
+                            cv.body
+                                .clone()
+                                .ok_or(OpenringError::EmptyFeedError(self.as_str().to_string()))
                         }
-                        _ => None,
+                        _ => Err(Box::new(e).into()),
                     }
                 } else {
                     warn!(url=%self.as_str(), error=%e, "failed to get feed.");
-                    None
+                    Err(Box::new(e).into())
                 }
             }
         };
 
-        if let Some(feed_str) = body {
-            match parser::parse(feed_str.as_bytes()) {
-                Ok(feed) => Some((feed, self.clone())),
+        match body {
+            Ok(feed_str) => match parser::parse(feed_str.as_bytes()) {
+                Ok(feed) => Ok((feed, self.clone())),
                 Err(e) => {
                     warn!(
                         url=%self.as_str(),
                         error=%e,
                         "failed to parse feed."
                     );
-                    None
+                    Err(e.into())
                 }
-            }
-        } else {
-            warn!(url = self.as_str(), "empty feed");
-            None
+            },
+            Err(e) => Err(e),
         }
     }
 }

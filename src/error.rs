@@ -17,11 +17,19 @@ pub enum OpenringError {
     #[error("Failed to parse civil date.")]
     CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
+    UreqError(#[from] Box<ureq::Error>),
+    #[error(transparent)]
     #[diagnostic(transparent)]
     ChronoError(#[from] ChronoError),
     #[error(transparent)]
     #[diagnostic(transparent)]
     FeedUrlError(#[from] FeedUrlError),
+    #[error("The feed at `{0}` was empty.")]
+    #[diagnostic(code(openring::empty_feed_error))]
+    EmptyFeedError(String),
+    #[error(transparent)]
+    #[diagnostic(code(openring::parse_feed_error))]
+    ParseFeedError(#[from] feed_rs::parser::ParseFeedError),
     #[error("Failed to open file.")]
     #[diagnostic(code(openring::io_error))]
     IoError(#[from] std::io::Error),
