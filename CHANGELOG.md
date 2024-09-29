@@ -3,9 +3,10 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [0.3.0](https://github.com/lukehsiao/openring-rs/compare/v0.2.5..v0.3.0) - 2024-09-29
+## [0.3.1](https://github.com/lukehsiao/openring-rs/compare/v0.3.0..v0.3.1) - 2024-09-29
 
 This release is a significant internal refactor that improves performance by fetching _all_ feeds concurrently.
+In addition, we also deduplicate feeds to avoid unnecessary fetching.
 
 ### Performance
 
