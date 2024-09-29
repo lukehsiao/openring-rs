@@ -6,8 +6,7 @@ use clap::{crate_name, crate_version};
 use feed_rs::{model::Feed, parser};
 use jiff::{Timestamp, ToSpan};
 use reqwest::{
-    blocking::{Client, ClientBuilder},
-    StatusCode,
+    StatusCode, {Client, ClientBuilder},
 };
 use tracing::{debug, warn};
 use url::Url;
@@ -19,12 +18,12 @@ use crate::{
 
 pub(crate) trait FeedFetcher {
     /// Fetch a feed
-    fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError>;
+    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError>;
 }
 
 impl FeedFetcher for Url {
     /// Fetch a feed for a URL
-    fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError> {
+    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError> {
         let client: Client = ClientBuilder::new()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!(crate_name!(), '/', crate_version!()))
@@ -71,7 +70,7 @@ impl FeedFetcher for Url {
             r
         };
 
-        let body = match req.send() {
+        let body = match req.send().await {
             Ok(r) => {
                 debug!(url=%self, response=?r, "received response");
                 match r.status() {
@@ -93,7 +92,7 @@ impl FeedFetcher for Url {
                             lm_value.to_str().ok().map(std::string::ToString::to_string)
                         });
                         let status = r.status();
-                        let mut body = r.text().ok();
+                        let mut body = r.text().await.ok();
 
                         // Update cache
                         if let Some(mut cv) = cache_value {

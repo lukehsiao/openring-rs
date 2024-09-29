@@ -14,9 +14,9 @@ use feed_rs::model::Feed;
 use indicatif::{ProgressBar, ProgressStyle};
 use jiff::{tz::TimeZone, Timestamp};
 use miette::NamedSource;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use tera::Tera;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use url::{ParseError, Url};
 
@@ -73,7 +73,7 @@ fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
 // Get all feeds from URLs concurrently.
 //
 // Skips feeds if there are errors. Shows progress.
-fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
+async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
     let pb = ProgressBar::new(urls.len() as u64).with_style(
         ProgressStyle::with_template(
             "{spinner} [{elapsed_precise}] [{bar}] ({human_pos}/{human_len}) {msg}",
@@ -81,16 +81,22 @@ fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
         .unwrap(),
     );
 
-    let feeds: Vec<(Feed, Url)> = urls
-        .par_iter()
-        .filter_map(|url| {
-            pb.set_message(format!("{url}"));
-            let result = url.fetch_feed(cache).ok();
-            pb.inc(1);
+    let mut join_set = JoinSet::new();
 
-            result
-        })
-        .collect();
+    for url in urls {
+        let cache_clone = Arc::clone(cache);
+        let url_clone = url.clone();
+        join_set.spawn(async move { url_clone.fetch_feed(&cache_clone).await });
+    }
+    let mut feeds = Vec::new();
+
+    while let Some(result) = join_set.join_next().await {
+        pb.inc(1);
+        if let Ok(Ok((feed, url))) = result {
+            pb.set_message(format!("{url}"));
+            feeds.push((feed, url));
+        }
+    }
 
     pb.finish_and_clear();
     feeds
@@ -99,7 +105,7 @@ fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
 #[allow(clippy::missing_panics_doc)]
 #[allow(clippy::missing_errors_doc)]
 #[allow(clippy::too_many_lines)]
-pub fn run(args: Args) -> Result<()> {
+pub async fn run(args: Args) -> Result<()> {
     debug!(?args);
     let cache = cache::load_cache(&args).unwrap_or_default();
     let cache = Arc::new(cache);
@@ -115,7 +121,7 @@ pub fn run(args: Args) -> Result<()> {
         return Err(OpenringError::FeedMissing);
     }
 
-    let feeds = get_feeds_from_urls(&urls, &cache);
+    let feeds = get_feeds_from_urls(&urls, &cache).await;
 
     if args.cache {
         cache.store(OPENRING_CACHE_FILE)?;
