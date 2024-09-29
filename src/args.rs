@@ -35,7 +35,7 @@ pub struct Args {
     /// Note that this only prevents refetching if the feed source responds
     /// with a 429. In this case, we respect Retry-After, or default to 4h.
     /// Otherwise, the existence of a cache file just allows openring to respect
-    /// ETag and Last-Modified headers for conditional requests.
+    /// `ETag` and `Last-Modified` headers for conditional requests.
     #[arg(short, long)]
     pub cache: bool,
     /// Discard all cached requests older than this duration
@@ -55,6 +55,6 @@ mod test {
     #[test]
     fn verify_app() {
         use clap::CommandFactory;
-        Args::command().debug_assert()
+        Args::command().debug_assert();
     }
 }

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(format!(
-            "openring={},html5ever=off,ureq=off",
+            "openring={},html5ever=off",
             convert_filter(args.verbose.log_level_filter())
         ))
         .with_writer(io::stderr)

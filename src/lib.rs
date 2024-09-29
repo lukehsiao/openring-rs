@@ -6,7 +6,7 @@ pub mod feedfetcher;
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::Path,
     sync::Arc,
 };
 
@@ -38,8 +38,8 @@ pub struct Article {
 }
 
 /// Parse the file into a vector of URLs.
-fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
-    let file = File::open(path.clone())?;
+fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     reader
@@ -54,11 +54,11 @@ fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
             let line = &line.unwrap();
             Url::parse(line).map_err(|e| {
                 // Give a nice diagnostic error
-                let file_src = fs::read_to_string(path.clone()).unwrap();
+                let file_src = fs::read_to_string(path).unwrap();
                 let offset = file_src.find(line).unwrap();
                 FeedUrlError {
                     src: NamedSource::new(
-                        path.clone().into_os_string().to_string_lossy(),
+                        path.to_path_buf().into_os_string().to_string_lossy(),
                         file_src,
                     ),
                     span: (offset..offset + line.len()).into(),
@@ -73,13 +73,18 @@ fn parse_urls_from_file(path: PathBuf) -> Result<Vec<Url>> {
 // Get all feeds from URLs concurrently.
 //
 // Skips feeds if there are errors. Shows progress.
-fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
-    let pb = ProgressBar::new(urls.len() as u64).with_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:.cyan/blue}] ({human_pos}/{human_len}) {msg}").unwrap());
+fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
+    let pb = ProgressBar::new(urls.len() as u64).with_style(
+        ProgressStyle::with_template(
+            "{spinner} [{elapsed_precise}] [{bar}] ({human_pos}/{human_len}) {msg}",
+        )
+        .unwrap(),
+    );
 
     let feeds: Vec<(Feed, Url)> = urls
         .par_iter()
         .filter_map(|url| {
-            pb.set_message(format!("{}", url));
+            pb.set_message(format!("{url}"));
             let result = url.fetch_feed(cache).ok();
             pb.inc(1);
 
@@ -88,9 +93,12 @@ fn get_feeds_from_urls(urls: Vec<Url>, cache: &Arc<Cache>) -> Result<Vec<(Feed, 
         .collect();
 
     pb.finish_and_clear();
-    Ok(feeds)
+    feeds
 }
 
+#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_errors_doc)]
+#[allow(clippy::too_many_lines)]
 pub fn run(args: Args) -> Result<()> {
     debug!(?args);
     let cache = cache::load_cache(&args).unwrap_or_default();
@@ -99,7 +107,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut urls = args.url;
 
     if let Some(path) = args.url_file {
-        let mut file_urls = parse_urls_from_file(path)?;
+        let mut file_urls = parse_urls_from_file(&path)?;
         urls.append(&mut file_urls);
     };
 
@@ -107,7 +115,7 @@ pub fn run(args: Args) -> Result<()> {
         return Err(OpenringError::FeedMissing);
     }
 
-    let feeds = get_feeds_from_urls(urls, &cache)?;
+    let feeds = get_feeds_from_urls(&urls, &cache);
 
     if args.cache {
         cache.store(OPENRING_CACHE_FILE)?;
@@ -188,7 +196,7 @@ pub fn run(args: Args) -> Result<()> {
                 Err(e) => return Err(OpenringError::UrlParseError(e)),
             },
         };
-        for entry in entries.iter() {
+        for entry in entries {
             if let (Some(link), Some(title), Some(date)) =
                 (
                     match entry

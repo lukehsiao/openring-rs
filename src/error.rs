@@ -1,3 +1,4 @@
+#![allow(clippy::module_name_repetitions)]
 use std::result;
 
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -17,7 +18,7 @@ pub enum OpenringError {
     #[error("Failed to parse civil date.")]
     CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
-    UreqError(#[from] Box<ureq::Error>),
+    ReqwestError(#[from] reqwest::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
     ChronoError(#[from] ChronoError),
@@ -27,6 +28,12 @@ pub enum OpenringError {
     #[error("The feed at `{0}` was empty.")]
     #[diagnostic(code(openring::empty_feed_error))]
     EmptyFeedError(String),
+    #[error("The request feed at `{0}` was rate limited (HTTP 429).")]
+    #[diagnostic(code(openring::rate_limit_error))]
+    RateLimitError(String),
+    #[error("The request feed at `{url}` received an unexpected error (HTTP {status}).")]
+    #[diagnostic(code(openring::unexpected_status_error))]
+    UnexpectedStatusError { url: String, status: String },
     #[error(transparent)]
     #[diagnostic(code(openring::parse_feed_error))]
     ParseFeedError(#[from] feed_rs::parser::ParseFeedError),
