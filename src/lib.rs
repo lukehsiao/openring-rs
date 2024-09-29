@@ -4,6 +4,7 @@ pub mod error;
 pub mod feedfetcher;
 
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{BufRead, BufReader},
     path::Path,
@@ -120,6 +121,12 @@ pub async fn run(args: Args) -> Result<()> {
     if urls.is_empty() {
         return Err(OpenringError::FeedMissing);
     }
+
+    // Deduplicate
+    let urls: Vec<Url> = {
+        let unique: HashSet<Url> = urls.into_iter().collect();
+        unique.into_iter().collect()
+    };
 
     let feeds = get_feeds_from_urls(&urls, &cache).await;
 
