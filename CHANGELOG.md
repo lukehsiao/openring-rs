@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.0](https://github.com/lukehsiao/openring-rs/compare/v0.2.5..v0.3.0) - 2024-09-29
+
+This release is a significant internal refactor that improves performance by fetching _all_ feeds concurrently.
+
+### Performance
+
+- switch from `rayon` to `tokio` - ([64a354d](https://github.com/lukehsiao/openring-rs/commit/64a354de873cf06617a81e99c50f3cf701a3c9db)) - Luke Hsiao
+- deduplicate feed urls - ([e590e4d](https://github.com/lukehsiao/openring-rs/commit/e590e4d5940a39a201d69dc515e6837d071523cc)) - Luke Hsiao
+
+---
 ## [0.2.5](https://github.com/lukehsiao/openring-rs/compare/v0.2.4..v0.2.5) - 2024-09-28
 
 ### Bug Fixes
