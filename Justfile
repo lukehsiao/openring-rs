@@ -21,7 +21,7 @@ test:
 
 # Sets up a watcher that lints, tests, and builds
 watch:
-	cargo watch -c -s 'cargo clippy --color=always --all-targets --all-features -- -W clippy::pedantic -D warnings 2>&1 | bat -p' -s 'cargo --color=always nextest run 2>&1 | bat -p' -s 'cargo --color=always build --release 2>&1 | bat -p'
+	cargo watch -c -s 'cargo clippy --color=always --all-targets --all-features -- -W clippy::pedantic -D warnings' -s 'cargo --color=always nextest run' -s 'cargo --color=always build --release'
 		
 # Update the changelog using git-cliff
 _update_changelog version:
