@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [0.3.3](https://github.com/lukehsiao/openring-rs/compare/v0.3.2..v0.3.3) - 2024-10-09
+## [0.3.4](https://github.com/lukehsiao/openring-rs/compare/v0.3.3..v0.3.4) - 2024-10-09
 
 The primary change of this release is changing to `cargo`-style progress.
 It's subjectively a little more explicit and clear.
@@ -16,6 +16,7 @@ It's subjectively a little more explicit and clear.
 
 - simplify progress bar - ([ee98561](https://github.com/lukehsiao/openring-rs/commit/ee98561b4f006085637832cfff080406d8d2fee7)) - Luke Hsiao
 - switch to cargo-style progress - ([f1db309](https://github.com/lukehsiao/openring-rs/commit/f1db30995a0df6870c24d3bedc0b9052150d0b1f)) - Luke Hsiao
+- print error progress correctly - ([dcd0b6b](https://github.com/lukehsiao/openring-rs/commit/dcd0b6b7b46005994b5d49525b6af35995293c17)) - Luke Hsiao
 
 ### Build and Dependencies
 
