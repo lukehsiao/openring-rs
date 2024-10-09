@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.5](https://github.com/lukehsiao/openring-rs/compare/v0.3.4..v0.3.5) - 2024-10-09
+
+### Bug Fixes
+
+- support compressed feeds (gzip, ztd, brotli, deflate) - ([2d3e467](https://github.com/lukehsiao/openring-rs/commit/2d3e4671d824d02ad787f340de58d16a2648c346)) - Luke Hsiao
+
+---
 ## [0.3.4](https://github.com/lukehsiao/openring-rs/compare/v0.3.3..v0.3.4) - 2024-10-09
 
 The primary change of this release is changing to `cargo`-style progress.
