@@ -20,6 +20,7 @@ use tera::Tera;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use url::{ParseError, Url};
+use yansi::Paint;
 
 use crate::{
     args::Args,
@@ -76,8 +77,10 @@ fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
 // Skips feeds if there are errors. Shows progress.
 async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
     let pb = ProgressBar::new(urls.len() as u64).with_style(
-        ProgressStyle::with_template("{spinner} [{human_pos}/{human_len}] [{bar}] {msg}").unwrap(),
+        ProgressStyle::with_template("{prefix:>10} [{bar}] {human_pos}/{human_len}: {msg}")
+            .unwrap(),
     );
+    pb.set_prefix("Fetching".bold().to_string());
 
     let mut join_set = JoinSet::new();
 
@@ -90,9 +93,16 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
 
     while let Some(result) = join_set.join_next().await {
         pb.inc(1);
-        if let Ok(Ok((feed, url))) = result {
-            pb.set_message(format!("{url}"));
-            feeds.push((feed, url));
+        match result {
+            Ok(Ok((feed, url))) => {
+                pb.set_message(format!("{url}"));
+                pb.println(format!("{:>10} {url}", "Fetched".bold().green()));
+                feeds.push((feed, url));
+            }
+            Ok(Err(e)) => {
+                pb.set_message(format!("{:>10} {e}", "Error".bold().red()));
+            }
+            _ => (),
         }
     }
 
