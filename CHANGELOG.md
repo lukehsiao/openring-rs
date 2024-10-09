@@ -3,6 +3,27 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.3](https://github.com/lukehsiao/openring-rs/compare/v0.3.2..v0.3.3) - 2024-10-09
+
+The primary change of this release is changing to `cargo`-style progress.
+It's subjectively a little more explicit and clear.
+
+### Documentation
+
+- **(README)** update Tera link and call out up front - ([b5ac27d](https://github.com/lukehsiao/openring-rs/commit/b5ac27d5c35944c12dddd67922bbaca60c1324a3)) - Luke Hsiao
+
+### Refactor
+
+- simplify progress bar - ([ee98561](https://github.com/lukehsiao/openring-rs/commit/ee98561b4f006085637832cfff080406d8d2fee7)) - Luke Hsiao
+- switch to cargo-style progress - ([f1db309](https://github.com/lukehsiao/openring-rs/commit/f1db30995a0df6870c24d3bedc0b9052150d0b1f)) - Luke Hsiao
+
+### Build and Dependencies
+
+- **(deps)** bump clap from 4.5.18 to 4.5.19 - ([8c9431e](https://github.com/lukehsiao/openring-rs/commit/8c9431e4f359191f3bb67394157add536a5b1f66)) - dependabot[bot]
+- **(deps)** bump reqwest from 0.12.7 to 0.12.8 - ([2f3484f](https://github.com/lukehsiao/openring-rs/commit/2f3484fb2fd1ba1eadccce2cc97b92b71439d28a)) - dependabot[bot]
+- **(deps)** bump all dependencies - ([02c70b5](https://github.com/lukehsiao/openring-rs/commit/02c70b5d197328fd87c1efa83d9dc2f4b76c6cae)) - Luke Hsiao
+
+---
 ## [0.3.2](https://github.com/lukehsiao/openring-rs/compare/v0.2.5..v0.3.2) - 2024-09-29
 
 This release is a significant internal refactor that improves performance by fetching _all_ feeds concurrently.
