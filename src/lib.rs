@@ -77,8 +77,7 @@ fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
 // Skips feeds if there are errors. Shows progress.
 async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
     let pb = ProgressBar::new(urls.len() as u64).with_style(
-        ProgressStyle::with_template("{prefix:>10} [{bar}] {human_pos}/{human_len}: {msg}")
-            .unwrap(),
+        ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {msg}").unwrap(),
     );
     pb.set_prefix("Fetching".bold().to_string());
 
@@ -87,20 +86,23 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
     for url in urls {
         let cache_clone = Arc::clone(cache);
         let url_clone = url.clone();
-        join_set.spawn(async move { url_clone.fetch_feed(&cache_clone).await });
+        join_set.spawn(async move {
+            let fetch_result = url_clone.fetch_feed(&cache_clone).await;
+            (url_clone, fetch_result)
+        });
     }
     let mut feeds = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         pb.inc(1);
         match result {
-            Ok(Ok((feed, url))) => {
+            Ok((url, Ok(feed))) => {
                 pb.set_message(format!("{url}"));
-                pb.println(format!("{:>10} {url}", "Fetched".bold().green()));
+                pb.println(format!("{:>8} {url}", "Fetched".bold().green()));
                 feeds.push((feed, url));
             }
-            Ok(Err(e)) => {
-                pb.set_message(format!("{:>10} {e}", "Error".bold().red()));
+            Ok((url, Err(e))) => {
+                pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
             }
             _ => (),
         }

@@ -18,12 +18,12 @@ use crate::{
 
 pub(crate) trait FeedFetcher {
     /// Fetch a feed
-    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError>;
+    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
 }
 
 impl FeedFetcher for Url {
     /// Fetch a feed for a URL
-    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<(Feed, Url), OpenringError> {
+    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError> {
         let client: Client = ClientBuilder::new()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!(crate_name!(), '/', crate_version!()))
@@ -41,7 +41,7 @@ impl FeedFetcher for Url {
                         // TODO: This is just copy-pasted, should be reused
                         if let Some(ref feed_str) = cv.body {
                             return match parser::parse(feed_str.as_bytes()) {
-                                Ok(feed) => Ok((feed, self.clone())),
+                                Ok(feed) => Ok(feed),
                                 Err(e) => {
                                     warn!(
                                         url=%self.as_str(),
@@ -163,7 +163,7 @@ impl FeedFetcher for Url {
 
         match body {
             Ok(feed_str) => match parser::parse(feed_str.as_bytes()) {
-                Ok(feed) => Ok((feed, self.clone())),
+                Ok(feed) => Ok(feed),
                 Err(e) => {
                     warn!(
                         url=%self.as_str(),
