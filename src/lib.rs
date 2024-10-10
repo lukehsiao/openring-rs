@@ -77,7 +77,8 @@ fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
 // Skips feeds if there are errors. Shows progress.
 async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
     let pb = ProgressBar::new(urls.len() as u64).with_style(
-        ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {msg}").unwrap(),
+        ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
+            .unwrap(),
     );
     pb.set_prefix("Fetching".bold().to_string());
 
