@@ -1,6 +1,7 @@
 use clap::Parser;
 use miette::{Context, Result};
 use std::io;
+use tracing_log::AsTrace;
 
 use openring::{self, args::Args};
 
@@ -11,21 +12,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(format!(
             "openring={},html5ever=off",
-            convert_filter(args.verbose.log_level_filter())
+            args.verbose.log_level_filter().as_trace()
         ))
         .with_writer(io::stderr)
         .init();
     // I feel like I shouldn't need wrap_err, but it doesn't work without it.
     openring::run(args).await.wrap_err("runtime error")
-}
-
-fn convert_filter(filter: log::LevelFilter) -> tracing_subscriber::filter::LevelFilter {
-    match filter {
-        log::LevelFilter::Off => tracing_subscriber::filter::LevelFilter::OFF,
-        log::LevelFilter::Error => tracing_subscriber::filter::LevelFilter::ERROR,
-        log::LevelFilter::Warn => tracing_subscriber::filter::LevelFilter::WARN,
-        log::LevelFilter::Info => tracing_subscriber::filter::LevelFilter::INFO,
-        log::LevelFilter::Debug => tracing_subscriber::filter::LevelFilter::DEBUG,
-        log::LevelFilter::Trace => tracing_subscriber::filter::LevelFilter::TRACE,
-    }
 }
