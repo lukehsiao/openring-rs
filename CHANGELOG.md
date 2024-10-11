@@ -3,6 +3,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.6](https://github.com/lukehsiao/openring-rs/compare/v0.3.5..v0.3.6) - 2024-10-11
+
+This release further adopts `cargo`-style progress, by showing all the remaining URLs in the message, rather than just the most recently fetched URL.
+
+### Features
+
+- show all remaining URLs in progress bar - ([752a433](https://github.com/lukehsiao/openring-rs/commit/752a43387a77d452d0d2bfc209547b2c28bf0c07)) - Luke Hsiao
+
+### Refactor
+
+- use `wide_msg` in progress for auto truncation - ([a237d87](https://github.com/lukehsiao/openring-rs/commit/a237d876773962fbc1a34039aa80981b0824e062)) - Luke Hsiao
+- simplify main by using `tracing_log` - ([b7096b1](https://github.com/lukehsiao/openring-rs/commit/b7096b1eb12846447ffc68cc928bc57a524e0bc8)) - Luke Hsiao
+
+---
 ## [0.3.5](https://github.com/lukehsiao/openring-rs/compare/v0.3.4..v0.3.5) - 2024-10-09
 
 ### Bug Fixes
