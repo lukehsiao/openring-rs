@@ -83,6 +83,15 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
     pb.set_prefix("Fetching".bold().to_string());
 
     let mut join_set = JoinSet::new();
+    let mut pending_urls: HashSet<&Url> = HashSet::from_iter(urls);
+
+    pb.set_message(
+        pending_urls
+            .iter()
+            .map(|u| u.as_str())
+            .collect::<Vec<&str>>()
+            .join(", "),
+    );
 
     for url in urls {
         let cache_clone = Arc::clone(cache);
@@ -98,11 +107,26 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
         pb.inc(1);
         match result {
             Ok((url, Ok(feed))) => {
-                pb.set_message(format!("{url}"));
+                pending_urls.remove(&url);
+                pb.set_message(
+                    pending_urls
+                        .iter()
+                        .map(|u| u.as_str())
+                        .collect::<Vec<&str>>()
+                        .join(", "),
+                );
                 pb.println(format!("{:>8} {url}", "Fetched".bold().green()));
                 feeds.push((feed, url));
             }
             Ok((url, Err(e))) => {
+                pending_urls.remove(&url);
+                pb.set_message(
+                    pending_urls
+                        .iter()
+                        .map(|u| u.as_str())
+                        .collect::<Vec<&str>>()
+                        .join(", "),
+                );
                 pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
             }
             _ => (),
