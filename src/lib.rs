@@ -295,19 +295,19 @@ pub async fn run(args: Args) -> Result<()> {
 
                 let summary = match &entry.summary {
                     Some(s) => &s.content,
-                    None => match &entry.content {
-                        Some(c) => match &c.body {
-                            Some(b) => b,
-                            None => {
+                    None => {
+                        if let Some(c) = &entry.content {
+                            if let Some(b) = &c.body {
+                                b
+                            } else {
                                 info!(?link, ?source_link, "no summary or content provided.");
                                 ""
                             }
-                        },
-                        None => {
+                        } else {
                             info!(?link, ?source_link, "no summary or content provided.");
                             ""
                         }
-                    },
+                    }
                 };
 
                 let mut safe_summary = String::new();
