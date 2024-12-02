@@ -211,7 +211,7 @@ pub async fn run(args: Args) -> Result<()> {
                             .links
                             .into_iter()
                             // Ignore "self" rels, which usually link to feed
-                            .find(|l| !l.rel.as_ref().is_some_and(|r| r == "self"))
+                            .find(|l| l.rel.as_ref().is_none_or(|r| r != "self"))
                             .map(|l| l.href)
                         {
                             Some(s) => {
