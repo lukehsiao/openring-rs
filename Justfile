@@ -15,9 +15,9 @@ audit:
 link-check:
 	-lychee -E '**/*.md'
 
-# Runs nextest
-test:
-	cargo nextest run
+# Format source
+fmt:
+	cargo fmt
 
 # Sets up a watcher that lints, tests, and builds
 watch:
