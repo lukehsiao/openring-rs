@@ -21,7 +21,7 @@ test:
 
 # Sets up a watcher that lints, tests, and builds
 watch:
-	cargo watch -c -x 'clippy --all-targets --all-features -- -W clippy::pedantic -D warnings' -x 'nextest run' -x 'build --release'
+	bacon
 		
 # Update the changelog using git-cliff
 _update_changelog version:
