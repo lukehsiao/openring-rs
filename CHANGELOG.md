@@ -3,6 +3,30 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.7](https://github.com/lukehsiao/openring-rs/compare/v0.3.6..v0.3.7) - 2025-03-22
+
+### Documentation
+
+- **(LICENSE)** use markdown for nicer rendering - ([0cfa7a1](https://github.com/lukehsiao/openring-rs/commit/0cfa7a11d2921a3130d5dae737d50455a7274683)) - Luke Hsiao
+
+### Build and Dependencies
+
+- **(Justfile)** use pedantic on `check` - ([071c354](https://github.com/lukehsiao/openring-rs/commit/071c3548444a29328580a1c91fa7eb02c14628d0)) - Luke Hsiao
+- **(deps)** bump serde from 1.0.210 to 1.0.214 - ([aaa343e](https://github.com/lukehsiao/openring-rs/commit/aaa343e8a5c547a086725d3bd06c3f0207a92a39)) - dependabot[bot]
+- **(deps)** bump thiserror from 1.0.64 to 1.0.66 - ([2d41eed](https://github.com/lukehsiao/openring-rs/commit/2d41eedaa4985e475be62e6e99168520536f12ad)) - dependabot[bot]
+- **(deps)** bump reqwest from 0.12.8 to 0.12.9 - ([322431d](https://github.com/lukehsiao/openring-rs/commit/322431d12a97c79c9e0845567e63081a0c73df3e)) - dependabot[bot]
+- **(deps)** bump tokio from 1.40.0 to 1.41.0 - ([5231c0e](https://github.com/lukehsiao/openring-rs/commit/5231c0e33b6cda5b2ce3a2aae5355ad9ef421e64)) - dependabot[bot]
+- **(deps)** bump jiff from 0.1.13 to 0.1.14 - ([293d0ab](https://github.com/lukehsiao/openring-rs/commit/293d0abf1036cf23cb18a798d137d7a2f4049d2a)) - dependabot[bot]
+- **(deps)** bump thiserror from 1.0.69 to 2.0.3 - ([caa602a](https://github.com/lukehsiao/openring-rs/commit/caa602a5b00c28de36d7f98adefb5b68076e9f72)) - Luke Hsiao
+- **(deps)** upgrade all dependencies - ([64e6a57](https://github.com/lukehsiao/openring-rs/commit/64e6a5720dd65563980d781cb24712d9fcb7f7d3)) - Luke Hsiao
+- **(deps)** bump thiserror from 2.0.3 to 2.0.11 - ([8dbf8dc](https://github.com/lukehsiao/openring-rs/commit/8dbf8dcc86a85d4b1671dfead4f06d746bbe2b27)) - dependabot[bot]
+- **(deps)** bump clap from 4.5.21 to 4.5.27 - ([2391470](https://github.com/lukehsiao/openring-rs/commit/2391470c8cf3c83ee3db8d129c0b8f4eba1e671d)) - dependabot[bot]
+- **(deps)** update all dependencies - ([95d1851](https://github.com/lukehsiao/openring-rs/commit/95d185195279989bd294ae37639a18752a5d24b6)) - Luke Hsiao
+- **(deps)** update lockfile - ([4833d69](https://github.com/lukehsiao/openring-rs/commit/4833d693bede16f0358920449f58bc7192ee937f)) - Luke Hsiao
+- **(deps)** update all dependencies - ([3195e35](https://github.com/lukehsiao/openring-rs/commit/3195e35a6f425f2366007a108c2f75fd4878c036)) - Luke Hsiao
+- bump to rust 2024 edition - ([fdf1c40](https://github.com/lukehsiao/openring-rs/commit/fdf1c40123cf44f83c6eb3201005689ab8cb6c09)) - Luke Hsiao
+
+---
 ## [0.3.6](https://github.com/lukehsiao/openring-rs/compare/v0.3.5..v0.3.6) - 2024-10-11
 
 This release further adopts `cargo`-style progress, by showing all the remaining URLs in the message, rather than just the most recently fetched URL.
