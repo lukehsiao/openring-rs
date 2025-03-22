@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use clap::{builder::ValueHint, Parser};
+use clap::{Parser, builder::ValueHint};
 use clap_verbosity_flag::Verbosity;
 use jiff::civil::Date;
 use url::Url;

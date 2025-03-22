@@ -13,7 +13,7 @@ use std::{
 
 use feed_rs::model::Feed;
 use indicatif::{ProgressBar, ProgressStyle};
-use jiff::{tz::TimeZone, Timestamp};
+use jiff::{Timestamp, tz::TimeZone};
 use miette::NamedSource;
 use serde::Serialize;
 use tera::Tera;
@@ -24,7 +24,7 @@ use yansi::Paint;
 
 use crate::{
     args::Args,
-    cache::{Cache, StoreExt, OPENRING_CACHE_FILE},
+    cache::{Cache, OPENRING_CACHE_FILE, StoreExt},
     error::{FeedUrlError, OpenringError, Result},
     feedfetcher::FeedFetcher,
 };
