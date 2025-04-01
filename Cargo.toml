@@ -23,7 +23,7 @@ html-escape = "0.2.13"
 humantime = "2.2.0"
 indicatif = "0.17.11"
 jiff = { version = "0.2.4", features = ["serde"] }
-log = "0.4.26"
+log = "0.4.27"
 miette = { version = "7.5.0", features = ["fancy"] }
 reqwest = { version = "0.12.15", features = ["gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.219", features = ["derive"] }
