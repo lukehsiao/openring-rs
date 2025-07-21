@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.8](https://github.com/lukehsiao/openring-rs/compare/v0.3.7..v0.3.8) - 2025-07-21
+
+### Build and Dependencies
+
+- **(deps)** update all dependencies (namely, indicatif, which yanked a version which causes builds to fail) - ([cca0751](https://github.com/lukehsiao/openring-rs/commit/cca0751869a2ba26919dba45bd220c76e02ee153)) - Luke Hsiao
+
+---
 ## [0.3.7](https://github.com/lukehsiao/openring-rs/compare/v0.3.6..v0.3.7) - 2025-03-22
 
 ### Documentation
