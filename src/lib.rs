@@ -150,7 +150,7 @@ pub async fn run(args: Args) -> Result<()> {
     if let Some(path) = args.url_file {
         let mut file_urls = parse_urls_from_file(&path)?;
         urls.append(&mut file_urls);
-    };
+    }
 
     if urls.is_empty() {
         return Err(OpenringError::FeedMissing);
@@ -287,10 +287,10 @@ pub async fn run(args: Args) -> Result<()> {
             {
                 // Skip articles after args.before, if present
                 let timestamp = Timestamp::from_second(date.timestamp())?;
-                if let Some(before) = args.before {
-                    if timestamp > before.to_zoned(TimeZone::system())?.timestamp() {
-                        continue;
-                    }
+                if let Some(before) = args.before
+                    && timestamp > before.to_zoned(TimeZone::system())?.timestamp()
+                {
+                    continue;
                 }
 
                 let summary = match &entry.summary {

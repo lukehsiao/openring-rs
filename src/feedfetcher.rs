@@ -33,28 +33,27 @@ impl FeedFetcher for Url {
             let cache_value = cache.get(self);
 
             // Respect Retry-After Header if set in cache
-            if let Some(ref cv) = cache_value {
-                if let Some(retry) = cv.retry_after {
-                    if cv.timestamp + retry > Timestamp::now() {
-                        debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
+            if let Some(ref cv) = cache_value
+                && let Some(retry) = cv.retry_after
+                && cv.timestamp + retry > Timestamp::now()
+            {
+                debug!(timestamp=%cv.timestamp, retry_after=%retry, "skipping request due to 429, using feed from cache");
 
-                        // TODO: This is just copy-pasted, should be reused
-                        if let Some(ref feed_str) = cv.body {
-                            return match parser::parse(feed_str.as_bytes()) {
-                                Ok(feed) => Ok(feed),
-                                Err(e) => {
-                                    warn!(
-                                        url=%self.as_str(),
-                                        error=%e,
-                                        "failed to parse feed."
-                                    );
-                                    Err(e.into())
-                                }
-                            };
+                // TODO: This is just copy-pasted, should be reused
+                if let Some(ref feed_str) = cv.body {
+                    return match parser::parse(feed_str.as_bytes()) {
+                        Ok(feed) => Ok(feed),
+                        Err(e) => {
+                            warn!(
+                                url=%self.as_str(),
+                                error=%e,
+                                "failed to parse feed."
+                            );
+                            Err(e.into())
                         }
-                        warn!(url = %self.as_str(), "empty feed");
-                    }
+                    };
                 }
+                warn!(url = %self.as_str(), "empty feed");
             }
 
             let mut r = client.get(self.as_str());
