@@ -42,7 +42,18 @@
     padding: 0.5rem;
     background: lab(15% 0 0);
     min-width: 10rem;
-    border-radius: 15px;
+    border-radius: 0.5rem;
+  }
+
+  /* Mobile: force single column stack */
+  @media screen and (max-width: 650px) {
+    .webring .articles {
+      flex-direction: column;
+    }
+
+    .webring .article {
+      flex: 0 0 auto;
+    }
   }
 
   .webring .summary {
