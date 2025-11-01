@@ -21,7 +21,7 @@ dashmap = "6.1.0"
 feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
-indicatif = "0.18.1"
+indicatif = "0.18.2"
 jiff = { version = "0.2.15", features = ["serde"] }
 log = "0.4.28"
 miette = { version = "7.6.0", features = ["fancy"] }
