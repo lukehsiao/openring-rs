@@ -14,21 +14,21 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 ammonia = "4.1.2"
-clap = { version = "4.5.50", features = ["derive", "wrap_help", "cargo"] }
+clap = { version = "4.5.51", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "3.0.4"
 csv = "1.4.0"
 dashmap = "6.1.0"
 feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
-indicatif = "0.18.1"
+indicatif = "0.18.2"
 jiff = { version = "0.2.15", features = ["serde"] }
 log = "0.4.28"
 miette = { version = "7.6.0", features = ["fancy"] }
 reqwest = { version = "0.12.24", features = ["gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tera = "1.20.0"
+tera = "1.20.1"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 tracing = "0.1.41"
