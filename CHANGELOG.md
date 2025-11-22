@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.9](https://github.com/lukehsiao/openring-rs/compare/v0.3.8..v0.3.9) - 2025-11-22
+
+### Bug Fixes
+
+- provide a more mobile-friendly template example - ([4a2c609](https://github.com/lukehsiao/openring-rs/commit/4a2c609401a6eee0ad2b1115e20fc6d645e0cccd)) - Luke Hsiao
+
+### Documentation
+
+- **(README)** minor capitalization tweaks - ([b349b1a](https://github.com/lukehsiao/openring-rs/commit/b349b1a31e608597372ee39515db67b16b308a34)) - Luke Hsiao
+
+---
 ## [0.3.8](https://github.com/lukehsiao/openring-rs/compare/v0.3.7..v0.3.8) - 2025-07-21
 
 ### Build and Dependencies
