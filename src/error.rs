@@ -1,4 +1,5 @@
 #![allow(clippy::module_name_repetitions)]
+#![allow(unused_assignments)]
 use std::result;
 
 use miette::{Diagnostic, NamedSource, SourceSpan};

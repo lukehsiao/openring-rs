@@ -317,7 +317,7 @@ pub async fn run(args: Args) -> Result<()> {
                 );
                 articles.push(Article {
                     link,
-                    title: title.to_string(),
+                    title: title.clone(),
                     summary: safe_summary.trim().to_string(),
                     source_link: source_link.clone(),
                     source_title: source_title.clone(),

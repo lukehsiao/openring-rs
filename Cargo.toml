@@ -22,17 +22,17 @@ feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
 indicatif = "0.18.3"
-jiff = { version = "0.2.16", features = ["serde"] }
-log = "0.4.28"
+jiff = { version = "0.2.17", features = ["serde"] }
+log = "0.4.29"
 miette = { version = "7.6.0", features = ["fancy"] }
-reqwest = { version = "0.12.24", features = ["gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.13.1", features = ["gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.148"
 tera = "1.20.1"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
-tracing = "0.1.43"
+tracing = "0.1.44"
 tracing-log = "0.2.0"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 url = { version = "2.5.7", features = ["serde"] }
 yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
