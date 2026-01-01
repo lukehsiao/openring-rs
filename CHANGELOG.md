@@ -3,6 +3,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.10](https://github.com/lukehsiao/openring-rs/compare/v0.3.9..v0.3.10) - 2026-01-01
+
+### Build and Dependencies
+
+- **(deps)** bump actions/checkout from 5 to 6 - ([a00c1dd](https://github.com/lukehsiao/openring-rs/commit/a00c1dde0f919bfd6d9e964822839e1f4846f549)) - dependabot[bot]
+- **(deps)** bump tracing from 0.1.41 to 0.1.43 - ([b2d92a3](https://github.com/lukehsiao/openring-rs/commit/b2d92a32c90f070d95932e5778449f494f4e13a4)) - dependabot[bot]
+- **(deps)** upgrade all dependencies - ([560b456](https://github.com/lukehsiao/openring-rs/commit/560b456f6220d3878c948c83eeefd429496a9c12)) - Luke Hsiao
+
+---
 ## [0.3.9](https://github.com/lukehsiao/openring-rs/compare/v0.3.8..v0.3.9) - 2025-11-22
 
 ### Bug Fixes
