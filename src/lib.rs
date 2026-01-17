@@ -207,23 +207,28 @@ pub async fn run(args: Args) -> Result<()> {
                 {
                     None => {
                         // If an alternate link is missing just grab one of them
-                        match feed
+                        if let Some(s) = feed
                             .links
                             .into_iter()
                             // Ignore "self" rels, which usually link to feed
                             .find(|l| l.rel.as_ref().is_none_or(|r| r != "self"))
                             .map(|l| l.href)
                         {
-                            Some(s) => {
-                                match Url::parse(&s) {
-                                    Ok(u) => u,
-                                    Err(ParseError::RelativeUrlWithoutBase) => Url::parse(
-                                        &format!("{}{}", url.origin().ascii_serialization(), &s),
-                                    )?,
-                                    Err(e) => return Err(OpenringError::UrlParseError(e)),
-                                }
+                            match Url::parse(&s) {
+                                Ok(u) => u,
+                                Err(ParseError::RelativeUrlWithoutBase) => Url::parse(&format!(
+                                    "{}{}",
+                                    url.origin().ascii_serialization(),
+                                    &s
+                                ))?,
+                                Err(e) => return Err(OpenringError::UrlParseError(e)),
                             }
-                            None => return Err(OpenringError::FeedBadTitle(url.to_string())),
+                        } else {
+                            warn!(
+                                source = url.as_str(),
+                                "feed is missing root link: falling back to rss feed url."
+                            );
+                            url.clone()
                         }
                     }
                     Some(s) => match Url::parse(s) {
