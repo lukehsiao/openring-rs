@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.11](https://github.com/lukehsiao/openring-rs/compare/v0.3.10..v0.3.11) - 2026-01-17
+
+### Bug Fixes
+
+- fall back to feed URL if feed itself has none - ([9260737](https://github.com/lukehsiao/openring-rs/commit/9260737541a32f2bd52b69ca08718aacbe86837f)) - Luke Hsiao
+
+---
 ## [0.3.10](https://github.com/lukehsiao/openring-rs/compare/v0.3.9..v0.3.10) - 2026-01-01
 
 ### Build and Dependencies
