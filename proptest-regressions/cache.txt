@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3ff554494842b241a235b4e74c573260fbd4fa58e98c44eba2deec5f9b41afd6 # shrinks to entries = [(Url { scheme: "http", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("a.aa")), port: None, path: "/", query: None, fragment: None }, CacheValue { timestamp: 1970-01-01T00:00:00Z, retry_after: None, last_modified: None, etag: None, body: None })]
+cc 508944d50663da21827ae3bfb2969396d0dbb38ae0c8d878a4d2aab146828845 # shrinks to now_secs = -377705022461, max_age = 740, entries = [(Url { scheme: "http", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("a.aa")), port: None, path: "/", query: None, fragment: None }, CacheValue { timestamp: 1970-01-01T00:00:00Z, retry_after: None, last_modified: None, etag: None, body: None })]
