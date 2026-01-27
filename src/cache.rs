@@ -66,7 +66,7 @@ impl StoreExt for Cache {
     }
 
     fn load<T: AsRef<Path>>(path: T, max_age_secs: u64, now: Timestamp) -> Result<Cache> {
-        let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64) as i64;
+        let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64).cast_signed();
 
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
@@ -152,7 +152,7 @@ mod tests {
     fn url_gen() -> impl Strategy<Value = Url> {
         // Simple host + path generator; you can extend it if you need more variety.
         ("https?://", "[a-z]{1,10}\\.[a-z]{2,5}", "/[a-z]{0,15}")
-            .prop_map(|(scheme, host, path)| format!("{}{}{}", scheme, host, path))
+            .prop_map(|(scheme, host, path)| format!("{scheme}{host}{path}"))
             .prop_filter_map("valid URL", |s| Url::parse(&s).ok())
     }
 
@@ -199,7 +199,7 @@ mod tests {
         ) {
             // Build a cache and insert the generated entries
             let cache: Cache = DashMap::new();
-            for (url, value) in entries.iter() {
+            for (url, value) in &entries {
                 cache.insert(url.clone(), value.clone());
             }
 
@@ -232,7 +232,7 @@ mod tests {
         ) {
             // Freeze “now” for the test
             let now = bounded_timestamp(now_secs);
-            let max_age_span = Span::new().seconds(i64::try_from(max_age).unwrap());
+            let max_age_span = Span::new().seconds(i64::from(max_age));
 
             // Build a cache where half the entries are artificially old
             let cache: Cache = DashMap::new();
@@ -255,7 +255,7 @@ mod tests {
             let loaded = Cache::load(tmp.path(), max_age.into(), now).expect("load succeeds");
 
             // Verify that only the “new” entries survived
-            for entry in cache.iter() {
+            for entry in &cache {
                 let url   = entry.key();    // &Url
                 let value = entry.value(); // &CacheValue
 
