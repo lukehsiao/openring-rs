@@ -8,3 +8,4 @@ cc 13503c2dc011687388d37af254f29f73d87cf49cb7c13e6204ae64a95e672567 # shrinks to
 cc dfa1f84382082ecf16f5fe1d986ada5d18d59d181d95cae597d7cb1966b4ba4c # shrinks to scheme = "http", host = "a.0", port = 80, rel_path = "/A"
 cc 254e53273406f44edf30685b05f88b7f8990c2a92c6b5739590a01d2e80dfe80 # shrinks to scheme = "http", host = "a0.0", tld = "", port = 80, rel_path = "/a"
 cc 0cb34e9d76f959e5fc4f8c41c2ac42e346c9a4ad78e2a940ce13dc96f39423e6 # shrinks to scheme = "http", host = "a-", tld = "aa", port = 80, rel_path = "/.."
+cc 674959dfb5d68732448acdd1be700034c6d3c96c85d850bd969824b18163076c # shrinks to scheme = "http", host = "xn--", tld = "aa", port = 80, rel_path = "/-"
