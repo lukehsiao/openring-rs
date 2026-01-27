@@ -66,6 +66,8 @@ impl StoreExt for Cache {
     }
 
     fn load<T: AsRef<Path>>(path: T, max_age_secs: u64, now: Timestamp) -> Result<Cache> {
+        let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64) as i64;
+
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_path(path)?;
@@ -76,9 +78,7 @@ impl StoreExt for Cache {
             let (url, value): (Url, CacheValue) = result?;
             // Discard entries older than `max_age_secs`.
             // This allows gradually updating the cache over multiple runs.
-            if (current_ts - value.timestamp).compare(i64::try_from(max_age_secs)?.seconds())?
-                == Ordering::Less
-            {
+            if (current_ts - value.timestamp).compare(clamped_secs.seconds())? == Ordering::Less {
                 map.insert(url, value);
             }
         }
