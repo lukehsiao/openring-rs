@@ -39,6 +39,26 @@ pub struct Article {
     timestamp: Timestamp,
 }
 
+/// Resolve a possibly-relative URL `href` against the feed’s base `feed_url`.
+/// Expects `href` to have a leading `/`.
+pub(crate) fn resolve_href(
+    feed_url: &Url,
+    href: &str,
+) -> std::result::Result<Url, url::ParseError> {
+    match Url::parse(href) {
+        Ok(u) => Ok(u),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            // Prepend the origin (scheme + authority) of the feed URL.
+            Url::parse(&format!(
+                "{}{}",
+                feed_url.origin().ascii_serialization(),
+                href
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse the file into a vector of URLs.
 fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
     let file = File::open(path)?;
@@ -214,15 +234,7 @@ pub async fn run(args: Args) -> Result<()> {
                             .find(|l| l.rel.as_ref().is_none_or(|r| r != "self"))
                             .map(|l| l.href)
                         {
-                            match Url::parse(&s) {
-                                Ok(u) => u,
-                                Err(ParseError::RelativeUrlWithoutBase) => Url::parse(&format!(
-                                    "{}{}",
-                                    url.origin().ascii_serialization(),
-                                    &s
-                                ))?,
-                                Err(e) => return Err(OpenringError::UrlParseError(e)),
-                            }
+                            resolve_href(&url, &s)?
                         } else {
                             warn!(
                                 source = url.as_str(),
@@ -231,22 +243,10 @@ pub async fn run(args: Args) -> Result<()> {
                             url.clone()
                         }
                     }
-                    Some(s) => match Url::parse(s) {
-                        Ok(u) => u,
-                        Err(ParseError::RelativeUrlWithoutBase) => {
-                            Url::parse(&format!("{}{}", url.origin().ascii_serialization(), &s))?
-                        }
-                        Err(e) => return Err(OpenringError::UrlParseError(e)),
-                    },
+                    Some(s) => resolve_href(&url, s)?,
                 }
             }
-            Some(s) => match Url::parse(s) {
-                Ok(u) => u,
-                Err(ParseError::RelativeUrlWithoutBase) => {
-                    Url::parse(&format!("{}{}", url.origin().ascii_serialization(), &s))?
-                }
-                Err(e) => return Err(OpenringError::UrlParseError(e)),
-            },
+            Some(s) => resolve_href(&url, s)?,
         };
         for entry in entries {
             if let (Some(link), Some(title), Some(date)) =
