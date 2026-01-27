@@ -40,6 +40,7 @@ yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 [dev-dependencies]
 proptest = "1.9.0"
 tempfile = "3.24.0"
+wiremock = "0.6.5"
 
 [profile.test.package.proptest]
 opt-level = 3
