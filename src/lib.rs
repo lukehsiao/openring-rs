@@ -391,6 +391,10 @@ mod tests {
         }
     }
 
+    fn label_strategy() -> impl Strategy<Value = String> {
+        // 1..=28 length, start/end with alnum, middle can include hyphen
+        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
+    }
     // Generates a base URL and a random path fragment. The property asserts that:
     // * If `href` is already absolute, the result equals `Url::parse(href)`.
     // * If `href` is relative, the result's origin matches the base URL's origin.
@@ -398,14 +402,14 @@ mod tests {
         #[test]
         fn resolve_href_preserves_origin(
             scheme in prop_oneof![Just("http".to_string()), Just("https".to_string())],
-            host in "[a-z][a-z0-9-]{1,28}[.]{0,1}[a-z0-9-]{0,28}",
-            tld in "[a-z]{2,6}",
+            labels in prop::collection::vec(label_strategy(), 1..=3),            tld in "[a-z]{2,6}",
             port in 80u16..=65535,
             rel_path in "/[a-zA-Z0-9_/-]{1,30}"
         ) {
+            let host = format!("{}.{}", labels.join("."), tld);
             // Assemble the base URL string.
-            let base_str = format!("{scheme}://{host}.{tld}:{port}");
-            let base_url = Url::parse(&base_str).expect("generated base URL should be valid");
+            let base_str = format!("{scheme}://{host}:{port}");
+            let base_url = Url::parse(&base_str).unwrap_or_else(|_| panic!("generated base URL should be valid: {base_str}"));
 
             let absolute = format!("{base_str}/{rel_path}");
             let resolved_abs = resolve_href(&base_url, &absolute).unwrap();
@@ -414,9 +418,6 @@ mod tests {
             prop_assert_eq!(resolved_abs, expected_abs);
 
             let resolved_rel = resolve_href(&base_url, &rel_path).unwrap();
-            dbg!(base_url.as_str());
-            dbg!(resolved_rel.as_str());
-            dbg!(&rel_path);
             // Origin (scheme + host + port) must be identical.
             prop_assert_eq!(resolved_rel.origin(), base_url.origin());
             // Path component should be exactly the relative fragment prefixed with '/'.
