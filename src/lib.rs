@@ -354,3 +354,73 @@ pub async fn run(args: Args) -> Result<()> {
     println!("{output}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use std::io::Write;
+    use url::Url;
+
+    use super::{parse_urls_from_file, resolve_href};
+
+    // Generates a vector of well‑formed URLs and writes them to a temporary file,
+    // then checks that `parse_urls_from_file` returns exactly the same set.
+    proptest! {
+        #[test]
+        fn parse_urls_roundtrip(urls in prop::collection::vec(any::<String>(), 0..20)) {
+            // Filter out strings that are not valid URLs.
+            let valid: Vec<Url> = urls.iter()
+                .filter_map(|s| Url::parse(s).ok())
+                .collect();
+
+            // Write them (one per line) to a temp file.
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            for u in &valid {
+                writeln!(tmp, "{u}").unwrap();
+            }
+
+            // Add a few comment lines to ensure the filter works.
+            writeln!(tmp, "# this is a comment").unwrap();
+            writeln!(tmp, "// another comment").unwrap();
+
+            // Parse back.
+            let parsed = parse_urls_from_file(tmp.path()).unwrap();
+
+            // The order is preserved, so a simple equality check suffices.
+            prop_assert_eq!(parsed, valid);
+        }
+    }
+
+    // Generates a base URL and a random path fragment. The property asserts that:
+    // * If `href` is already absolute, the result equals `Url::parse(href)`.
+    // * If `href` is relative, the result's origin matches the base URL's origin.
+    proptest! {
+        #[test]
+        fn resolve_href_preserves_origin(
+            scheme in prop_oneof![Just("http".to_string()), Just("https".to_string())],
+            host in "[a-z][a-z0-9-]{1,28}[.]{0,1}[a-z0-9-]{0,28}",
+            tld in "[a-z]{2,6}",
+            port in 80u16..=65535,
+            rel_path in "/[a-zA-Z0-9_/-]{1,30}"
+        ) {
+            // Assemble the base URL string.
+            let base_str = format!("{scheme}://{host}.{tld}:{port}");
+            let base_url = Url::parse(&base_str).expect("generated base URL should be valid");
+
+            let absolute = format!("{base_str}/{rel_path}");
+            let resolved_abs = resolve_href(&base_url, &absolute).unwrap();
+            // Parse the generated string so we compare canonical `Url`s, not raw strings.
+            let expected_abs = Url::parse(&absolute).unwrap();
+            prop_assert_eq!(resolved_abs, expected_abs);
+
+            let resolved_rel = resolve_href(&base_url, &rel_path).unwrap();
+            dbg!(base_url.as_str());
+            dbg!(resolved_rel.as_str());
+            dbg!(&rel_path);
+            // Origin (scheme + host + port) must be identical.
+            prop_assert_eq!(resolved_rel.origin(), base_url.origin());
+            // Path component should be exactly the relative fragment prefixed with '/'.
+            prop_assert_eq!(resolved_rel.path(), rel_path);
+        }
+    }
+}
