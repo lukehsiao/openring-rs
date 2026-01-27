@@ -216,9 +216,7 @@ mod tests {
                 prop_assert_eq!(&*loaded_val, &value);
             }
         }
-    }
 
-    proptest! {
         #[test]
         fn age_filter_discards_old_entries(
             // generate a fresh timestamp (now) and a max_age in seconds, ensuring they can be subtracted

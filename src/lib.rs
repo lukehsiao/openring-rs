@@ -363,9 +363,14 @@ mod tests {
 
     use super::{parse_urls_from_file, resolve_href};
 
-    // Generates a vector of well‑formed URLs and writes them to a temporary file,
-    // then checks that `parse_urls_from_file` returns exactly the same set.
+    fn label_strategy() -> impl Strategy<Value = String> {
+        // 1..=28 length, start/end with alnum, middle can include hyphen
+        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
+    }
+
     proptest! {
+        // Generates a vector of well‑formed URLs and writes them to a temporary file,
+        // then checks that `parse_urls_from_file` returns exactly the same set.
         #[test]
         fn parse_urls_roundtrip(urls in prop::collection::vec(any::<String>(), 0..20)) {
             // Filter out strings that are not valid URLs.
@@ -389,16 +394,10 @@ mod tests {
             // The order is preserved, so a simple equality check suffices.
             prop_assert_eq!(parsed, valid);
         }
-    }
 
-    fn label_strategy() -> impl Strategy<Value = String> {
-        // 1..=28 length, start/end with alnum, middle can include hyphen
-        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
-    }
-    // Generates a base URL and a random path fragment. The property asserts that:
-    // * If `href` is already absolute, the result equals `Url::parse(href)`.
-    // * If `href` is relative, the result's origin matches the base URL's origin.
-    proptest! {
+        // Generates a base URL and a random path fragment. The property asserts that:
+        // * If `href` is already absolute, the result equals `Url::parse(href)`.
+        // * If `href` is relative, the result's origin matches the base URL's origin.
         #[test]
         fn resolve_href_preserves_origin(
             scheme in prop_oneof![Just("http".to_string()), Just("https".to_string())],
