@@ -59,3 +59,18 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Collect coverage data
         run: cargo llvm-cov nextest
+
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - run: cargo mutants -vV --in-place --test-tool=nextest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out
+          path: mutants.out
