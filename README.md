@@ -82,3 +82,7 @@ The test suite only contains a single valid RSS 2.0 feed.
 It would be great to generate test strategies that provide far more coverage of both RSS and Atom feeds.
 
 Another thing that is interesting is the potential holes revealed by `cargo-mutant`.
+We've added a GitHub workflow for it to show the holes.
+
+Finally, `proptest` tests for `src/feedfetcher.rs` are excessively slow.
+We should be able to speed those up.
