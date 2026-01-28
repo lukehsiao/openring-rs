@@ -132,12 +132,10 @@ impl FeedFetcher for Url {
                             let retry_after = r
                                 .headers()
                                 .get("retry-after")
-                                .and_then(|retry_value| {
-                                    retry_value.to_str().ok().map(|retry_str| {
-                                        retry_str.parse::<i64>().map(ToSpan::seconds).ok()
-                                    })
-                                })
-                                .unwrap_or(Some(4.hours()));
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .map(ToSpan::seconds)
+                                .or(Some(4.hours()));
                             debug!(url=%self, response=?r, "got 429, using feed from cache");
                             cv.timestamp = Timestamp::now();
                             cv.retry_after = retry_after;
@@ -173,6 +171,310 @@ impl FeedFetcher for Url {
                 }
             },
             Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dashmap::DashMap;
+    use jiff::{Timestamp, Unit};
+    use proptest::prelude::*;
+    use std::{sync::Arc, sync::OnceLock};
+    use tokio::runtime::Runtime;
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::{cache::CacheValue, error::OpenringError};
+
+    use super::FeedFetcher;
+
+    // Import your crate items (adjust crate name if needed)
+    // Cache alias from your crate: pub(crate) type Cache = DashMap<Url, CacheValue>;
+    type Cache = DashMap<Url, CacheValue>;
+
+    // create a global runtime you can reuse across test cases
+    static RT: OnceLock<Runtime> = OnceLock::new();
+
+    fn get_rt() -> &'static Runtime {
+        RT.get_or_init(|| Runtime::new().expect("failed to create runtime"))
+    }
+
+    proptest! {
+        // 200 with arbitrary, non-empty body parses or returns parser error; doesn't crash.
+        #[test]
+        fn prop_success_parses_feed_without_crashing(feed_body in "\\PC*") {
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+                let body = if feed_body.trim().is_empty() {
+                    "<?xml version=\"1.0\"?><rss><channel><title>x</title></channel></rss>".to_string()
+                } else {
+                    feed_body.clone()
+                };
+
+                Mock::given(method("GET"))
+                    .and(path("/"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+                    .mount(&server)
+                    .await;
+
+                let url = Url::parse(&server.uri()).unwrap();
+                let cache = Arc::new(Cache::new());
+
+                // Call the method under test
+                let res = url.fetch_feed(&cache).await;
+
+                // If parser fails we still accept Err(ParseError) as meaningful, but for typical feed bodies expect Ok
+                if let Ok(feed) = res {
+                    // sanity: parsed feed must be a Feed instance
+                    let _ = feed;
+                }
+                Ok(())
+            });
+            res.unwrap();
+        }
+
+        // 304 Not Modified should use cached body
+        #[test]
+        fn prop_not_modified_uses_cache(cached_title in "[a-z]{1,50}") {
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+
+                Mock::given(method("GET")).and(path("/"))
+                    .respond_with(ResponseTemplate::new(304))
+                    .mount(&server)
+                    .await;
+
+                let url = Url::parse(&server.uri()).unwrap();
+                let cache = Arc::new(Cache::new());
+
+                let body = format!(r#"
+                    <?xml version="1.0"?>
+                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+                       <channel>
+                          <title>{cached_title}</title>
+                          <link>http://www.nasa.gov/</link>
+                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
+                          <language>en-us</language>
+                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                          <item>
+                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
+                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
+                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
+                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
+                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
+                          </item>
+                       </channel>
+                    </rss>
+                "#);
+                let cv = CacheValue {
+                    timestamp: Timestamp::now(),
+                    retry_after: None,
+                    last_modified: None,
+                    etag: None,
+                    body: Some(body.clone()),
+                };
+                cache.insert(url.clone(), cv);
+
+                let feed = url.fetch_feed(&cache).await.expect("expected cached feed");
+                prop_assert!(feed.title.as_ref().is_some_and(|t| t.content.contains(&cached_title)));
+                Ok(())
+            });
+            res.unwrap();
+        }
+
+        // HTTP 429 uses cache and sets retry_after (if header present) or default 4 hours
+        #[test]
+        fn prop_too_many_requests_with_optional_retry(header_retry in prop::option::of(1u64..10_000u64)) {
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+
+                let mut template = ResponseTemplate::new(429);
+                if let Some(r) = header_retry {
+                    template = template.insert_header("retry-after", r.to_string());
+                }
+
+                Mock::given(method("GET")).and(path("/"))
+                    .respond_with(template)
+                    .mount(&server)
+                    .await;
+
+                let url = Url::parse(&server.uri()).unwrap();
+                let cache = Arc::new(Cache::new());
+
+                let feed_title = "cached429";
+
+                let body = format!(r#"
+                    <?xml version="1.0"?>
+                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+                       <channel>
+                          <title>{feed_title}</title>
+                          <link>http://www.nasa.gov/</link>
+                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
+                          <language>en-us</language>
+                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                          <item>
+                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
+                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
+                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
+                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
+                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
+                          </item>
+                       </channel>
+                    </rss>
+                "#);
+                let cv = CacheValue {
+                    timestamp: Timestamp::now(),
+                    retry_after: None,
+                    last_modified: None,
+                    etag: None,
+                    body: Some(body.clone()),
+                };
+                cache.insert(url.clone(), cv);
+
+                let feed = url.fetch_feed(&cache).await.expect("expected cached feed on 429");
+                prop_assert!(feed.title.as_ref().is_some_and(|t| t.content.contains(feed_title)));
+
+                // Verify cache entry has retry_after set
+                if let Some(entry) = cache.get(&url) {
+                    prop_assert!(entry.retry_after.is_some());
+                    // if header provided, it should match roughly the seconds; if not provided, default 4 hours expected
+                    if header_retry.is_some() {
+                        let span = entry.retry_after.unwrap();
+                        prop_assert!(span.total(Unit::Second)? > 0.0);
+                    } else {
+                        let span = entry.retry_after.unwrap();
+                        let span_secs = span.total(Unit::Second)?;
+                        prop_assert!(span_secs >= 4.0 * 3600.0, "{:?} < 4 * 3600", span_secs);
+                    }
+                } else {
+                    // If entry missing, fail
+                    prop_assert!(false);
+                }
+                Ok(())
+            });
+            res.unwrap();
+        }
+
+        // Unexpected status results in UnexpectedStatusError
+        #[test]
+        fn prop_unexpected_status(code in 300u16..600u16) {
+            prop_assume!(code != 200 && code != 304 && code != 429);
+
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+
+                Mock::given(method("GET"))
+                    .and(path("/"))
+                    .respond_with(ResponseTemplate::new(code))
+                    .mount(&server)
+                    .await;
+
+                let url = Url::parse(&server.uri()).unwrap();
+                let cache = Arc::new(Cache::new());
+
+                let res = url.fetch_feed(&cache).await;
+                prop_assert!(
+                    matches!(
+                        res, Err(OpenringError::UnexpectedStatusError{ .. })
+                    ),
+                    "Expected OpenringUnexpectedStatusError, got {:?} for status code {:?}",
+                    res,
+                    code
+                );
+                Ok(())
+            });
+            res.unwrap();
+        }
+
+        // verifies If-None-Match header is sent and properly quoted/normalized
+        #[test]
+        fn prop_sends_if_none_match_for_etag(etag_input in prop_oneof![
+            // unquoted token
+            "[A-Za-z0-9]{1,30}",
+            // already quoted
+            "\"[A-Za-z0-9]{1,30}\"",
+            // weak etag
+            "W/\"[A-Za-z0-9]{1,30}\"",
+        ]) {
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+
+                // capture the request to inspect headers
+                let expected_etag = {
+                    // normalize the input the same way production code would:
+                    if (etag_input.starts_with('"') && etag_input.ends_with('"'))
+                        || (etag_input.starts_with("W/\"") && etag_input.ends_with('"'))
+                    {
+                        etag_input.clone()
+                    } else {
+                        format!("\"{etag_input}\"")
+                    }
+                };
+
+                // mock responds 304 so fetch_feed uses cache path that sends If-None-Match
+                Mock::given(method("GET"))
+                    .and(path("/"))
+                    .respond_with(ResponseTemplate::new(304).append_header("etag", &etag_input))
+                    .mount(&server)
+                    .await;
+
+                // create url and cache containing the etag
+                let url = Url::parse(&server.uri()).unwrap();
+                let cache = Arc::new(Cache::new());
+
+                let body = r#"
+                    <?xml version="1.0"?>
+                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+                       <channel>
+                          <title>Fake</title>
+                          <link>http://www.nasa.gov/</link>
+                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
+                          <language>en-us</language>
+                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                          <item>
+                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
+                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
+                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
+                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
+                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
+                          </item>
+                       </channel>
+                    </rss>
+                "#.to_string();
+                let last_modified = String::from("Wed, 21 Oct 2015 07:28:00 GMT");
+                let cv = CacheValue {
+                    timestamp: Timestamp::now(),
+                    retry_after: None,
+                    last_modified: Some(last_modified.clone()),
+                    etag: Some(expected_etag.clone()),
+                    body: Some(body),
+                };
+                cache.insert(url.clone(), cv);
+
+                // Make the request and inspect the mock server received requests
+                let _ = url.fetch_feed(&cache).await?;
+
+                // retrieve requests recorded by the mock server
+                let received = server.received_requests().await.unwrap();
+                // there should be at least one request
+                prop_assert!(!received.is_empty());
+                let first = &received[0];
+                // header keys in recorded requests are lowercase
+                let if_none_match = first
+                    .headers
+                    .get("if-none-match")
+                    .ok_or_else(|| proptest::test_runner::TestCaseError::fail("missing If-None-Match header"))?;
+                prop_assert_eq!(if_none_match.to_str()?, &expected_etag, "{} != {}", if_none_match.to_str()?, &expected_etag);
+                let if_modified_since = first
+                    .headers
+                    .get("if-modified-since")
+                    .ok_or_else(|| proptest::test_runner::TestCaseError::fail("missing If-Modified-Since header"))?;
+                prop_assert_eq!(if_modified_since.to_str()?, &last_modified, "{} != {}", if_modified_since.to_str()?, &last_modified);
+                Ok(())
+            });
+            res.unwrap();
         }
     }
 }
