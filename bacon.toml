@@ -5,7 +5,7 @@
 # You may check the current default at
 #   https://github.com/Canop/bacon/blob/main/defaults/default-bacon.toml
 
-default_job = "check"
+default_job = "clippy"
 env.CARGO_TERM_COLOR = "always"
 
 [jobs.check]
@@ -33,14 +33,6 @@ command = [
     "-D", "warnings",
 ]
 need_stdout = false
-
-# This job lets you run
-# - all tests: bacon test
-# - a specific test: bacon test -- config::test_default_files
-# - the tests of a package: bacon test -- -- -p config
-[jobs.test]
-command = ["cargo", "test"]
-need_stdout = true
 
 [jobs.nextest]
 command = [
