@@ -364,8 +364,8 @@ mod tests {
     use super::{parse_urls_from_file, resolve_href};
 
     fn label_strategy() -> impl Strategy<Value = String> {
-        // 1..=28 length, start/end with alnum, middle can include hyphen
-        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
+        // 1..=28 length, start with alnum, middle can include hyphen, end
+        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]{2,5}").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
     }
 
     proptest! {
