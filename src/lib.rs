@@ -421,4 +421,28 @@ mod tests {
             prop_assert_eq!(resolved_rel.path(), rel_path);
         }
     }
+
+    #[test]
+    fn parse_urls_ignores_comments_and_blank_lines() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+
+        // Valid URLs
+        writeln!(tmp, "https://first.example/").unwrap();
+        writeln!(tmp, "   https://second.example   ").unwrap(); // leading/trailing spaces
+
+        // Comments
+        writeln!(tmp, "# a hash comment").unwrap();
+        writeln!(tmp, "// a double‑slash comment").unwrap();
+
+        // Blank line
+        writeln!(tmp).unwrap();
+
+        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+
+        let expected = vec![
+            Url::parse("https://first.example/").unwrap(),
+            Url::parse("https://second.example/").unwrap(),
+        ];
+        assert_eq!(parsed, expected);
+    }
 }
