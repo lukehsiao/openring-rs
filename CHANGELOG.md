@@ -3,6 +3,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.3.12](https://github.com/lukehsiao/openring-rs/compare/v0.3.11..v0.3.12) - 2026-01-28
+
+This release contains just a few small bugfixes as a result of me actually adding some testing.
+
+### Bug Fixes
+
+- **(cache)** clamp max_cache_age to the max value to prevent crashing - ([46ed04b](https://github.com/lukehsiao/openring-rs/commit/46ed04b34950e4585a41c3fd113cebf644c9fc21)) - Luke Hsiao
+- **(lib)** correctly ignore whitespace in urlfile - ([43bf995](https://github.com/lukehsiao/openring-rs/commit/43bf995ec100987f0d3c781a81ab90d907dc08e5)) - Luke Hsiao
+
+### Documentation
+
+- **(README)** add roadmap for tests - ([3f23e95](https://github.com/lukehsiao/openring-rs/commit/3f23e950f873d301663f88e366170bc3c2e53be4)) - Luke Hsiao
+
+---
 ## [0.3.11](https://github.com/lukehsiao/openring-rs/compare/v0.3.10..v0.3.11) - 2026-01-17
 
 ### Bug Fixes
