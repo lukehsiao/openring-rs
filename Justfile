@@ -13,6 +13,11 @@ check:
 test:
 	cargo nextest run
 
+# Runs the test suite to compute coverage
+[group('dev')]
+coverage:
+	cargo llvm-cov nextest
+
 # check security advisories
 [group('dev')]
 audit:
