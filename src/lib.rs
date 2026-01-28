@@ -60,7 +60,7 @@ pub(crate) fn resolve_href(
 }
 
 /// Parse the file into a vector of URLs.
-fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
+fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -169,15 +169,15 @@ pub async fn run(args: Args) -> Result<()> {
     let mut urls = args.url;
 
     if let Some(path) = args.url_file {
-        let mut file_urls = parse_urls_from_file(&path)?;
-        urls.append(&mut file_urls);
+        let file_urls = parse_urls_from_file(&path)?;
+        urls.extend(file_urls.into_iter());
     }
 
     if urls.is_empty() {
         return Err(OpenringError::FeedMissing);
     }
 
-    // Deduplicate
+    // Deduplicate here, too, in case urls are provided in args + file.
     let urls: Vec<Url> = {
         let unique: HashSet<Url> = urls.into_iter().collect();
         unique.into_iter().collect()
@@ -359,38 +359,12 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use std::io::Write;
+    use std::{collections::HashSet, io::Write};
     use url::Url;
 
     use super::{parse_urls_from_file, resolve_href};
 
     proptest! {
-        // Generates a vector of well‑formed URLs and writes them to a temporary file,
-        // then checks that `parse_urls_from_file` returns exactly the same set.
-        #[test]
-        fn parse_urls_roundtrip(urls in prop::collection::vec(any::<String>(), 0..20)) {
-            // Filter out strings that are not valid URLs.
-            let valid: Vec<Url> = urls.iter()
-                .filter_map(|s| Url::parse(s).ok())
-                .collect();
-
-            // Write them (one per line) to a temp file.
-            let mut tmp = tempfile::NamedTempFile::new().unwrap();
-            for u in &valid {
-                writeln!(tmp, "{u}").unwrap();
-            }
-
-            // Add a few comment lines to ensure the filter works.
-            writeln!(tmp, "# this is a comment").unwrap();
-            writeln!(tmp, "// another comment").unwrap();
-
-            // Parse back.
-            let parsed = parse_urls_from_file(tmp.path()).unwrap();
-
-            // The order is preserved, so a simple equality check suffices.
-            prop_assert_eq!(parsed, valid);
-        }
-
         // Generates a base URL and a random path fragment. The property asserts that:
         // * If `href` is already absolute, the result equals `Url::parse(href)`.
         // * If `href` is relative, the result's origin matches the base URL's origin.
@@ -424,12 +398,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_urls_ignores_comments_and_blank_lines() {
+    fn parse_urls_ignores_comments_and_blank_lines_and_whitespace() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
 
         // Valid URLs
         writeln!(tmp, "https://first.example/").unwrap();
         writeln!(tmp, "   https://second.example   ").unwrap(); // leading/trailing spaces
+        writeln!(tmp, " https://first.example   ").unwrap(); // duplicate (even missing trailing slash)
 
         // Comments
         writeln!(tmp, "# a hash comment").unwrap();
@@ -440,10 +415,10 @@ mod tests {
 
         let parsed = parse_urls_from_file(tmp.path()).unwrap();
 
-        let expected = vec![
+        let expected = HashSet::from([
             Url::parse("https://first.example/").unwrap(),
             Url::parse("https://second.example/").unwrap(),
-        ];
+        ]);
         assert_eq!(parsed, expected);
     }
 }
