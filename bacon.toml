@@ -5,20 +5,11 @@
 # You may check the current default at
 #   https://github.com/Canop/bacon/blob/main/defaults/default-bacon.toml
 
-default_job = "clippy"
+default_job = "clippy-all"
 env.CARGO_TERM_COLOR = "always"
-
-[jobs.check]
-command = ["cargo", "check"]
-need_stdout = false
 
 [jobs.check-all]
 command = ["cargo", "check", "--all-targets"]
-need_stdout = false
-
-# Run clippy on the default target
-[jobs.clippy]
-command = ["cargo", "clippy"]
 need_stdout = false
 
 # Run clippy on all targets
@@ -34,12 +25,18 @@ command = [
 ]
 need_stdout = false
 
+[jobs.coverage]
+command = [
+    "cargo", "llvm-cov", "nextest",
+]
+need_stdout = true
+
 [jobs.nextest]
 command = [
     "cargo", "nextest", "run",
     "--hide-progress-bar", "--failure-output", "final"
 ]
-need_stdout = true
+need_stdout = false
 analyzer = "nextest"
 
 [jobs.doc]
@@ -53,48 +50,10 @@ command = ["cargo", "doc", "--no-deps", "--open"]
 need_stdout = false
 on_success = "back" # so that we don't open the browser at each change
 
-# You can run your application and have the result displayed in bacon,
-# if it makes sense for this crate.
-[jobs.run]
-command = [
-    "cargo", "run",
-    # put launch parameters for your program behind a `--` separator
-]
-need_stdout = true
-allow_warnings = true
-background = true
-
-# Run your long-running application (eg server) and have the result displayed in bacon.
-# For programs that never stop (eg a server), `background` is set to false
-# to have the cargo run output immediately displayed instead of waiting for
-# program's end.
-# 'on_change_strategy' is set to `kill_then_restart` to have your program restart
-# on every change (an alternative would be to use the 'F5' key manually in bacon).
-# If you often use this job, it makes sense to override the 'r' key by adding
-# a binding `r = job:run-long` at the end of this file .
-[jobs.run-long]
-command = [
-    "cargo", "run",
-    # put launch parameters for your program behind a `--` separator
-]
-need_stdout = true
-allow_warnings = true
-background = false
-on_change_strategy = "kill_then_restart"
-
-# This parameterized job runs the example of your choice, as soon
-# as the code compiles.
-# Call it as
-#    bacon ex -- my-example
-[jobs.ex]
-command = ["cargo", "run", "--example"]
-need_stdout = true
-allow_warnings = true
-
 # You may define here keybindings that would be specific to
 # a project, for example a shortcut to launch a specific job.
 # Shortcuts to internal functions (scrolling, toggling, etc.)
 # should go in your personal global prefs.toml file instead.
 [keybindings]
 # alt-m = "job:my-job"
-c = "job:clippy-all" # comment this to have 'c' run clippy on only the default target
+o = "job:coverage" 
