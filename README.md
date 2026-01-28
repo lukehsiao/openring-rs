@@ -71,3 +71,14 @@ Please refer to the Tera documentation for details.
 ## Why a Rust port?
 
 Just for fun.
+
+## TODO
+
+### Test suite
+I've only recently added some property-based testing to this repository for some happy-path behavior.
+I'd love to make this test suite more rigorous.
+The most significant hole right now is all the log in `src/lib.rs` which handles variables nuances of a feed body.
+The test suite only contains a single valid RSS 2.0 feed.
+It would be great to generate test strategies that provide far more coverage of both RSS and Atom feeds.
+
+Another thing that is interesting is the potential holes revealed by `cargo-mutant`.
