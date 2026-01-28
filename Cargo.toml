@@ -47,3 +47,6 @@ opt-level = 3
 
 [profile.test.package.rand_chacha]
 opt-level = 3
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

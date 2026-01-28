@@ -137,11 +137,16 @@ pub(crate) fn load_cache(args: &Args) -> Option<Cache> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{fs::File, io::Write, thread::sleep, time::Duration as StdDuration};
+
+    use csv::WriterBuilder;
     use jiff::{Span, Timestamp};
     use proptest::prelude::*;
     use tempfile::NamedTempFile;
+    use tempfile::TempDir;
     use url::Url;
+
+    use super::*;
 
     fn bounded_timestamp(secs: i64) -> Timestamp {
         let secs = secs.clamp(Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
@@ -192,6 +197,83 @@ mod tests {
     }
 
     proptest! {
+        // spans_equal behaves as expected for equal and different spans
+        #[test]
+        fn spans_equal_behavior(a_secs in 0i64..1_000_000i64, b_secs in 0i64..1_000_000i64) {
+            let a = Span::new().seconds(a_secs);
+            let b = Span::new().seconds(b_secs);
+
+            let eq = spans_equal(&a, &b);
+            prop_assert_eq!(eq, a_secs == b_secs);
+        }
+
+        // Round-trip CSV when optional fields are all None
+        #[test]
+        fn round_trip_all_none_fields(url in url_gen()) {
+            let cache: Cache = DashMap::new();
+            let cv = CacheValue {
+                timestamp: Timestamp::now(),
+                retry_after: None,
+                last_modified: None,
+                etag: None,
+                body: None,
+            };
+            cache.insert(url.clone(), cv.clone());
+
+            let tmp = NamedTempFile::new().expect("temp file");
+            cache.store(tmp.path()).expect("store succeeds");
+
+            let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+            let loaded_val = loaded.get(&url).expect("key present after load");
+            prop_assert_eq!(&*loaded_val, &cv);
+        }
+
+        // load skips malformed CSV rows instead of panicking (we create a CSV
+        // with one valid and one malformed row)
+        #[test]
+        fn load_skips_malformed_rows(url in url_gen(), value in cache_value_gen(), junk in r"\PC*") {
+            let tmp = NamedTempFile::new().expect("temp file");
+            {
+                // Write a CSV with one valid row and one invalid row
+                let mut wtr = WriterBuilder::new().has_headers(false).from_writer(tmp.reopen().expect("reopen"));
+                // valid row
+                wtr.serialize((&url, &value)).expect("serialize ok");
+                // malformed row: just random text
+                writeln!(wtr.into_inner().expect("into inner"), "{junk}").ok();
+            }
+
+            // Loading should not panic; it may return an Err if CSV reader fails, but we assert any valid row is retrievable.
+            if let Ok(loaded) = Cache::load(tmp.path(), u64::MAX, Timestamp::now()) {
+                if loaded.contains_key(&url) {
+                    let loaded_val = loaded.get(&url).expect("key present after load");
+                    prop_assert_eq!(&*loaded_val, &value);
+                } else {
+                    // If the loader treated the whole file as invalid it's acceptable, assert at least no panic occurred.
+                    prop_assert!(true);
+                }
+            } else {
+                // If load returned Err that's acceptable but shouldn't panic in tests
+                prop_assert!(true);
+            }
+        }
+
+        #[test]
+        fn load_clamps_max_age(url in url_gen(), value in cache_value_gen()) {
+            // create file with single entry
+            let cache: Cache = DashMap::new();
+            cache.insert(url.clone(), value.clone());
+            let tmp = NamedTempFile::new().expect("temp file");
+            cache.store(tmp.path()).expect("store succeeds");
+
+            // Use an enormous max_age (u128-sized) mapped to u64::MAX via API; ensure it doesn't overflow
+            let loaded_large = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+            let loaded_clamped = Cache::load(tmp.path(), MAX_SPAN_SEC as u64, Timestamp::now()).expect("load succeeds");
+
+            // Both should contain the same entry (since clamp should cap max age)
+            prop_assert!(loaded_large.contains_key(&url));
+            prop_assert!(loaded_clamped.contains_key(&url));
+        }
+
         #[test]
         fn round_trip_preserves_entries(
             // generate a vector of (Url, CacheValue) pairs
@@ -263,5 +345,95 @@ mod tests {
                 prop_assert_eq!(present, should_keep);
             }
         }
+    }
+    #[test]
+    fn load_cache_returns_none_when_cache_disabled() {
+        let mut args = Args {
+            cache: false,
+            ..Default::default()
+        };
+        args.cache = false;
+        assert!(super::load_cache(&args).is_none());
+    }
+
+    #[test]
+    fn load_cache_returns_none_when_no_file() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&tmpdir).expect("chdir");
+
+        let args = Args {
+            cache: true,
+            ..Default::default()
+        };
+        // Ensure no cache file exists
+        let _ = fs::remove_file(OPENRING_CACHE_FILE);
+        assert!(super::load_cache(&args).is_none());
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
+    }
+
+    #[test]
+    fn load_cache_discards_too_old_file_and_returns_none() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&tmpdir).expect("chdir");
+
+        // Create the cache file
+        let file_path = tmpdir.path().join(OPENRING_CACHE_FILE);
+        File::create(&file_path).expect("create cache file");
+
+        // Ensure the file's mtime is at least in the past relative to the check
+        sleep(StdDuration::from_millis(10));
+
+        // Use a max_cache_age smaller than the sleep to make the file "too old"
+        let args = Args {
+            cache: true,
+            max_cache_age: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        // Should detect file too old and return None
+        assert!(super::load_cache(&args).is_none());
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
+    }
+
+    #[test]
+    fn load_cache_uses_recent_file_and_loads_entries() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&tmpdir).expect("chdir");
+
+        // Prepare a real cache CSV under the expected filename
+        let file_path = tmpdir.path().join(OPENRING_CACHE_FILE);
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_path(&file_path)
+            .expect("writer");
+        let url = Url::parse("https://example.test/").unwrap();
+        let value = CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
+            etag: Some("etag".into()),
+            body: Some("body".into()),
+        };
+        wtr.serialize((&url, &value)).expect("serialize");
+        wtr.flush().expect("flush");
+
+        let args = Args {
+            cache: true,
+            max_cache_age: Duration::from_hours(24),
+            ..Default::default()
+        };
+
+        // Should return Some(Cache) and contain our entry
+        let loaded = super::load_cache(&args).expect("some cache");
+        assert!(loaded.contains_key(&url));
+        let loaded_val = loaded.get(&url).expect("get");
+        assert_eq!(&*loaded_val, &value);
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
     }
 }

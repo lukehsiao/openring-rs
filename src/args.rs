@@ -5,7 +5,7 @@ use clap_verbosity_flag::Verbosity;
 use jiff::civil::Date;
 use url::Url;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Total number of articles to fetch
