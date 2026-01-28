@@ -201,6 +201,95 @@ mod tests {
         RT.get_or_init(|| Runtime::new().expect("failed to create runtime"))
     }
 
+    // Return a valid RSS 2.0 feed (with parameterized title)
+    fn get_valid_rss_feed(title: &str) -> String {
+        format!(
+            r#"
+            <?xml version="1.0"?>
+            <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+               <channel>
+                  <title>{title}</title>
+                  <link>http://www.nasa.gov/</link>
+                  <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
+                  <language>en-us</language>
+                  <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                  <item>
+                     <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
+                     <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
+                     <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
+                     <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
+                     <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
+                  </item>
+               </channel>
+            </rss>
+        "#
+        )
+    }
+
+    fn day_name_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("Mon".to_string()),
+            Just("Tue".to_string()),
+            Just("Wed".to_string()),
+            Just("Thu".to_string()),
+            Just("Fri".to_string()),
+            Just("Sat".to_string()),
+            Just("Sun".to_string()),
+        ]
+    }
+
+    fn day_strategy() -> impl Strategy<Value = String> {
+        any::<u8>().prop_map(|day| format!("{:02}", day % 31 + 1)) // Days between 01 and 31
+    }
+
+    fn month_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("Jan".to_string()),
+            Just("Feb".to_string()),
+            Just("Mar".to_string()),
+            Just("Apr".to_string()),
+            Just("May".to_string()),
+            Just("Jun".to_string()),
+            Just("Jul".to_string()),
+            Just("Aug".to_string()),
+            Just("Sep".to_string()),
+            Just("Oct".to_string()),
+            Just("Nov".to_string()),
+            Just("Dec".to_string()),
+        ]
+    }
+
+    fn year_strategy() -> impl Strategy<Value = String> {
+        any::<u32>().prop_map(|year| format!("{}", year % 10000)) // Example: Limits to 4-digit years
+    }
+
+    fn hour_strategy() -> impl Strategy<Value = String> {
+        any::<u8>().prop_map(|hour| format!("{:02}", hour % 24)) // Hours between 00 and 23
+    }
+
+    fn minute_strategy() -> impl Strategy<Value = String> {
+        any::<u8>().prop_map(|minute| format!("{:02}", minute % 60)) // Minutes between 00 and 59
+    }
+
+    fn second_strategy() -> impl Strategy<Value = String> {
+        any::<u8>().prop_map(|second| format!("{:02}", second % 60)) // Seconds between 00 and 59
+    }
+
+    fn last_modified_strategy() -> impl Strategy<Value = String> {
+        (
+            day_name_strategy(),
+            day_strategy(),
+            month_strategy(),
+            year_strategy(),
+            hour_strategy(),
+            minute_strategy(),
+            second_strategy(),
+        )
+            .prop_map(|(day_name, day, month, year, hour, minute, second)| {
+                format!("{day_name}, {day} {month} {year} {hour}:{minute}:{second} GMT")
+            })
+    }
+
     proptest! {
         // 200 with arbitrary, non-empty body parses or returns parser error; doesn't crash.
         #[test]
@@ -249,25 +338,7 @@ mod tests {
                 let url = Url::parse(&server.uri()).unwrap();
                 let cache = Arc::new(Cache::new());
 
-                let body = format!(r#"
-                    <?xml version="1.0"?>
-                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
-                       <channel>
-                          <title>{cached_title}</title>
-                          <link>http://www.nasa.gov/</link>
-                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
-                          <language>en-us</language>
-                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
-                          <item>
-                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
-                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
-                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
-                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
-                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
-                          </item>
-                       </channel>
-                    </rss>
-                "#);
+                let body = get_valid_rss_feed(&cached_title);
                 let cv = CacheValue {
                     timestamp: Timestamp::now(),
                     retry_after: None,
@@ -305,25 +376,7 @@ mod tests {
 
                 let feed_title = "cached429";
 
-                let body = format!(r#"
-                    <?xml version="1.0"?>
-                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
-                       <channel>
-                          <title>{feed_title}</title>
-                          <link>http://www.nasa.gov/</link>
-                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
-                          <language>en-us</language>
-                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
-                          <item>
-                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
-                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
-                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
-                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
-                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
-                          </item>
-                       </channel>
-                    </rss>
-                "#);
+                let body = get_valid_rss_feed(feed_title);
                 let cv = CacheValue {
                     timestamp: Timestamp::now(),
                     retry_after: None,
@@ -388,16 +441,19 @@ mod tests {
             res.unwrap();
         }
 
-        // verifies If-None-Match header is sent and properly quoted/normalized
+        // Verifies If-None-Match and If-Modified-Since header is sent and properly quoted/normalized based on cache
         #[test]
-        fn prop_sends_if_none_match_for_etag(etag_input in prop_oneof![
-            // unquoted token
-            "[A-Za-z0-9]{1,30}",
-            // already quoted
-            "\"[A-Za-z0-9]{1,30}\"",
-            // weak etag
-            "W/\"[A-Za-z0-9]{1,30}\"",
-        ]) {
+        fn prop_sends_if_none_match_and_if_modified_since(
+            etag_input in prop_oneof![
+                // unquoted token
+                "[A-Za-z0-9]{1,30}",
+                // already quoted
+                "\"[A-Za-z0-9]{1,30}\"",
+                // weak etag
+                "W/\"[A-Za-z0-9]{1,30}\""
+            ],
+            last_modified_input in last_modified_strategy(),
+        ) {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
 
@@ -424,30 +480,11 @@ mod tests {
                 let url = Url::parse(&server.uri()).unwrap();
                 let cache = Arc::new(Cache::new());
 
-                let body = r#"
-                    <?xml version="1.0"?>
-                    <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
-                       <channel>
-                          <title>Fake</title>
-                          <link>http://www.nasa.gov/</link>
-                          <description>A RSS news feed containing the latest NASA press releases on the International Space Station.</description>
-                          <language>en-us</language>
-                          <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
-                          <item>
-                             <title>Louisiana Students to Hear from NASA Astronauts Aboard Space Station</title>
-                             <link>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</link>
-                             <description>As part of the state's first Earth-to-space call, students from Louisiana will have an opportunity soon to hear from NASA astronauts aboard the International Space Station.</description>
-                             <pubDate>Fri, 21 Jul 2023 09:04 EDT</pubDate>
-                             <guid>http://www.nasa.gov/press-release/louisiana-students-to-hear-from-nasa-astronauts-aboard-space-station</guid>
-                          </item>
-                       </channel>
-                    </rss>
-                "#.to_string();
-                let last_modified = String::from("Wed, 21 Oct 2015 07:28:00 GMT");
+                let body = get_valid_rss_feed("fake");
                 let cv = CacheValue {
                     timestamp: Timestamp::now(),
                     retry_after: None,
-                    last_modified: Some(last_modified.clone()),
+                    last_modified: Some(last_modified_input.clone()),
                     etag: Some(expected_etag.clone()),
                     body: Some(body),
                 };
@@ -471,7 +508,81 @@ mod tests {
                     .headers
                     .get("if-modified-since")
                     .ok_or_else(|| proptest::test_runner::TestCaseError::fail("missing If-Modified-Since header"))?;
-                prop_assert_eq!(if_modified_since.to_str()?, &last_modified, "{} != {}", if_modified_since.to_str()?, &last_modified);
+                prop_assert_eq!(if_modified_since.to_str()?, &last_modified_input, "{} != {}", if_modified_since.to_str()?, &last_modified_input);
+                Ok(())
+            });
+            res.unwrap();
+        }
+        // Verifies etag and last_modified metadata is saved to the cache on responses
+        #[test]
+        fn prop_sets_etag_and_last_modified_on_response(
+            etag_input in prop_oneof![
+                // unquoted token
+                "[A-Za-z0-9]{1,30}",
+                // already quoted
+                "\"[A-Za-z0-9]{1,30}\"",
+                // weak etag
+                "W/\"[A-Za-z0-9]{1,30}\"",
+            ],
+            last_modified_input in last_modified_strategy(),
+        ) {
+            let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
+                let server = MockServer::start().await;
+
+                // capture the request to inspect headers
+                let expected_etag = {
+                    // normalize the input the same way production code would:
+                    if (etag_input.starts_with('"') && etag_input.ends_with('"'))
+                        || (etag_input.starts_with("W/\"") && etag_input.ends_with('"'))
+                    {
+                        etag_input.clone()
+                    } else {
+                        format!("\"{etag_input}\"")
+                    }
+                };
+
+                let cache = Arc::new(Cache::new());
+
+                let body = get_valid_rss_feed("fake");
+                // mock responds 200 so fetch_feed updates cache
+                Mock::given(method("GET"))
+                    .and(path("/"))
+                    .respond_with(ResponseTemplate::new(200)
+                        .append_header("etag", &etag_input)
+                        .append_header("last-modified", &last_modified_input)
+                        .set_body_string(body)
+                    )
+                    .mount(&server)
+                    .await;
+
+                // create url and cache containing the etag
+                let url = Url::parse(&server.uri()).unwrap();
+
+                // Make the request and inspect the mock server received requests
+                let _ = url.fetch_feed(&cache).await?;
+
+                // retrieve requests recorded by the mock server
+                let received = server.received_requests().await.unwrap();
+
+                // there should be at least one request
+                prop_assert!(!received.is_empty());
+
+                // Verify cache entry has etag and last_modified set
+                if let Some(entry) = cache.get(&url) {
+                    prop_assert!(entry.etag.is_some());
+                    if let Some(etag) = &entry.etag {
+                        prop_assert_eq!(etag, &expected_etag);
+                    }
+
+                    prop_assert!(entry.last_modified.is_some());
+                    if let Some(last_modified) = &entry.last_modified{
+                        prop_assert_eq!(last_modified, &last_modified_input);
+                    }
+                } else {
+                    // If entry missing, fail
+                    prop_assert!(false);
+                }
+
                 Ok(())
             });
             res.unwrap();
