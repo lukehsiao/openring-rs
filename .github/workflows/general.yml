@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run tests
-        run: cargo nextest run
+        run: cargo nextest --profile ci run
 
   fmt:
     name: Rustfmt
