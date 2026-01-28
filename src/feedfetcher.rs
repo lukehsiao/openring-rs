@@ -21,6 +21,17 @@ pub(crate) trait FeedFetcher {
     async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
 }
 
+/// Normalize and etag
+#[must_use]
+pub fn normalize_etag(s: &str) -> String {
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with("W/\"") && s.ends_with('"')) {
+        s.to_string()
+    } else {
+        // ETag values must have the actual quotes
+        format!("\"{s}\"")
+    }
+}
+
 impl FeedFetcher for Url {
     /// Fetch a feed for a URL
     async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError> {
@@ -78,15 +89,7 @@ impl FeedFetcher for Url {
                         // ETag values must have the actual quotes
                         let etag = r.headers().get("etag").and_then(|etag_value| {
                             // Convert header to str
-                            etag_value.to_str().ok().map(|etag_str| {
-                                if (etag_str.starts_with('"') && etag_str.ends_with('"'))
-                                    || (etag_str.starts_with("W/\"") && etag_str.ends_with('"'))
-                                {
-                                    etag_str.to_string()
-                                } else {
-                                    format!("\"{etag_str}\"")
-                                }
-                            })
+                            etag_value.to_str().ok().map(normalize_etag)
                         });
                         let last_modified = r.headers().get("last-modified").and_then(|lm_value| {
                             lm_value.to_str().ok().map(std::string::ToString::to_string)
@@ -188,7 +191,7 @@ mod tests {
 
     use crate::{cache::CacheValue, error::OpenringError};
 
-    use super::FeedFetcher;
+    use super::{FeedFetcher, normalize_etag};
 
     // Import your crate items (adjust crate name if needed)
     // Cache alias from your crate: pub(crate) type Cache = DashMap<Url, CacheValue>;
@@ -457,17 +460,7 @@ mod tests {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
 
-                // capture the request to inspect headers
-                let expected_etag = {
-                    // normalize the input the same way production code would:
-                    if (etag_input.starts_with('"') && etag_input.ends_with('"'))
-                        || (etag_input.starts_with("W/\"") && etag_input.ends_with('"'))
-                    {
-                        etag_input.clone()
-                    } else {
-                        format!("\"{etag_input}\"")
-                    }
-                };
+                let expected_etag = normalize_etag(&etag_input);
 
                 // mock responds 304 so fetch_feed uses cache path that sends If-None-Match
                 Mock::given(method("GET"))
@@ -529,18 +522,7 @@ mod tests {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
 
-                // capture the request to inspect headers
-                let expected_etag = {
-                    // normalize the input the same way production code would:
-                    if (etag_input.starts_with('"') && etag_input.ends_with('"'))
-                        || (etag_input.starts_with("W/\"") && etag_input.ends_with('"'))
-                    {
-                        etag_input.clone()
-                    } else {
-                        format!("\"{etag_input}\"")
-                    }
-                };
-
+                let expected_etag = normalize_etag(&etag_input);
                 let cache = Arc::new(Cache::new());
 
                 let body = get_valid_rss_feed("fake");
