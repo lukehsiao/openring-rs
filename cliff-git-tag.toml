@@ -3,50 +3,32 @@
 
 [changelog]
 # changelog header
-header = """
-# Changelog\n
-All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.\n
-"""
+header = ""
 # template for the changelog body
 # https://keats.github.io/tera/docs/#introduction
 body = """
----
-{% if version %}\
-    {% if previous.version %}\
-        ## [{{ version | trim_start_matches(pat="v") }}]($REPO/compare/{{ previous.version }}..{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
-    {% else %}\
-        ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
-    {% endif %}\
-{% else %}\
-    ## [unreleased]
-{% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
-    ### {{ group | striptags | trim | upper_first }}
+    {{ group | striptags | trim | upper_first -}}
     {% for commit in commits
     | filter(attribute="scope")
     | sort(attribute="scope") %}
         - **({{commit.scope}})**{% if commit.breaking %} [**breaking**]{% endif %} \
-            {{ commit.message }} - ([{{ commit.id | truncate(length=7, end="") }}]($REPO/commit/{{ commit.id }})) - {{ commit.author.name }}
+            {{ commit.message }} ({{ commit.id | truncate(length=7, end="") }})
     {%- endfor -%}
     {% raw %}\n{% endraw %}\
     {%- for commit in commits %}
         {%- if commit.scope -%}
         {% else -%}
             - {% if commit.breaking %} [**breaking**] {% endif %}\
-                {{ commit.message }} - ([{{ commit.id | truncate(length=7, end="") }}]($REPO/commit/{{ commit.id }})) - {{ commit.author.name }}
+                {{ commit.message }} ({{ commit.id | truncate(length=7, end="") }})
         {% endif -%}
     {% endfor -%}
 {% endfor %}\n
 """
 # template for the changelog footer
-footer = """
-"""
+footer = ""
 # remove the leading and trailing whitespace from the templates
 trim = true
-# postprocessors
-postprocessors = [
-    { pattern = '\$REPO', replace = "https://github.com/lukehsiao/openring-rs" }, # replace repository URL
-]
 
 [git]
 # parse the commits based on https://www.conventionalcommits.org
@@ -76,7 +58,3 @@ tag_pattern = "v[0-9]*"
 date_order = true
 # sort the commits inside sections by oldest/newest order
 sort_commits = "oldest"
-link_parsers = [
-    { pattern = "#(\\d+)", href = "https://github.com/lukehsiao/openring-rs/issues/$1"},
-    { pattern = "RFC(\\d+)", text = "ietf-rfc$1", href = "https://datatracker.ietf.org/doc/html/rfc$1"},
-]
