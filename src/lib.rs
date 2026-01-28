@@ -70,10 +70,11 @@ fn parse_urls_from_file(path: &Path) -> Result<Vec<Url>> {
         .filter(|l| {
             let line = l.as_ref().unwrap();
             let trimmed = line.trim();
-            !(trimmed.starts_with('#') || trimmed.starts_with("//"))
+            !(trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.is_empty())
         })
         .map(|line| {
             let line = &line.unwrap();
+            let line = line.trim();
             Url::parse(line).map_err(|e| {
                 // Give a nice diagnostic error
                 let file_src = fs::read_to_string(path).unwrap();
