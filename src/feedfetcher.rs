@@ -278,7 +278,7 @@ mod tests {
         any::<u8>().prop_map(|second| format!("{:02}", second % 60)) // Seconds between 00 and 59
     }
 
-    fn last_modified_strategy() -> impl Strategy<Value = String> {
+    fn http_date_strategy() -> impl Strategy<Value = String> {
         (
             day_name_strategy(),
             day_strategy(),
@@ -296,7 +296,7 @@ mod tests {
     proptest! {
         // 200 with arbitrary, non-empty body parses or returns parser error; doesn't crash.
         #[test]
-        fn prop_success_parses_feed_without_crashing(feed_body in "\\PC*") {
+        fn prop_success_parses_feed_without_crashing(feed_body in r"\PC*") {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
                 let body = if feed_body.trim().is_empty() {
@@ -329,7 +329,7 @@ mod tests {
 
         // 304 Not Modified should use cached body
         #[test]
-        fn prop_not_modified_uses_cache(cached_title in "[a-z]{1,50}") {
+        fn prop_not_modified_uses_cache(cached_title in r"\w{1,50}") {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
 
@@ -360,13 +360,20 @@ mod tests {
 
         // HTTP 429 uses cache and sets retry_after (if header present) or default 4 hours
         #[test]
-        fn prop_too_many_requests_with_optional_retry(header_retry in prop::option::of(1u64..10_000u64)) {
+        fn prop_too_many_requests_with_optional_retry(
+            header_retry in prop::option::of(
+                prop_oneof![
+                    (1u64..10_000u64).prop_map(|s| s.to_string()),  // for seconds
+                    http_date_strategy(), // for http dates
+                ]
+            )
+        ) {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
 
                 let mut template = ResponseTemplate::new(429);
-                if let Some(r) = header_retry {
-                    template = template.insert_header("retry-after", r.to_string());
+                if let Some(ref r) = header_retry {
+                    template = template.insert_header("retry-after", r);
                 }
 
                 Mock::given(method("GET")).and(path("/"))
@@ -395,7 +402,7 @@ mod tests {
                 // Verify cache entry has retry_after set
                 if let Some(entry) = cache.get(&url) {
                     prop_assert!(entry.retry_after.is_some());
-                    // if header provided, it should match roughly the seconds; if not provided, default 4 hours expected
+                    // if header provided, it should set the header; if not provided, default 4 hours expected
                     if header_retry.is_some() {
                         let span = entry.retry_after.unwrap();
                         prop_assert!(span.total(Unit::Second)? > 0.0);
@@ -449,13 +456,13 @@ mod tests {
         fn prop_sends_if_none_match_and_if_modified_since(
             etag_input in prop_oneof![
                 // unquoted token
-                "[A-Za-z0-9]{1,30}",
+                "[[:word:]-]{1,30}",
                 // already quoted
-                "\"[A-Za-z0-9]{1,30}\"",
+                "\"[[:word:]-]{1,30}\"",
                 // weak etag
-                "W/\"[A-Za-z0-9]{1,30}\""
+                "W/\"[[:word:]-]{1,30}\""
             ],
-            last_modified_input in last_modified_strategy(),
+            last_modified_input in http_date_strategy(),
         ) {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
@@ -511,13 +518,13 @@ mod tests {
         fn prop_sets_etag_and_last_modified_on_response(
             etag_input in prop_oneof![
                 // unquoted token
-                "[A-Za-z0-9]{1,30}",
+                "[[:word:]-]{1,30}",
                 // already quoted
-                "\"[A-Za-z0-9]{1,30}\"",
+                "\"[[:word:]-]{1,30}\"",
                 // weak etag
-                "W/\"[A-Za-z0-9]{1,30}\"",
+                "W/\"[[:word:]-]{1,30}\"",
             ],
-            last_modified_input in last_modified_strategy(),
+            last_modified_input in http_date_strategy(),
         ) {
             let res: Result<(), proptest::test_runner::TestCaseError> = get_rt().block_on(async {
                 let server = MockServer::start().await;
