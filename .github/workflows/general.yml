@@ -51,8 +51,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-tarpaulin
-      - name: Generate code coverage
-        run: cargo tarpaulin --verbose --workspace
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - name: Collect coverage data
+        run: cargo llvm-cov nextest
