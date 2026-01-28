@@ -363,11 +363,6 @@ mod tests {
 
     use super::{parse_urls_from_file, resolve_href};
 
-    fn label_strategy() -> impl Strategy<Value = String> {
-        // 1..=28 length, start with alnum, middle can include hyphen, end
-        ("[a-z0-9]", "[a-z0-9-]{0,26}", "[a-z0-9]{2,5}").prop_map(|(s, m, e)| format!("{s}{m}{e}"))
-    }
-
     proptest! {
         // Generates a vector of well‑formed URLs and writes them to a temporary file,
         // then checks that `parse_urls_from_file` returns exactly the same set.
@@ -401,14 +396,17 @@ mod tests {
         #[test]
         fn resolve_href_preserves_origin(
             scheme in prop_oneof![Just("http".to_string()), Just("https".to_string())],
-            labels in prop::collection::vec(label_strategy(), 1..=3),            tld in "[a-z]{2,6}",
+            host in r"(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}",
             port in 80u16..=65535,
             rel_path in "/[a-zA-Z0-9_/-]{1,30}"
         ) {
-            let host = format!("{}.{}", labels.join("."), tld);
             // Assemble the base URL string.
             let base_str = format!("{scheme}://{host}:{port}");
-            let base_url = Url::parse(&base_str).unwrap_or_else(|_| panic!("generated base URL should be valid: {base_str}"));
+            let base_url = Url::parse(&base_str);
+
+            // Filter out invalid URLs (usually bad punycode) from the naive regex
+            prop_assume!(base_url.is_ok());
+            let base_url = base_url.unwrap();
 
             let absolute = format!("{base_str}/{rel_path}");
             let resolved_abs = resolve_href(&base_url, &absolute).unwrap();
