@@ -15,8 +15,8 @@ test:
 
 # Runs the test suite to compute coverage
 [group('dev')]
-coverage:
-	cargo llvm-cov nextest
+coverage *FLAGS:
+	cargo llvm-cov nextest {{FLAGS}}
 
 # check security advisories
 [group('dev')]
