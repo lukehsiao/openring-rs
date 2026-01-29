@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.4.1](https://github.com/lukehsiao/openring-rs/compare/v0.4.0..v0.4.1) - 2026-01-29
+
+Removes unused dependencies to reduce binary size slightly.
+
+---
 ## [0.4.0](https://github.com/lukehsiao/openring-rs/compare/v0.3.12..v0.4.0) - 2026-01-29
 
 Bumping the minor version here because we change the format of the cache file from CSV to JSON.
