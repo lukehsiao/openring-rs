@@ -1,4 +1,10 @@
-use std::{cmp::Ordering, fs, path::Path, time::Duration};
+use std::{
+    cmp::Ordering,
+    fs,
+    io::{BufReader, BufWriter},
+    path::Path,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use jiff::{Span, Timestamp, ToSpan};
@@ -56,36 +62,42 @@ pub(crate) trait StoreExt {
 
 impl StoreExt for Cache {
     fn store<T: AsRef<Path>>(&self, path: T) -> Result<()> {
-        let mut wtr = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_path(path)?;
-        for result in self {
-            wtr.serialize((result.key(), result.value()))?;
-        }
+        let f = fs::File::create(path)?;
+        let w = BufWriter::new(f);
+        serde_json::to_writer(w, self)?;
         Ok(())
     }
 
     fn load<T: AsRef<Path>>(path: T, max_age_secs: u64, now: Timestamp) -> Result<Cache> {
         let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64).cast_signed();
 
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_path(path)?;
+        let f = fs::File::open(path)?;
+        let r = BufReader::new(f);
 
-        let map = DashMap::new();
+        let map: DashMap<Url, CacheValue> = serde_json::from_reader(r)?;
+
+        // Remove entries older than max_age_secs
         let current_ts = now;
-        for result in rdr.deserialize() {
-            let (url, value): (Url, CacheValue) = result?;
-            // Discard entries older than `max_age_secs`.
-            // This allows gradually updating the cache over multiple runs.
-            if (current_ts - value.timestamp).compare(clamped_secs.seconds())? == Ordering::Less {
-                map.insert(url, value);
-            }
+        let threshold = clamped_secs.seconds();
+        let keys_to_remove: Vec<Url> = map
+            .iter()
+            .filter_map(|entry| {
+                let v = entry.value();
+                if (current_ts - v.timestamp).compare(threshold).ok()? == std::cmp::Ordering::Less {
+                    None
+                } else {
+                    Some(entry.key().clone())
+                }
+            })
+            .collect();
+
+        for k in keys_to_remove {
+            map.remove(&k);
         }
+
         Ok(map)
     }
 }
-
 /// Load cache (if exists and is still valid).
 /// This returns an `Option` as starting without a cache is a common scenario
 /// and we silently discard errors on purpose.
@@ -137,9 +149,8 @@ pub(crate) fn load_cache(args: &Args) -> Option<Cache> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write, thread::sleep, time::Duration as StdDuration};
+    use std::{fs::File, thread::sleep, time::Duration as StdDuration};
 
-    use csv::WriterBuilder;
     use jiff::{Span, Timestamp};
     use proptest::prelude::*;
     use tempfile::NamedTempFile;
@@ -207,7 +218,7 @@ mod tests {
             prop_assert_eq!(eq, a_secs == b_secs);
         }
 
-        // Round-trip CSV when optional fields are all None
+        // Round-trip JSON when optional fields are all None
         #[test]
         fn round_trip_all_none_fields(url in url_gen()) {
             let cache: Cache = DashMap::new();
@@ -226,35 +237,6 @@ mod tests {
             let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
             let loaded_val = loaded.get(&url).expect("key present after load");
             prop_assert_eq!(&*loaded_val, &cv);
-        }
-
-        // load skips malformed CSV rows instead of panicking (we create a CSV
-        // with one valid and one malformed row)
-        #[test]
-        fn load_skips_malformed_rows(url in url_gen(), value in cache_value_gen(), junk in r"\PC*") {
-            let tmp = NamedTempFile::new().expect("temp file");
-            {
-                // Write a CSV with one valid row and one invalid row
-                let mut wtr = WriterBuilder::new().has_headers(false).from_writer(tmp.reopen().expect("reopen"));
-                // valid row
-                wtr.serialize((&url, &value)).expect("serialize ok");
-                // malformed row: just random text
-                writeln!(wtr.into_inner().expect("into inner"), "{junk}").ok();
-            }
-
-            // Loading should not panic; it may return an Err if CSV reader fails, but we assert any valid row is retrievable.
-            if let Ok(loaded) = Cache::load(tmp.path(), u64::MAX, Timestamp::now()) {
-                if loaded.contains_key(&url) {
-                    let loaded_val = loaded.get(&url).expect("key present after load");
-                    prop_assert_eq!(&*loaded_val, &value);
-                } else {
-                    // If the loader treated the whole file as invalid it's acceptable, assert at least no panic occurred.
-                    prop_assert!(true);
-                }
-            } else {
-                // If load returned Err that's acceptable but shouldn't panic in tests
-                prop_assert!(true);
-            }
         }
 
         #[test]
@@ -405,12 +387,7 @@ mod tests {
         let cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&tmpdir).expect("chdir");
 
-        // Prepare a real cache CSV under the expected filename
-        let file_path = tmpdir.path().join(OPENRING_CACHE_FILE);
-        let mut wtr = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_path(&file_path)
-            .expect("writer");
+        // Prepare a real cache JSON under the expected filename
         let url = Url::parse("https://example.test/").unwrap();
         let value = CacheValue {
             timestamp: Timestamp::now(),
@@ -419,8 +396,9 @@ mod tests {
             etag: Some("etag".into()),
             body: Some("body".into()),
         };
-        wtr.serialize((&url, &value)).expect("serialize");
-        wtr.flush().expect("flush");
+        let cache = Cache::new();
+        cache.insert(url.clone(), value.clone());
+        cache.store(OPENRING_CACHE_FILE).expect("store");
 
         let args = Args {
             cache: true,

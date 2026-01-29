@@ -24,6 +24,8 @@ pub enum OpenringError {
     #[diagnostic(transparent)]
     ChronoError(#[from] ChronoError),
     #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+    #[error(transparent)]
     #[diagnostic(transparent)]
     FeedUrlError(#[from] FeedUrlError),
     #[error("The feed at `{0}` was empty.")]
