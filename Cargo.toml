@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 ammonia = "4.1.2"
-clap = { version = "4.5.54", features = ["derive", "wrap_help", "cargo"] }
+clap = { version = "4.5.56", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "3.0.4"
 dashmap = { version = "6.1.0", features = ["serde"] }
 feed-rs = "2.3.1"
