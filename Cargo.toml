@@ -16,7 +16,6 @@ categories = ["command-line-utilities"]
 ammonia = "4.1.2"
 clap = { version = "4.5.54", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "3.0.4"
-csv = "1.4.0"
 dashmap = { version = "6.1.0", features = ["serde"] }
 feed-rs = "2.3.1"
 html-escape = "0.2.13"
@@ -43,9 +42,6 @@ tempfile = "3.24.0"
 wiremock = "0.6.5"
 
 [profile.test.package.proptest]
-opt-level = 3
-
-[profile.test.package.rand_chacha]
 opt-level = 3
 
 [lints.rust]

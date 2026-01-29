@@ -24,6 +24,7 @@ pub enum OpenringError {
     #[diagnostic(transparent)]
     ChronoError(#[from] ChronoError),
     #[error(transparent)]
+    #[diagnostic(code(openring::cache_error))]
     SerdeJsonError(#[from] serde_json::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -49,12 +50,6 @@ pub enum OpenringError {
     #[error("Failed to parse tera template.")]
     #[diagnostic(code(openring::template_error))]
     TemplateError(#[from] tera::Error),
-    #[error("Invalid cache file found.")]
-    #[diagnostic(code(openring::cache_error))]
-    CsvError(#[from] csv::Error),
-    #[error("Invalid cache file found.")]
-    #[diagnostic(code(openring::cache_error))]
-    TryFromIntError(#[from] std::num::TryFromIntError),
 }
 
 #[derive(Error, Diagnostic, Debug)]
