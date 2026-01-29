@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.4.0](https://github.com/lukehsiao/openring-rs/compare/v0.3.12..v0.4.0) - 2026-01-29
+
+Bumping the minor version here because we change the format of the cache file from CSV to JSON.
+This shouldn't actually require any changes from any users, it will just behave as if you have no cache on first run.
+
+### Performance
+
+- also deduplicate in the parsing of the url file itself - ([0342255](https://github.com/lukehsiao/openring-rs/commit/03422554407ca0ad6d763d971057e8b8f5045df2)) - Luke Hsiao
+
+### Refactor
+
+- pull etag normalization into helper - ([2383e7e](https://github.com/lukehsiao/openring-rs/commit/2383e7e6ddc9287964bfafe419fb8010d728d00b)) - Luke Hsiao
+- serde cache as json, not csv - ([a776733](https://github.com/lukehsiao/openring-rs/commit/a77673362342d0bec8f3d36f18db0fb956f4b62d)) - Luke Hsiao
+
+---
 ## [0.3.12](https://github.com/lukehsiao/openring-rs/compare/v0.3.11..v0.3.12) - 2026-01-28
 
 This release contains just a few small bugfixes as a result of me actually adding some testing.
