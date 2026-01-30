@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.5.2](https://github.com/lukehsiao/openring-rs/compare/v0.5.1..v0.5.2) - 2026-01-30
+
+### Refactor
+
+- increase default max-cache-age to 30d - ([b2bb116](https://github.com/lukehsiao/openring-rs/commit/b2bb11695761eda27729e82efba7c9edec62a48e)) - Luke Hsiao
+
+---
 ## [0.5.1](https://github.com/lukehsiao/openring-rs/compare/v0.5.0..v0.5.1) - 2026-01-30
 
 ### Bug Fixes
