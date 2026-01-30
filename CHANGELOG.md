@@ -3,6 +3,29 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.5.0](https://github.com/lukehsiao/openring-rs/compare/v0.4.1..v0.5.0) - 2026-01-30
+
+I'm once again changing the cache behavior.
+Rather than storing caches per-project in `.openringcache`, we now store in OS-standard cache locations.
+
+- **Linux**: `$XDG_CACHE_HOME/openring/cache.json` or `$HOME/.cache/openring/cache.json`
+- **macOS**: `$HOME/Library/Caches/dev.hsiao.openring/cache.json`
+- **Windows**: `{FOLDERID_LocalAppData}\hsiao\openring\cache\cache.json`
+
+This way, the cache can easily benefit multiple sites, and you do not need to bother `.gitignore`-ing another file.
+
+To that end, **caching is now the default behavior**.
+It is the both the polite behavior (conditional requests, respecting 429s) and performant one, and as such, should be the default.
+Now that we are not polluting the directory of invocation with a file, I feel confortable making this the default behavior.
+
+If you were calling with `--cache` before, simply drop the argument.
+
+### Features
+
+- cache by default - ([809db64](https://github.com/lukehsiao/openring-rs/commit/809db64bcc403513f0852741dc514c9ee43a0d0f)) - Luke Hsiao
+- move cache to standard project-based directories - ([a3b3008](https://github.com/lukehsiao/openring-rs/commit/a3b30088a1d642ed87304c2f676f65764aeb8b3d)) - Luke Hsiao
+
+---
 ## [0.4.1](https://github.com/lukehsiao/openring-rs/compare/v0.4.0..v0.4.1) - 2026-01-29
 
 Removes unused dependencies to reduce binary size slightly.
