@@ -100,3 +100,8 @@ We've added a GitHub workflow for it to show the holes.
 
 Finally, `proptest` tests for `src/feedfetcher.rs` are excessively slow.
 We should be able to speed those up.
+
+### File-based lock for cache
+
+Now that we are using a shared cache in `~/.cache/openring/cache.json`, it is possible for multiple invocations of `openring` to try and write to the same place at once.
+We likely should implement a simple file-based lock to prevent that.
