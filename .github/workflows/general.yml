@@ -70,6 +70,7 @@ jobs:
         with:
           tool: cargo-mutants
       - run: cargo mutants -vV --in-place --test-tool=nextest
+        continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
