@@ -42,7 +42,7 @@ pub struct Args {
     #[arg(
         long,
         value_parser = humantime::parse_duration,
-        default_value = "14d"
+        default_value = "30d"
     )]
     pub max_cache_age: Duration,
     #[clap(flatten)]

@@ -56,7 +56,7 @@ Options:
   -s, --url <URL>                      A single URL to consider (can be repeated to specify multiple)
   -b, --before <BEFORE>                Only include articles before this date (in YYYY-MM-DD format)
       --no-cache                       Do NOT use request cache stored on disk
-      --max-cache-age <MAX_CACHE_AGE>  Discard all cached requests older than this duration [default: 14d]
+      --max-cache-age <MAX_CACHE_AGE>  Discard all cached requests older than this duration [default: 30d]
   -v, --verbose...                     Increase logging verbosity
   -q, --quiet...                       Decrease logging verbosity
   -h, --help                           Print help (see more with '--help')
