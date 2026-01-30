@@ -84,6 +84,8 @@ impl StoreExt for Cache {
             fs::create_dir_all(parent)?;
         }
         let f = fs::File::create(path)?;
+        // Grab a lock to avoid multiple processes writing simultaneously
+        f.lock()?;
         let w = BufWriter::new(f);
         serde_json::to_writer(w, self)?;
         Ok(())
@@ -93,6 +95,10 @@ impl StoreExt for Cache {
         let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64).cast_signed();
 
         let f = fs::File::open(path)?;
+
+        // Acquire a shared lock so multiple readers can coexist, but no writers
+        f.lock_shared()?;
+
         let r = BufReader::new(f);
 
         let map: DashMap<Url, CacheValue> = serde_json::from_reader(r)?;
