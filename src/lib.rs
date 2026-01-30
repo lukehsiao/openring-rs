@@ -24,7 +24,7 @@ use yansi::Paint;
 
 use crate::{
     args::Args,
-    cache::{Cache, OPENRING_CACHE_FILE, StoreExt},
+    cache::{Cache, CachePath, StoreExt},
     error::{FeedUrlError, OpenringError, Result},
     feedfetcher::FeedFetcher,
 };
@@ -163,7 +163,7 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
 #[allow(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     debug!(?args);
-    let cache = cache::load_cache(&args).unwrap_or_default();
+    let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
 
     let mut urls = args.url;
@@ -185,8 +185,10 @@ pub async fn run(args: Args) -> Result<()> {
 
     let feeds = get_feeds_from_urls(&urls, &cache).await;
 
-    if !args.no_cache {
-        cache.store(OPENRING_CACHE_FILE)?;
+    if let Some(cache_path) = cache::get_cache_path()
+        && !args.no_cache
+    {
+        cache.store(cache_path)?;
     }
 
     let template = fs::read_to_string(&args.template_file)?;

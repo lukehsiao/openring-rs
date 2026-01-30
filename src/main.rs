@@ -1,5 +1,5 @@
 use clap::Parser;
-use miette::{Context, Result};
+use miette::{IntoDiagnostic, Result};
 use std::io;
 use tracing_log::AsTrace;
 
@@ -16,6 +16,5 @@ async fn main() -> Result<()> {
         ))
         .with_writer(io::stderr)
         .init();
-    // I feel like I shouldn't need wrap_err, but it doesn't work without it.
-    openring::run(args).await.wrap_err("runtime error")
+    openring::run(args).await.into_diagnostic()
 }

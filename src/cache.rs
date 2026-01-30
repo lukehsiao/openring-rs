@@ -2,11 +2,12 @@ use std::{
     cmp::Ordering,
     fs,
     io::{BufReader, BufWriter},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use dashmap::DashMap;
+use directories::ProjectDirs;
 use jiff::{Span, Timestamp, ToSpan};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -14,8 +15,15 @@ use url::Url;
 
 use crate::{args::Args, error::Result};
 
-pub(crate) const OPENRING_CACHE_FILE: &str = ".openringcache";
 const MAX_SPAN_SEC: i64 = 631_107_417_600;
+
+/// Options for loading cache
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum CachePath<'a> {
+    Default,
+    #[allow(dead_code)]
+    Path(&'a Path),
+}
 
 /// Describes a feed fetch result that can be serialized to disk
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,6 +33,14 @@ pub(crate) struct CacheValue {
     pub(crate) last_modified: Option<String>,
     pub(crate) etag: Option<String>,
     pub(crate) body: Option<String>,
+}
+
+/// Get the path to cache location.
+pub(crate) fn get_cache_path() -> Option<PathBuf> {
+    if let Some(proj_dirs) = ProjectDirs::from("dev", "hsiao", "openring") {
+        return Some(proj_dirs.cache_dir().join("cache.json"));
+    }
+    None
 }
 
 fn spans_equal(a: &Span, b: &Span) -> bool {
@@ -62,6 +78,11 @@ pub(crate) trait StoreExt {
 
 impl StoreExt for Cache {
     fn store<T: AsRef<Path>>(&self, path: T) -> Result<()> {
+        // Ensure the parent directory exists
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let f = fs::File::create(path)?;
         let w = BufWriter::new(f);
         serde_json::to_writer(w, self)?;
@@ -99,17 +120,24 @@ impl StoreExt for Cache {
     }
 }
 /// Load cache (if exists and is still valid).
+///
 /// This returns an `Option` as starting without a cache is a common scenario
 /// and we silently discard errors on purpose.
-pub(crate) fn load_cache(args: &Args) -> Option<Cache> {
+pub(crate) fn load_cache(args: &Args, cache_path: CachePath) -> Option<Cache> {
     if args.no_cache {
         return None;
     }
+    let default_cache_path = get_cache_path();
+    let cache_path = match cache_path {
+        CachePath::Default if default_cache_path.is_none() => return None,
+        CachePath::Default => default_cache_path.unwrap(),
+        CachePath::Path(p) => p.to_path_buf(),
+    };
 
     // Discard entire cache if it hasn't been updated since `max_cache_age`.
     // This is an optimization, which avoids iterating over the file and
     // checking the age of each entry.
-    match fs::metadata(OPENRING_CACHE_FILE) {
+    match fs::metadata(&cache_path) {
         Err(_e) => {
             // No cache found; silently start with empty cache
             return None;
@@ -133,11 +161,7 @@ pub(crate) fn load_cache(args: &Args) -> Option<Cache> {
         }
     }
 
-    let cache = Cache::load(
-        OPENRING_CACHE_FILE,
-        args.max_cache_age.as_secs(),
-        Timestamp::now(),
-    );
+    let cache = Cache::load(cache_path, args.max_cache_age.as_secs(), Timestamp::now());
     match cache {
         Ok(cache) => Some(cache),
         Err(e) => {
@@ -330,40 +354,32 @@ mod tests {
     }
     #[test]
     fn load_cache_returns_none_when_cache_disabled() {
+        let tmp_cache_path = NamedTempFile::new().expect("temp file");
         let mut args = Args {
             no_cache: true,
             ..Default::default()
         };
         args.no_cache = true;
-        assert!(super::load_cache(&args).is_none());
+        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).is_none());
     }
 
     #[test]
     fn load_cache_returns_none_when_no_file() {
         let tmpdir = TempDir::new().expect("tempdir");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&tmpdir).expect("chdir");
-
+        let tmp_cache_path = tmpdir.path().join("nonexistent");
         let args = Args {
             no_cache: false,
             ..Default::default()
         };
         // Ensure no cache file exists
-        let _ = fs::remove_file(OPENRING_CACHE_FILE);
-        assert!(super::load_cache(&args).is_none());
-
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        let _ = fs::remove_file(&tmp_cache_path);
+        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.as_path())).is_none());
     }
 
     #[test]
     fn load_cache_discards_too_old_file_and_returns_none() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&tmpdir).expect("chdir");
-
-        // Create the cache file
-        let file_path = tmpdir.path().join(OPENRING_CACHE_FILE);
-        File::create(&file_path).expect("create cache file");
+        let tmp_cache_path = NamedTempFile::new().expect("temp file");
+        File::create(&tmp_cache_path).expect("create cache file");
 
         // Ensure the file's mtime is at least in the past relative to the check
         sleep(StdDuration::from_millis(10));
@@ -376,16 +392,12 @@ mod tests {
         };
 
         // Should detect file too old and return None
-        assert!(super::load_cache(&args).is_none());
-
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).is_none());
     }
 
     #[test]
     fn load_cache_uses_recent_file_and_loads_entries() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&tmpdir).expect("chdir");
+        let tmp_cache_path = NamedTempFile::new().expect("temp file");
 
         // Prepare a real cache JSON under the expected filename
         let url = Url::parse("https://example.test/").unwrap();
@@ -398,7 +410,7 @@ mod tests {
         };
         let cache = Cache::new();
         cache.insert(url.clone(), value.clone());
-        cache.store(OPENRING_CACHE_FILE).expect("store");
+        cache.store(&tmp_cache_path).expect("store");
 
         let args = Args {
             no_cache: false,
@@ -407,11 +419,60 @@ mod tests {
         };
 
         // Should return Some(Cache) and contain our entry
-        let loaded = super::load_cache(&args).expect("some cache");
+        let loaded =
+            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
         assert!(loaded.contains_key(&url));
         let loaded_val = loaded.get(&url).expect("get");
         assert_eq!(&*loaded_val, &value);
+    }
 
-        std::env::set_current_dir(cwd).expect("restore cwd");
+    #[test]
+    fn cache_round_trip_prunes_entries_that_are_old() {
+        let tmp_cache_path = NamedTempFile::new().expect("temp file");
+
+        // Prepare a real cache JSON under the expected filename
+        let cache = Cache::new();
+        let valid_url = Url::parse("https://example.test/").unwrap();
+        let valid_value = CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
+            etag: Some("etag".into()),
+            body: Some("body".into()),
+        };
+        cache.insert(valid_url.clone(), valid_value.clone());
+
+        // To old, should be filtered
+        let expired_url = Url::parse("https://example2.test/").unwrap();
+        let expired_value = CacheValue {
+            timestamp: Timestamp::now() - Duration::from_hours(48),
+            retry_after: None,
+            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
+            etag: Some("etag".into()),
+            body: Some("body".into()),
+        };
+        cache.insert(expired_url.clone(), expired_value.clone());
+        cache.store(&tmp_cache_path).expect("store");
+
+        let args = Args {
+            no_cache: false,
+            max_cache_age: Duration::from_hours(24),
+            ..Default::default()
+        };
+
+        // Should return Some(Cache) and contain only the valid entry
+        let loaded =
+            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
+        assert!(loaded.contains_key(&valid_url));
+        assert!(!loaded.contains_key(&expired_url));
+        let loaded_val = loaded.get(&valid_url).expect("get");
+        assert_eq!(&*loaded_val, &valid_value);
+
+        // After loading with the config, storing again should prune old entries
+        loaded.store(&tmp_cache_path).expect("store");
+        let loaded =
+            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
+        assert!(loaded.contains_key(&valid_url));
+        assert!(!loaded.contains_key(&expired_url));
     }
 }

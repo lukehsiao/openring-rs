@@ -30,7 +30,7 @@ pub struct Args {
     /// away articles before this date from the feed itself.
     #[arg(short, long)]
     pub before: Option<Date>,
-    /// Do NOT use request cache stored on disk at `.openringcache`
+    /// Do NOT use request cache stored on disk.
     ///
     /// Note that the cache only prevents refetching if the feed source responds
     /// with a 429. In this case, we respect Retry-After, or default to 4h.

@@ -24,6 +24,7 @@ command = [
     "-D", "warnings",
 ]
 need_stdout = false
+hide_scrollbar = true
 
 [jobs.coverage]
 command = [

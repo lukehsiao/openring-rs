@@ -22,7 +22,7 @@
 `openring-rs` is a tool for generating a webring from Atom/RSS feeds, so you can populate a template with articles from those feeds and embed them in your own blog. An example template is provided in `in.html`.
 
 This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the primary differences being:
-- we respect throttling and send conditional requests by default (disable with `--no-cache`)
+- we respect throttling and send conditional requests by default via caching (disable with `--no-cache`)
 - the template is written using [Tera](https://keats.github.io/tera/) and is provided as an argument, not read from stdin
 - we show a little progress bar
 - we fetch all feeds concurrently
@@ -51,12 +51,11 @@ Usage: openring [OPTIONS] --template-file <FILE>
 Options:
   -n, --num-articles <NUM_ARTICLES>    Total number of articles to fetch [default: 3]
   -p, --per-source <PER_SOURCE>        Number of most recent articles to get from each feed [default: 1]
-  -S, --url-file <FILE>                File with URLs of Atom/RSS feeds to read (one URL per line, lines starting with '#'
-                                       or "//" are ignored)
+  -S, --url-file <FILE>                File with URLs of Atom/RSS feeds to read (one URL per line, lines starting with '#' or "//" are ignored)
   -t, --template-file <FILE>           Tera template file
   -s, --url <URL>                      A single URL to consider (can be repeated to specify multiple)
   -b, --before <BEFORE>                Only include articles before this date (in YYYY-MM-DD format)
-      --no-cache                       Do NOT use request cache stored on disk at `.openringcache`
+      --no-cache                       Do NOT use request cache stored on disk
       --max-cache-age <MAX_CACHE_AGE>  Discard all cached requests older than this duration [default: 14d]
   -v, --verbose...                     Increase logging verbosity
   -q, --quiet...                       Decrease logging verbosity
@@ -68,6 +67,20 @@ Options:
 
 The templates supported by `openring-rs` are written using [Tera](https://keats.github.io/tera/).
 Please refer to the Tera documentation for details.
+
+## Caching
+
+We use OS-standard locations for caching.
+
+- **Linux**: `$XDG_CACHE_HOME/openring/cache.json` or `$HOME/.cache/openring/cache.json`
+- **macOS**: `$HOME/Library/Caches/dev.hsiao.openring/cache.json`
+- **Windows**: `{FOLDERID_LocalAppData}\hsiao\openring\cache\cache.json`
+
+The cache file is simple JSON.
+
+The cache only prevents refetching a feed if the feed source responds with a 429.
+In this case, we respect `Retry-After`, or default to 4 hours.
+Otherwise, we use the cache to send conditional requests by respecting the `ETag` and `Last-Modified` headers.
 
 ## Why a Rust port?
 
