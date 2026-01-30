@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use url::Url;
 
-use crate::{args::Args, error::Result};
+use crate::{config::Config, error::Result};
 
 const MAX_SPAN_SEC: i64 = 631_107_417_600;
 
@@ -129,8 +129,8 @@ impl StoreExt for Cache {
 ///
 /// This returns an `Option` as starting without a cache is a common scenario
 /// and we silently discard errors on purpose.
-pub(crate) fn load_cache(args: &Args, cache_path: CachePath) -> Option<Cache> {
-    if args.no_cache {
+pub(crate) fn load_cache(config: &Config, cache_path: CachePath) -> Option<Cache> {
+    if config.no_cache {
         return None;
     }
     let default_cache_path = get_cache_path();
@@ -151,18 +151,18 @@ pub(crate) fn load_cache(args: &Args, cache_path: CachePath) -> Option<Cache> {
         Ok(metadata) => {
             let modified = metadata.modified().ok()?;
             let elapsed = modified.elapsed().ok()?;
-            if elapsed > args.max_cache_age {
+            if elapsed > config.max_cache_age {
                 warn!(
                     "Cache is too old (age: {:#?}, max age: {:#?}). Discarding and recreating.",
                     Duration::from_secs(elapsed.as_secs()),
-                    Duration::from_secs(args.max_cache_age.as_secs())
+                    Duration::from_secs(config.max_cache_age.as_secs())
                 );
                 return None;
             }
             info!(
                 "Cache is recent (age: {:#?}, max age: {:#?}). Using.",
                 Duration::from_secs(elapsed.as_secs()),
-                Duration::from_secs(args.max_cache_age.as_secs())
+                Duration::from_secs(config.max_cache_age.as_secs())
             );
         }
     }
@@ -361,19 +361,19 @@ mod tests {
     #[test]
     fn load_cache_returns_none_when_cache_disabled() {
         let tmp_cache_path = NamedTempFile::new().expect("temp file");
-        let mut args = Args {
+        let mut config = Config {
             no_cache: true,
             ..Default::default()
         };
-        args.no_cache = true;
-        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).is_none());
+        config.no_cache = true;
+        assert!(super::load_cache(&config, CachePath::Path(tmp_cache_path.path())).is_none());
     }
 
     #[test]
     fn load_cache_returns_none_when_no_file() {
         let tmpdir = TempDir::new().expect("tempdir");
         let tmp_cache_path = tmpdir.path().join("nonexistent");
-        let args = Args {
+        let config = Config {
             no_cache: false,
             ..Default::default()
         };
@@ -391,7 +391,7 @@ mod tests {
         sleep(StdDuration::from_millis(10));
 
         // Use a max_cache_age smaller than the sleep to make the file "too old"
-        let args = Args {
+        let config = Config {
             no_cache: false,
             max_cache_age: Duration::from_millis(1),
             ..Default::default()
@@ -418,7 +418,7 @@ mod tests {
         cache.insert(url.clone(), value.clone());
         cache.store(&tmp_cache_path).expect("store");
 
-        let args = Args {
+        let config = Config {
             no_cache: false,
             max_cache_age: Duration::from_hours(24),
             ..Default::default()

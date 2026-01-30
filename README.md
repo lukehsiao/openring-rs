@@ -28,6 +28,7 @@ This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 - we fetch all feeds concurrently
 - we provide better error messages (via [miette](https://github.com/zkat/miette))
 - we allow filtering feeds with `--before`
+- we allow configuration via file
 
 ## Demo
 
@@ -81,6 +82,28 @@ The cache file is simple JSON.
 The cache only prevents refetching a feed if the feed source responds with a 429.
 In this case, we respect `Retry-After`, or default to 4 hours.
 Otherwise, we use the cache to send conditional requests by respecting the `ETag` and `Last-Modified` headers.
+
+## Configuration
+
+We use OS-standard locations for configuration.
+
+- **Linux**:	`$XDG_CONFIG_HOME/openring/config.toml` or `$HOME/.config/openring/config.toml`
+- **macOS**:	`$HOME/Library/Application Support/dev.hsiao.openring/config.toml`
+- **Windows**: `{FOLDERID_RoamingAppData}\hsiao\openring\config\config.toml`
+
+CLI options take precedence over configuration files.
+
+The default configuration is the CLI default values.
+
+### Example configuration file
+
+```toml
+num_articles = 3
+per_source = 1
+url_file = "/path/to/blogroll.txt"
+before = "2025-01-01"
+max_cache_age = 13d
+```
 
 ## Why a Rust port?
 

@@ -1,4 +1,4 @@
-pub mod args;
+pub mod config;
 pub mod cache;
 pub mod error;
 pub mod feedfetcher;
@@ -23,7 +23,7 @@ use url::{ParseError, Url};
 use yansi::Paint;
 
 use crate::{
-    args::Args,
+    config::Config,
     cache::{Cache, CachePath, StoreExt},
     error::{FeedUrlError, OpenringError, Result},
     feedfetcher::FeedFetcher,
@@ -161,14 +161,14 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
 #[allow(clippy::missing_panics_doc)]
 #[allow(clippy::missing_errors_doc)]
 #[allow(clippy::too_many_lines)]
-pub async fn run(args: Args) -> Result<()> {
-    debug!(?args);
-    let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
+pub async fn run(config: Config) -> Result<()> {
+    debug!(?config);
+    let cache = cache::load_cache(&config, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
 
-    let mut urls = args.url;
+    let mut urls = config.url;
 
-    if let Some(path) = args.url_file {
+    if let Some(path) = config.url_file {
         let file_urls = parse_urls_from_file(&path)?;
         urls.extend(file_urls.into_iter());
     }
@@ -177,7 +177,7 @@ pub async fn run(args: Args) -> Result<()> {
         return Err(OpenringError::FeedMissing);
     }
 
-    // Deduplicate here, too, in case urls are provided in args + file.
+    // Deduplicate here, too, in case urls are provided in config + file.
     let urls: Vec<Url> = {
         let unique: HashSet<Url> = urls.into_iter().collect();
         unique.into_iter().collect()
@@ -191,14 +191,14 @@ pub async fn run(args: Args) -> Result<()> {
         cache.store(cache_path)?;
     }
 
-    let template = fs::read_to_string(&args.template_file)?;
+    let template = fs::read_to_string(&config.template_file)?;
     let mut context = tera::Context::new();
 
     // Grab articles from all the feeds
     let mut articles = Vec::new();
     for (feed, url) in feeds {
-        let entries = if feed.entries.len() >= args.per_source {
-            &feed.entries[0..args.per_source]
+        let entries = if feed.entries.len() >= config.per_source {
+            &feed.entries[0..config.per_source]
         } else {
             &feed.entries
         };
@@ -293,9 +293,9 @@ pub async fn run(args: Args) -> Result<()> {
                     entry.published.or(entry.updated),
                 )
             {
-                // Skip articles after args.before, if present
+                // Skip articles after config.before, if present
                 let timestamp = Timestamp::from_second(date.timestamp())?;
-                if let Some(before) = args.before
+                if let Some(before) = config.before
                     && timestamp > before.to_zoned(TimeZone::system())?.timestamp()
                 {
                     continue;
@@ -345,8 +345,8 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     articles.sort_unstable_by(|a, b| a.timestamp.cmp(&b.timestamp).reverse());
-    let articles = if articles.len() >= args.num_articles {
-        &articles[0..args.num_articles]
+    let articles = if articles.len() >= config.num_articles {
+        &articles[0..config.num_articles]
     } else {
         &articles
     };

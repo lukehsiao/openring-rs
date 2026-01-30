@@ -2,12 +2,23 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, builder::ValueHint};
 use clap_verbosity_flag::Verbosity;
+use directories::ProjectDirs;
 use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[derive(Parser, Debug, Default)]
+/// Get the path to config location.
+#[must_use]
+pub fn get_config_path() -> Option<PathBuf> {
+    if let Some(proj_dirs) = ProjectDirs::from("dev", "hsiao", "openring") {
+        return Some(proj_dirs.config_dir().join("config.toml"));
+    }
+    None
+}
+
+#[derive(Parser, Debug, Default, Serialize, Deserialize)]
 #[command(author, version, about, long_about = None)]
-pub struct Args {
+pub struct Config {
     /// Total number of articles to fetch
     #[arg(short, long, default_value_t = 3)]
     pub num_articles: usize,
@@ -30,7 +41,7 @@ pub struct Args {
     /// away articles before this date from the feed itself.
     #[arg(short, long)]
     pub before: Option<Date>,
-    /// Do NOT use request cache stored on disk.
+    /// Do NOT use request cache stored on disk
     ///
     /// Note that the cache only prevents refetching if the feed source responds
     /// with a 429. In this case, we respect Retry-After, or default to 4h.
@@ -55,6 +66,6 @@ mod test {
     #[test]
     fn verify_app() {
         use clap::CommandFactory;
-        Args::command().debug_assert();
+        Config::command().debug_assert();
     }
 }
