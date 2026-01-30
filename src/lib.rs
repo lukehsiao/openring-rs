@@ -185,7 +185,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let feeds = get_feeds_from_urls(&urls, &cache).await;
 
-    if args.cache {
+    if !args.no_cache {
         cache.store(OPENRING_CACHE_FILE)?;
     }
 

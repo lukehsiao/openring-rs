@@ -30,14 +30,14 @@ pub struct Args {
     /// away articles before this date from the feed itself.
     #[arg(short, long)]
     pub before: Option<Date>,
-    /// Use request cache stored on disk at `.openringcache`
+    /// Do NOT use request cache stored on disk at `.openringcache`
     ///
-    /// Note that this only prevents refetching if the feed source responds
+    /// Note that the cache only prevents refetching if the feed source responds
     /// with a 429. In this case, we respect Retry-After, or default to 4h.
     /// Otherwise, the existence of a cache file just allows openring to respect
     /// `ETag` and `Last-Modified` headers for conditional requests.
-    #[arg(short, long)]
-    pub cache: bool,
+    #[arg(long)]
+    pub no_cache: bool,
     /// Discard all cached requests older than this duration
     #[arg(
         long,

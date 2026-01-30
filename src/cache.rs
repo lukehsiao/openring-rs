@@ -102,7 +102,7 @@ impl StoreExt for Cache {
 /// This returns an `Option` as starting without a cache is a common scenario
 /// and we silently discard errors on purpose.
 pub(crate) fn load_cache(args: &Args) -> Option<Cache> {
-    if !args.cache {
+    if args.no_cache {
         return None;
     }
 
@@ -331,10 +331,10 @@ mod tests {
     #[test]
     fn load_cache_returns_none_when_cache_disabled() {
         let mut args = Args {
-            cache: false,
+            no_cache: true,
             ..Default::default()
         };
-        args.cache = false;
+        args.no_cache = true;
         assert!(super::load_cache(&args).is_none());
     }
 
@@ -345,7 +345,7 @@ mod tests {
         std::env::set_current_dir(&tmpdir).expect("chdir");
 
         let args = Args {
-            cache: true,
+            no_cache: false,
             ..Default::default()
         };
         // Ensure no cache file exists
@@ -370,7 +370,7 @@ mod tests {
 
         // Use a max_cache_age smaller than the sleep to make the file "too old"
         let args = Args {
-            cache: true,
+            no_cache: false,
             max_cache_age: Duration::from_millis(1),
             ..Default::default()
         };
@@ -401,7 +401,7 @@ mod tests {
         cache.store(OPENRING_CACHE_FILE).expect("store");
 
         let args = Args {
-            cache: true,
+            no_cache: false,
             max_cache_age: Duration::from_hours(24),
             ..Default::default()
         };

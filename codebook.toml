@@ -1,1 +1,6 @@
-words = ["openringcache"]
+words = [
+    "openring",
+    "openringcache",
+    "tera",
+    "webring",
+]
