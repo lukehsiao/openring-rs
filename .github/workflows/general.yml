@@ -71,7 +71,7 @@ jobs:
           tool: cargo-mutants
       - run: cargo mutants -vV --in-place --test-tool=nextest
         continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: mutants-out
