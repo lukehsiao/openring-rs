@@ -87,7 +87,7 @@ impl StoreExt for Cache {
         // Grab a lock to avoid multiple processes writing simultaneously
         f.lock()?;
         let w = BufWriter::new(f);
-        serde_json::to_writer(w, self)?;
+        serde_json::to_writer_pretty(w, self)?;
         Ok(())
     }
 
