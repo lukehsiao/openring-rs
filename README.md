@@ -41,6 +41,12 @@ To see this in action, you can look at the footer of this blog post.
 cargo install --locked openring
 ```
 
+Or, if you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```
+cargo binstall openring
+```
+
 ## Usage
 
 ```
