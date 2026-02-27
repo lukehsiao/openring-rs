@@ -135,8 +135,15 @@ version *args:
 # Publish a new version on crates.io
 [group('release')]
 publish:
-    pnpm changeset publish
-    cargo publish
+    #!/usr/bin/env bash
+    set -euo pipefail
+    output=$(pnpm changeset publish 2>&1)
+    echo "$output"
+    if echo "$output" | grep -q "New tag:"; then
+        cargo publish
+    else
+        echo "No new version published by changesets, skipping cargo publish."
+    fi
 
 # Show pending changesets and expected version bumps.
 [group('release')]
