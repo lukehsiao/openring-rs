@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.6
+
+### Patch Changes
+
+- [`c218c69`](https://github.com/lukehsiao/openring-rs/commit/c218c6908e290495d3f8f782c5974c223b8de535) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **fix**: fix binstall metadata to eliminate warning.
+
+<pre>
+$ git-stats v0.5.5..v0.5.6
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
+ Luke Hsiao        2              4         +27        -14    +13 
+ Total             2              4         +27        -14    +13 
+</pre>
+
 ## 0.5.5
 
 ### Patch Changes
