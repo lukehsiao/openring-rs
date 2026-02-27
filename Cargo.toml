@@ -14,18 +14,18 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 ammonia = "4.1.2"
-clap = { version = "4.5.56", features = ["derive", "wrap_help", "cargo"] }
+clap = { version = "4.5.60", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "3.0.4"
 dashmap = { version = "6.1.0", features = ["serde"] }
 directories = "6.0.0"
 feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
-indicatif = "0.18.3"
-jiff = { version = "0.2.18", features = ["serde"] }
+indicatif = "0.18.4"
+jiff = { version = "0.2.21", features = ["serde"] }
 log = "0.4.29"
 miette = { version = "7.6.0", features = ["fancy"] }
-reqwest = { version = "0.13.1", features = ["gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.13.2", features = ["gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tera = "1.20.1"
@@ -38,8 +38,8 @@ url = { version = "2.5.8", features = ["serde"] }
 yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 
 [dev-dependencies]
-proptest = "1.9.0"
-tempfile = "3.24.0"
+proptest = "1.10.0"
+tempfile = "3.26.0"
 wiremock = "0.6.5"
 
 [profile.test.package.proptest]
