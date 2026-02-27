@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [0.5.3](https://github.com/lukehsiao/openring-rs/compare/v0.5.2..v0.5.3) - 2026-02-27
+
+### Bug Fixes
+
+- pretty-format cache JSON - ([39cc5a1](https://github.com/lukehsiao/openring-rs/commit/39cc5a184edd52a4ad4fa489622fc5abb217d4a8)) - Luke Hsiao
+
+---
 ## [0.5.2](https://github.com/lukehsiao/openring-rs/compare/v0.5.1..v0.5.2) - 2026-01-30
 
 ### Refactor
