@@ -30,10 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,jaq,sd
-      - uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: git-stats
+          tool: just,jaq,sd,git-stats
       - run: just install
       - name: Create Release Pull Request or Tag
         id: changesets
