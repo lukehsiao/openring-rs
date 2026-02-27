@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.5
+
+### Patch Changes
+
+- [`c3a153d`](https://github.com/lukehsiao/openring-rs/commit/c3a153d95d2bfacd16f7e1adff59a43fd270b24f) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **feature**: support installing openring via [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall).
+
+<pre>
+$ git-stats v0.5.4..v0.5.5
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
+ Luke Hsiao        2              7        +226         -5   +221 
+ Total             2              7        +226         -5   +221 
+</pre>
+
 ## 0.5.4
 
 ### Patch Changes
