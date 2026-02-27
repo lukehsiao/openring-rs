@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.4
+
+### Patch Changes
+
+- 833f8c2: [Internal] Switch release infrastructure from bespoke scripts to [`changesets`](https://github.com/changesets/changesets).
+
+<pre>
+$ git-stats v0.5.3..v0.5.4
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
+ Luke Hsiao        2             11       +1332       -243  +1089 
+ Total             2             11       +1332       -243  +1089 
+</pre>
+
 ## [0.5.3](https://github.com/lukehsiao/openring-rs/compare/v0.5.2..v0.5.3) - 2026-02-27
 
 ### Bug Fixes
@@ -7,6 +20,7 @@
 - pretty-format cache JSON - ([39cc5a1](https://github.com/lukehsiao/openring-rs/commit/39cc5a184edd52a4ad4fa489622fc5abb217d4a8)) - Luke Hsiao
 
 ---
+
 ## [0.5.2](https://github.com/lukehsiao/openring-rs/compare/v0.5.1..v0.5.2) - 2026-01-30
 
 ### Refactor
@@ -14,14 +28,15 @@
 - increase default max-cache-age to 30d - ([b2bb116](https://github.com/lukehsiao/openring-rs/commit/b2bb11695761eda27729e82efba7c9edec62a48e)) - Luke Hsiao
 
 ---
+
 ## [0.5.1](https://github.com/lukehsiao/openring-rs/compare/v0.5.0..v0.5.1) - 2026-01-30
 
 ### Bug Fixes
 
 - **(cache)** acquire file locks to prevent clobbering - ([2d72ec8](https://github.com/lukehsiao/openring-rs/commit/2d72ec8a7e58566c0e07b98a783030af5f1a33df)) - Luke Hsiao
 
-
 ---
+
 ## [0.5.0](https://github.com/lukehsiao/openring-rs/compare/v0.4.1..v0.5.0) - 2026-01-30
 
 I'm once again changing the cache behavior.
@@ -45,11 +60,13 @@ If you were calling with `--cache` before, simply drop the argument.
 - move cache to standard project-based directories - ([a3b3008](https://github.com/lukehsiao/openring-rs/commit/a3b30088a1d642ed87304c2f676f65764aeb8b3d)) - Luke Hsiao
 
 ---
+
 ## [0.4.1](https://github.com/lukehsiao/openring-rs/compare/v0.4.0..v0.4.1) - 2026-01-29
 
 Removes unused dependencies to reduce binary size slightly.
 
 ---
+
 ## [0.4.0](https://github.com/lukehsiao/openring-rs/compare/v0.3.12..v0.4.0) - 2026-01-29
 
 Bumping the minor version here because we change the format of the cache file from CSV to JSON.
@@ -65,6 +82,7 @@ This shouldn't actually require any changes from any users, it will just behave 
 - serde cache as json, not csv - ([a776733](https://github.com/lukehsiao/openring-rs/commit/a77673362342d0bec8f3d36f18db0fb956f4b62d)) - Luke Hsiao
 
 ---
+
 ## [0.3.12](https://github.com/lukehsiao/openring-rs/compare/v0.3.11..v0.3.12) - 2026-01-28
 
 This release contains just a few small bugfixes as a result of me actually adding some testing.
@@ -79,6 +97,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - **(README)** add roadmap for tests - ([3f23e95](https://github.com/lukehsiao/openring-rs/commit/3f23e950f873d301663f88e366170bc3c2e53be4)) - Luke Hsiao
 
 ---
+
 ## [0.3.11](https://github.com/lukehsiao/openring-rs/compare/v0.3.10..v0.3.11) - 2026-01-17
 
 ### Bug Fixes
@@ -86,6 +105,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - fall back to feed URL if feed itself has none - ([9260737](https://github.com/lukehsiao/openring-rs/commit/9260737541a32f2bd52b69ca08718aacbe86837f)) - Luke Hsiao
 
 ---
+
 ## [0.3.10](https://github.com/lukehsiao/openring-rs/compare/v0.3.9..v0.3.10) - 2026-01-01
 
 ### Build and Dependencies
@@ -95,6 +115,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - **(deps)** upgrade all dependencies - ([560b456](https://github.com/lukehsiao/openring-rs/commit/560b456f6220d3878c948c83eeefd429496a9c12)) - Luke Hsiao
 
 ---
+
 ## [0.3.9](https://github.com/lukehsiao/openring-rs/compare/v0.3.8..v0.3.9) - 2025-11-22
 
 ### Bug Fixes
@@ -106,6 +127,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - **(README)** minor capitalization tweaks - ([b349b1a](https://github.com/lukehsiao/openring-rs/commit/b349b1a31e608597372ee39515db67b16b308a34)) - Luke Hsiao
 
 ---
+
 ## [0.3.8](https://github.com/lukehsiao/openring-rs/compare/v0.3.7..v0.3.8) - 2025-07-21
 
 ### Build and Dependencies
@@ -113,6 +135,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - **(deps)** update all dependencies (namely, indicatif, which yanked a version which causes builds to fail) - ([cca0751](https://github.com/lukehsiao/openring-rs/commit/cca0751869a2ba26919dba45bd220c76e02ee153)) - Luke Hsiao
 
 ---
+
 ## [0.3.7](https://github.com/lukehsiao/openring-rs/compare/v0.3.6..v0.3.7) - 2025-03-22
 
 ### Documentation
@@ -137,6 +160,7 @@ This release contains just a few small bugfixes as a result of me actually addin
 - bump to rust 2024 edition - ([fdf1c40](https://github.com/lukehsiao/openring-rs/commit/fdf1c40123cf44f83c6eb3201005689ab8cb6c09)) - Luke Hsiao
 
 ---
+
 ## [0.3.6](https://github.com/lukehsiao/openring-rs/compare/v0.3.5..v0.3.6) - 2024-10-11
 
 This release further adopts `cargo`-style progress, by showing all the remaining URLs in the message, rather than just the most recently fetched URL.
@@ -151,6 +175,7 @@ This release further adopts `cargo`-style progress, by showing all the remaining
 - simplify main by using `tracing_log` - ([b7096b1](https://github.com/lukehsiao/openring-rs/commit/b7096b1eb12846447ffc68cc928bc57a524e0bc8)) - Luke Hsiao
 
 ---
+
 ## [0.3.5](https://github.com/lukehsiao/openring-rs/compare/v0.3.4..v0.3.5) - 2024-10-09
 
 ### Bug Fixes
@@ -158,6 +183,7 @@ This release further adopts `cargo`-style progress, by showing all the remaining
 - support compressed feeds (gzip, ztd, brotli, deflate) - ([2d3e467](https://github.com/lukehsiao/openring-rs/commit/2d3e4671d824d02ad787f340de58d16a2648c346)) - Luke Hsiao
 
 ---
+
 ## [0.3.4](https://github.com/lukehsiao/openring-rs/compare/v0.3.3..v0.3.4) - 2024-10-09
 
 The primary change of this release is changing to `cargo`-style progress.
@@ -180,6 +206,7 @@ It's subjectively a little more explicit and clear.
 - **(deps)** bump all dependencies - ([02c70b5](https://github.com/lukehsiao/openring-rs/commit/02c70b5d197328fd87c1efa83d9dc2f4b76c6cae)) - Luke Hsiao
 
 ---
+
 ## [0.3.2](https://github.com/lukehsiao/openring-rs/compare/v0.2.5..v0.3.2) - 2024-09-29
 
 This release is a significant internal refactor that improves performance by fetching _all_ feeds concurrently.
@@ -195,6 +222,7 @@ In addition, we also deduplicate feeds to avoid unnecessary fetching.
 - deduplicate feed urls - ([e590e4d](https://github.com/lukehsiao/openring-rs/commit/e590e4d5940a39a201d69dc515e6837d071523cc)) - Luke Hsiao
 
 ---
+
 ## [0.2.5](https://github.com/lukehsiao/openring-rs/compare/v0.2.4..v0.2.5) - 2024-09-28
 
 ### Bug Fixes
@@ -211,6 +239,7 @@ In addition, we also deduplicate feeds to avoid unnecessary fetching.
 - pull feed fetching logic into a trait - ([c17f57a](https://github.com/lukehsiao/openring-rs/commit/c17f57aa38273af8b16611ef3234d0a495b58154)) - Luke Hsiao
 
 ---
+
 ## [0.2.4](https://github.com/lukehsiao/openring-rs/compare/v0.2.3..v0.2.4) - 2024-08-14
 
 ### Bug Fixes
@@ -222,6 +251,7 @@ In addition, we also deduplicate feeds to avoid unnecessary fetching.
 - **(README)** add link to demo of the webring - ([09e1b3c](https://github.com/lukehsiao/openring-rs/commit/09e1b3c58726b3c3345c8bced1bf825174dd4a71)) - Luke Hsiao
 
 ---
+
 ## [0.2.3](https://github.com/lukehsiao/openring-rs/compare/v0.2.2..v0.2.3) - 2024-08-08
 
 ### Bug Fixes
@@ -229,6 +259,7 @@ In addition, we also deduplicate feeds to avoid unnecessary fetching.
 - adjust log levels - ([9c86048](https://github.com/lukehsiao/openring-rs/commit/9c860488cd4a555867bfe95cafc61b53cfd62d5e)) - Luke Hsiao
 
 ---
+
 ## [0.2.2](https://github.com/lukehsiao/openring-rs/compare/v0.2.1..v0.2.2) - 2024-08-08
 
 Minor release that now allows feed entries without summary/content.
@@ -238,6 +269,7 @@ Minor release that now allows feed entries without summary/content.
 - allow entries with no summary/content - ([02bcde3](https://github.com/lukehsiao/openring-rs/commit/02bcde3d21ac263ada6f9c97bf28be8faa909562)) - Luke Hsiao
 
 ---
+
 ## [0.2.1](https://github.com/lukehsiao/openring-rs/compare/v0.2.0..v0.2.1) - 2024-08-08
 
 **This release adds a nice quality of life feature: local caching.**
@@ -266,6 +298,7 @@ If we don't have a cache value, we send an unconditional request.
 - tweak changelog and order of release checks - ([c8c6ebe](https://github.com/lukehsiao/openring-rs/commit/c8c6ebeb25f9f15a4fdeac437a3b2804c92e00b2)) - Luke Hsiao
 
 ---
+
 ## [0.2.0](https://github.com/lukehsiao/openring-rs/compare/v0.1.15..v0.2.0) - 2024-07-29
 
 In this release, the only meaningful change is changing from `chrono` to `jiff` as a dependency.
@@ -277,9 +310,11 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(deps)** [**breaking**] switch from `chrono` to `jiff` - ([485fe4e](https://github.com/lukehsiao/openring-rs/commit/485fe4ef480c9f08a1c895b9e6b75b8c2b6f3774)) - Luke Hsiao
 
 ---
+
 ## [0.1.15](https://github.com/lukehsiao/openring-rs/compare/v0.1.14..v0.1.15) - 2024-06-04
 
 ### Dependencies
+
 - Bump to `feed-rs` v2.0.0 - Luke Hsiao
 
 ### Styling
@@ -288,6 +323,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - run rustfmt - ([25413ff](https://github.com/lukehsiao/openring-rs/commit/25413ffb423b7f7bc6d22bd61c4af5b6e97da121)) - Luke Hsiao
 
 ---
+
 ## [0.1.14](https://github.com/lukehsiao/openring-rs/compare/v0.1.13..v0.1.14) - 2024-01-18
 
 ### Documentation
@@ -300,6 +336,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - default to error-level logs - ([23e355a](https://github.com/lukehsiao/openring-rs/commit/23e355a3fdc39f4e10bc496458b6588e20fb7b85)) - Luke Hsiao
 
 ---
+
 ## [0.1.13](https://github.com/lukehsiao/openring-rs/compare/v0.1.12..v0.1.13) - 2023-10-12
 
 ### Bug Fixes
@@ -316,6 +353,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - default to domain name if feed title is empty - ([1b08b27](https://github.com/lukehsiao/openring-rs/commit/1b08b27df8f0f9bbb1ae8284cf0b397e36b00614)) - Luke Hsiao
 
 ---
+
 ## [0.1.12](https://github.com/lukehsiao/openring-rs/compare/v0.1.11..v0.1.12) - 2023-10-12
 
 ### Documentation
@@ -327,6 +365,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - support feeds with relative URLs - ([f85009b](https://github.com/lukehsiao/openring-rs/commit/f85009b14763098692bb682e2c51f6bcd9f8b5b3)) - Luke Hsiao
 
 ---
+
 ## [0.1.11](https://github.com/lukehsiao/openring-rs/compare/v0.1.10..v0.1.11) - 2023-09-07
 
 ### Bug Fixes
@@ -344,6 +383,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - standardize and clarify logs - ([64da97b](https://github.com/lukehsiao/openring-rs/commit/64da97bf91a1d9abdd73d7fdf09847461dbba48d)) - Luke Hsiao
 
 ---
+
 ## [0.1.10](https://github.com/lukehsiao/openring-rs/compare/v0.1.9..v0.1.10) - 2023-09-07
 
 ### Documentation
@@ -353,9 +393,10 @@ It is likely you will simply need to update your template to `s/article.date/art
 ### Refactor
 
 - rename `--urls` to just `--url` - ([178788b](https://github.com/lukehsiao/openring-rs/commit/178788b37e05dbd8db6c2f371473dba0ae4cb739)) - Luke Hsiao
--  [**breaking**] switch to `feed-rs` - ([032add1](https://github.com/lukehsiao/openring-rs/commit/032add1034cfc72786957a34b1705606fd1f6488)) - Luke Hsiao
+- [**breaking**] switch to `feed-rs` - ([032add1](https://github.com/lukehsiao/openring-rs/commit/032add1034cfc72786957a34b1705606fd1f6488)) - Luke Hsiao
 
 ---
+
 ## [0.1.9](https://github.com/lukehsiao/openring-rs/compare/v0.1.8..v0.1.9) - 2023-08-11
 
 ### Documentation
@@ -367,6 +408,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - provide `miette`-powered error diagnostics - ([88c63a0](https://github.com/lukehsiao/openring-rs/commit/88c63a00fc0c28cedbb77a7debcd2d49c728419c)) - Luke Hsiao
 
 ---
+
 ## [0.1.8](https://github.com/lukehsiao/openring-rs/compare/v0.1.7..v0.1.8) - 2023-06-21
 
 ### Documentation
@@ -375,6 +417,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(README)** add badges - ([5334775](https://github.com/lukehsiao/openring-rs/commit/5334775b30468df49ae0d9b6e56c109b590b4e47)) - Luke Hsiao
 
 ---
+
 ## [0.1.7](https://github.com/lukehsiao/openring-rs/compare/v0.1.6..v0.1.7) - 2023-05-21
 
 ### Documentation
@@ -391,6 +434,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - s/unable/failed/ - ([308d08f](https://github.com/lukehsiao/openring-rs/commit/308d08fc790f6412768bcff4022ff860a5cf5f12)) - Luke Hsiao
 
 ---
+
 ## [0.1.6](https://github.com/lukehsiao/openring-rs/compare/v0.1.5..v0.1.6) - 2022-12-11
 
 ### Documentation
@@ -402,6 +446,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - add `--before` to allow filtering to posts before a given date - ([4d42a33](https://github.com/lukehsiao/openring-rs/commit/4d42a33202bcb784216f75fb03f94d63a48ec540)) - Luke Hsiao
 
 ---
+
 ## [0.1.5](https://github.com/lukehsiao/openring-rs/compare/v0.1.4..v0.1.5) - 2022-11-26
 
 ### Bug Fixes
@@ -413,6 +458,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(CHANGELOG)** add entry for v0.1.5 - ([e56d89f](https://github.com/lukehsiao/openring-rs/commit/e56d89f97009727548b53f84f1e99e512d8b784d)) - Luke Hsiao
 
 ---
+
 ## [0.1.4](https://github.com/lukehsiao/openring-rs/compare/v0.1.3..v0.1.4) - 2022-11-26
 
 ### Bug Fixes
@@ -424,6 +470,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(CHANGELOG)** add entry for v0.1.4 - ([8c9290a](https://github.com/lukehsiao/openring-rs/commit/8c9290a3f14403bc68ae20acc4c091dcf061e372)) - Luke Hsiao
 
 ---
+
 ## [0.1.3](https://github.com/lukehsiao/openring-rs/compare/v0.1.2..v0.1.3) - 2022-11-26
 
 ### Bug Fixes
@@ -435,6 +482,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(CHANGELOG)** add entry for v0.1.3 - ([c9dda71](https://github.com/lukehsiao/openring-rs/commit/c9dda71b9f7a798be65399787cf9c6d738eeaa22)) - Luke Hsiao
 
 ---
+
 ## [0.1.2](https://github.com/lukehsiao/openring-rs/compare/v0.1.1..v0.1.2) - 2022-11-26
 
 ### Bug Fixes
@@ -449,6 +497,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(README)** use unicode icon directly - ([5de0aef](https://github.com/lukehsiao/openring-rs/commit/5de0aefaf60622d689aa387c39c0bfa56e657584)) - Luke Hsiao
 
 ---
+
 ## [0.1.1](https://github.com/lukehsiao/openring-rs/compare/v0.1.0..v0.1.1) - 2022-11-26
 
 ### Documentation
@@ -458,6 +507,7 @@ It is likely you will simply need to update your template to `s/article.date/art
 - **(README)** use a fancier header - ([3e171a7](https://github.com/lukehsiao/openring-rs/commit/3e171a7bd3a4252bcf45b42af724c5101347a9fc)) - Luke Hsiao
 
 ---
+
 ## [0.1.0] - 2022-09-17
 
 ### Bug Fixes
@@ -487,4 +537,3 @@ It is likely you will simply need to update your template to `s/article.date/art
 - allow parsing a url file - ([3a2374d](https://github.com/lukehsiao/openring-rs/commit/3a2374dd2238b1e8e02b2cccd66f05fe8b6d2aa4)) - Luke Hsiao
 - setup structure for tera - ([435b181](https://github.com/lukehsiao/openring-rs/commit/435b181c044e9f69ee74afa9d136dc4f98ac28a5)) - Luke Hsiao
 - error if no feed urls are provided - ([65393eb](https://github.com/lukehsiao/openring-rs/commit/65393eb0c96d203b6b459667e067feb3594cf247)) - Luke Hsiao
-
