@@ -1,8 +1,12 @@
 name: Binaries
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to attach binaries to (e.g. v0.5.4)"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -63,19 +67,9 @@ jobs:
             ext: zip
 
     steps:
-      - name: Resolve release tag
-        id: tag
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v6
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -124,7 +118,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload ${{ steps.tag.outputs.tag }} \
+          gh release upload ${{ inputs.tag }} \
             openring-${{ matrix.target }}.${{ matrix.ext }} \
             openring-${{ matrix.target }}.${{ matrix.ext }}.sha256 \
             --clobber

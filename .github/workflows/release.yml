@@ -16,6 +16,9 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+      publishedPackages: ${{ steps.changesets.outputs.publishedPackages }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,6 +36,7 @@ jobs:
           tool: git-stats
       - run: just install
       - name: Create Release Pull Request or Tag
+        id: changesets
         uses: changesets/action@v1
         with:
           version: just version
@@ -42,3 +46,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    uses: ./.github/workflows/binaries.yml
+    with:
+      tag: v${{ fromJSON(needs.release.outputs.publishedPackages)[0].version }}
+    permissions:
+      contents: write
