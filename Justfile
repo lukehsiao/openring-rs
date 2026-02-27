@@ -1,139 +1,88 @@
 # just manual: https://github.com/casey/just
 
 _default:
-	@just --list
+    @just --list
 
 # Runs clippy on the sources
 [group('dev')]
 check:
-	cargo clippy --all-targets --all-features --locked -- -W clippy::pedantic -D warnings
+    cargo clippy --all-targets --all-features --locked -- -W clippy::pedantic -D warnings
 
 # Runs the test suite
 [group('dev')]
 test:
-	cargo nextest run
+    cargo nextest run
 
 # Runs the test suite to compute coverage
 [group('dev')]
 coverage *FLAGS:
-	cargo llvm-cov nextest {{FLAGS}}
+    cargo llvm-cov nextest {{FLAGS}}
 
 # check security advisories
 [group('dev')]
 audit:
-	cargo deny check advisories
+    cargo deny check advisories
 
 # Check links in markdown files
 [group('dev')]
 link-check:
-	-lychee -E '**/*.md'
+    -lychee -E '**/*.md'
 
 # Format source
 [group('dev')]
 fmt:
-	cargo fmt
+    cargo fmt
 
 # Sets up a watcher that lints, tests, and builds
 [group('dev')]
 watch:
-	bacon
-		
-# Update the changelog using git-cliff
-_update_changelog version:
-	#!/usr/bin/env bash
-	set -euxo pipefail
+    bacon
 
-	# Update changelog
-	if ! command -v git-cliff &> /dev/null
-	then
-	    echo "Please install git-cliff: https://github.com/orhun/git-cliff#installation"
-	    exit
-	fi
+# Update all dependencies
+[group('build')]
+upgrade:
+    pnpm up --recursive
+    pnpm install
+    cargo upgrade
+    cargo update
 
-	git-cliff --tag {{version}} --unreleased --prepend CHANGELOG.md
-	${EDITOR:-vi} CHANGELOG.md
-	git commit CHANGELOG.md -m "docs(CHANGELOG): add entry for {{version}}"
+# Install release tooling
+[group('build')]
+install:
+    pnpm install
 
-# Increment the version
-_incr_version version: (_update_changelog version)
-	#!/usr/bin/env bash
-	set -euxo pipefail
-
-	# Update version
-	cargo set-version {{trim_start_match(version, "v")}}
-	cargo build --release
-	git commit Cargo.toml Cargo.lock -m "chore(release): bump version to {{version}}"
-
-# Get the changelog and git stats for the release
-_tlog describe version:
-	# Format git-cliff output friendly for the tag
-	@git-cliff -c cliff-git-tag.toml --strip all --unreleased --tag {{version}}
-	@echo "$ git-stats -r {{describe}}..{{version}}"
-	@git stats -r {{describe}}..HEAD
-
-# Target can be ["major", "minor", "patch", or a version]
+# Interactively create a changeset.
 [group('release')]
-release target:
-	#!/usr/bin/env python3
-	# Inspired-by: https://git.sr.ht/~sircmpwn/dotfiles/tree/master/bin/semver
-	import os
-	import subprocess
-	import sys
-	import tempfile
+changeset *args:
+    pnpm changeset {{ args }}
 
-	if subprocess.run(["git", "branch", "--show-current"], stdout=subprocess.PIPE
-	        ).stdout.decode().strip() != "main":
-	    print("WARNING! Not on the main branch.")
+# Sync version from package.json to Cargo manifest
+_sync-versions:
+    #!/usr/bin/env bash
+    set -euxo pipefail
 
-	subprocess.run(["git", "pull", "--rebase"])
-	p = subprocess.run(["git", "describe", "--abbrev=0"], stdout=subprocess.PIPE)
-	describe = p.stdout.decode().strip()
-	old_version = describe[1:].split("-")[0].split(".")
-	if len(old_version) == 2:
-	    [major, minor] = old_version
-	    [major, minor] = map(int, [major, minor])
-	    patch = 0
-	else:
-	    [major, minor, patch] = old_version
-	    [major, minor, patch] = map(int, [major, minor, patch])
+    # read version from package.json
+    version=$(jaq -r '.version' package.json)
 
-	new_version = None
+    # ensure we found a version
+    [ -n "$version" ]
+    # replace a version line that starts at column 1: version = "..."
+    sd '^version\s+=\s+".*"$' "version = \"$version\"" Cargo.toml
+    echo "Cargo.toml version set to $version"	
 
-	if "{{target}}" == "patch":
-	    patch += 1
-	elif "{{target}}" == "minor":
-	    minor += 1
-	    patch = 0
-	elif "{{target}}" == "major":
-	    major += 1
-	    minor = patch = 0
-	else:
-	    new_version = "{{target}}"
-
-	if new_version is None:
-	    if len(old_version) == 2 and patch == 0:
-	        new_version = f"v{major}.{minor}"
-	    else:
-	        new_version = f"v{major}.{minor}.{patch}"
-
-	p = subprocess.run(["just", "_tlog", describe, new_version],
-	        stdout=subprocess.PIPE)
-	shortlog = p.stdout.decode()
-
-	p = subprocess.run(["just", "_incr_version", new_version])
-	if p and p.returncode != 0:
-	    print("Error: _incr_version returned nonzero exit code")
-	    sys.exit(1)
-
-	with tempfile.NamedTemporaryFile() as f:
-	    basename = os.path.basename(os.getcwd())
-	    f.write(f"{basename} {new_version}\n\n".encode())
-	    f.write(shortlog.encode())
-	    f.flush()
-	    subprocess.run(["git", "tag", "-e", "-F", f.name, "-a", new_version])
-	    print(new_version)
+# Create a version bump
+[group('release')]
+version *args:
+    pnpm changeset version {{ args }}
+    just _sync-versions
 
 # Publish a new version on crates.io
 [group('release')]
 publish:
-	cargo publish
+    pnpm changeset publish
+    cargo publish
+
+# Show pending changesets and expected version bumps.
+[group('release')]
+status *args:
+    pnpm changeset status {{ args }}
