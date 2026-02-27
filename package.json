@@ -1,6 +1,6 @@
 {
   "name": "openring",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "devDependencies": {
     "@changesets/changelog-git": "^0.2.1",
