@@ -1,0 +1,9 @@
+{
+  "name": "openring",
+  "version": "0.5.3",
+  "private": true,
+  "devDependencies": {
+    "@changesets/changelog-git": "^0.2.1",
+    "@changesets/cli": "^2.29.8"
+  }
+}
