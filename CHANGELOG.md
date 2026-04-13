@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.8
+
+### Patch Changes
+
+- [`9b81ffa`](https://github.com/lukehsiao/openring-rs/commit/9b81ffaa9cf5f5dab02eabef5fa507a77a97e3f2) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **build(aur)**: remove debug and fix build of `openring-rs` from the AUR.
+
+<pre>
+$ git-stats v0.5.7..v0.5.8
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        1              2         +11          0    +11
+Total             1              2         +11          0    +11
+</pre>
+
 ## 0.5.7
 
 ### Patch Changes
