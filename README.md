@@ -47,6 +47,15 @@ Or, if you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
 cargo binstall openring
 ```
 
+On Arch Linux, install from the [AUR](https://aur.archlinux.org/) using your preferred helper (e.g. [`paru`](https://github.com/Morganamilo/paru) or [`yay`](https://github.com/Jguer/yay)):
+
+```
+paru -S openring-rs       # builds from source
+paru -S openring-rs-bin   # prebuilt binary
+```
+
+Both packages provide the `openring` binary and conflict with the original Go-based [`openring`](https://aur.archlinux.org/packages/openring) AUR package, so only one may be installed at a time.
+
 ## Usage
 
 ```

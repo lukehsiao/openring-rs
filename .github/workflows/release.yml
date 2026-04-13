@@ -52,3 +52,90 @@ jobs:
       tag: v${{ fromJSON(needs.release.outputs.publishedPackages)[0].version }}
     permissions:
       contents: write
+
+  aur:
+    needs: [release, binaries]
+    if: needs.release.outputs.published == 'true'
+    name: AUR (${{ matrix.pkgname }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkgname: [openring-rs, openring-rs-bin]
+    env:
+      TAG: v${{ fromJSON(needs.release.outputs.publishedPackages)[0].version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Trust AUR host key and configure git
+        run: |
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          git config --global user.name  'Luke Hsiao'
+          git config --global user.email 'luke@hsiao.dev'
+
+      - name: Template PKGBUILD
+        working-directory: contrib/aur/${{ matrix.pkgname }}
+        run: |
+          set -euo pipefail
+          pkgver="${TAG#v}"
+          base="https://github.com/lukehsiao/openring-rs/releases/download/v$pkgver"
+
+          src_sha=$(curl -fsSL "https://github.com/lukehsiao/openring-rs/archive/v$pkgver.tar.gz" \
+                   | sha256sum | awk '{print $1}')
+          x86_sha=$(curl -fsSL "$base/openring-x86_64-unknown-linux-gnu.tar.gz.sha256"      | awk '{print $1}')
+          arm_sha=$(curl -fsSL "$base/openring-aarch64-unknown-linux-gnu.tar.gz.sha256"     | awk '{print $1}')
+          v7_sha=$(curl  -fsSL "$base/openring-armv7-unknown-linux-gnueabihf.tar.gz.sha256" | awk '{print $1}')
+          zero='0000000000000000000000000000000000000000000000000000000000000000'
+
+          sed -i "s/^pkgver=.*/pkgver=$pkgver/"                              PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/"                                    PKGBUILD
+          sed -i "s/^sha256sums=('$zero')/sha256sums=('$src_sha')/"          PKGBUILD
+          sed -i "s/^sha256sums_x86_64=('$zero')/sha256sums_x86_64=('$x86_sha')/"   PKGBUILD
+          sed -i "s/^sha256sums_aarch64=('$zero')/sha256sums_aarch64=('$arm_sha')/" PKGBUILD
+          sed -i "s/^sha256sums_armv7h=('$zero')/sha256sums_armv7h=('$v7_sha')/"    PKGBUILD
+
+          # Fail loudly if any placeholder survived substitution. Otherwise a silent
+          # sed miss could ship a PKGBUILD with bogus checksums.
+          if grep -F "$zero" PKGBUILD; then
+            echo "::error::PKGBUILD still contains placeholder hash" >&2
+            exit 1
+          fi
+          if ! grep -q "^pkgver=$pkgver$" PKGBUILD; then
+            echo "::error::pkgver substitution failed" >&2
+            exit 1
+          fi
+
+      - name: Generate .SRCINFO
+        working-directory: contrib/aur/${{ matrix.pkgname }}
+        run: |
+          # makepkg only runs on Arch and refuses root, so use a one-shot container
+          # with a build user.
+          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:base-devel bash -c '
+            useradd -m b && chown -R b:b /pkg &&
+            su b -c "makepkg --printsrcinfo"
+          ' > .SRCINFO
+
+      - name: Push to AUR
+        working-directory: contrib/aur/${{ matrix.pkgname }}
+        env:
+          PKG: ${{ matrix.pkgname }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          git clone "ssh://aur@aur.archlinux.org/$PKG.git" "$work" 2>/dev/null || {
+            git -C "$work" init -b master
+            git -C "$work" remote add origin "ssh://aur@aur.archlinux.org/$PKG.git"
+          }
+          install -m644 PKGBUILD .SRCINFO "$work/"
+          cd "$work"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No changes to publish for $PKG"
+            exit 0
+          fi
+          git commit -m "Update to ${TAG#v}"
+          git push origin HEAD:master
