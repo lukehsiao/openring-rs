@@ -10,6 +10,12 @@ depends=('gcc-libs')
 makedepends=('cargo')
 provides=('openring')
 conflicts=('openring')
+# !lto: Arch enables LTO by default in makepkg.conf; it breaks the link of
+#   *-sys crates that ship pre-compiled C/asm objects (here: aws-lc-sys, pulled
+#   transitively via reqwest -> rustls -> aws-lc-rs).
+# !debug: cargo --release already strips; the auto-generated -debug
+#   subpackage is noise for AUR distribution.
+options=(!debug !lto)
 source=("$pkgname-$pkgver.tar.gz::https://github.com/lukehsiao/openring-rs/archive/v$pkgver.tar.gz")
 sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
