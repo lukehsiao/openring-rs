@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.7
+
+### Patch Changes
+
+- [`3d3de02`](https://github.com/lukehsiao/openring-rs/commit/3d3de027ba13dcb08391ef672e8e610b920b652d) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **releases**: publish `openring-rs` and `openring-rs-bin` on the [AUR](https://aur.archlinux.org/) for easier Arch installs.
+
+<pre>
+$ git-stats v0.5.6..v0.5.7
+Author           Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao             8             16        +460       -416    +44
+dependabot[bot]        3              4          +7         -7      0
+Total                 11             20        +467       -423    +44
+</pre>
+
 ## 0.5.6
 
 ### Patch Changes
