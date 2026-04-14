@@ -30,15 +30,12 @@ This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 - we allow filtering feeds with `--before`
 
 ## Demo
-
 To see this in action, you can look at the footer of this blog post.
 
 <https://luke.hsiao.dev/blog/openring-rs/>
 
 ## Install
-
 ### Cargo
-
 ```
 cargo install --locked openring
 ```
@@ -50,7 +47,6 @@ cargo binstall openring
 ```
 
 ### Arch
-
 On Arch Linux, install from the [AUR](https://aur.archlinux.org/) using your preferred helper (e.g. [`paru`](https://github.com/Morganamilo/paru) or [`yay`](https://github.com/Jguer/yay)):
 
 ```
@@ -61,7 +57,6 @@ paru -S openring-rs-bin   # prebuilt binary
 Both packages provide the `openring` binary and conflict with the original Go-based [`openring`](https://aur.archlinux.org/packages/openring) AUR package, so only one may be installed at a time.
 
 ## Usage
-
 ```
 A webring for static site generators written in Rust
 
@@ -83,12 +78,10 @@ Options:
 ```
 
 ## Using Tera templates
-
 The templates supported by `openring-rs` are written using [Tera](https://keats.github.io/tera/).
 Please refer to the Tera documentation for details.
 
 ## Caching
-
 We use OS-standard locations for caching.
 
 - **Linux**: `$XDG_CACHE_HOME/openring/cache.json` or `$HOME/.cache/openring/cache.json`
@@ -102,11 +95,9 @@ In this case, we respect `Retry-After`, or default to 4 hours.
 Otherwise, we use the cache to send conditional requests by respecting the `ETag` and `Last-Modified` headers.
 
 ## Why a Rust port?
-
 Just for fun.
 
 ## TODO
-
 ### Test suite
 I've only recently added some property-based testing to this repository for some happy-path behavior.
 I'd love to make this test suite more rigorous.
