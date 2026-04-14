@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.9
+
+### Patch Changes
+
+- [`c897d41`](https://github.com/lukehsiao/openring-rs/commit/c897d416c7049cd7c545627cc55bac20e3bcbd49) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **AUR**: correctly declare symmetric conflicts for openring-rs and openring-rs-bin.
+
+<pre>
+$ git-stats v0.5.8..v0.5.9
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        5              6         +21        -34    -13
+Total             5              6         +21        -34    -13
+</pre>
+
 ## 0.5.8
 
 ### Patch Changes
