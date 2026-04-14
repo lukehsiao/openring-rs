@@ -19,7 +19,8 @@
 </div>
 <br>
 
-`openring-rs` is a tool for generating a webring from Atom/RSS feeds, so you can populate a template with articles from those feeds and embed them in your own blog. An example template is provided in `in.html`.
+`openring-rs` is a tool for generating a webring from Atom/RSS feeds, so you can populate a template with articles from those feeds and embed them in your own blog.
+An example template is provided in `in.html`.
 
 This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the primary differences being:
 - we respect throttling and send conditional requests by default via caching (disable with `--no-cache`)
@@ -96,26 +97,3 @@ Otherwise, we use the cache to send conditional requests by respecting the `ETag
 
 ## Why a Rust port?
 Just for fun.
-
-## TODO
-### Test suite
-I've only recently added some property-based testing to this repository for some happy-path behavior.
-I'd love to make this test suite more rigorous.
-The most significant hole right now is all the log in `src/lib.rs` which handles variables nuances of a feed body.
-The test suite only contains a single valid RSS 2.0 feed.
-It would be great to generate test strategies that provide far more coverage of both RSS and Atom feeds.
-
-Another thing that is interesting is the potential holes revealed by `cargo-mutant`.
-We've added a GitHub workflow for it to show the holes.
-
-Finally, `proptest` tests for `src/feedfetcher.rs` are excessively slow.
-We should be able to speed those up.
-
-### Weighting feeds
-Some feeds are updated significantly more often than others.
-If you're using openring and your blogroll includes one of these feeds, then they will almost _always_ appear in your output.
-In some cases, you might want to distribute the inclusion a bit more than purely based on recency.
-
-We could implement a weighting scheme.
-For example, maybe you can specify an integer with each feed, where `N` means there need to be `>=N` articles that make the cutoff for a random article from those `N` to be included in the output.
-This would let you effectively "down weight" some feeds more than others.
