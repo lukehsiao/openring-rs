@@ -9,7 +9,7 @@ license=('BlueOak-1.0.0')
 depends=('gcc-libs')
 makedepends=('cargo')
 provides=('openring')
-conflicts=('openring')
+conflicts=('openring' 'openring-rs-bin')
 # !lto: Arch enables LTO by default in makepkg.conf; it breaks the link of
 #   *-sys crates that ship pre-compiled C/asm objects (here: aws-lc-sys, pulled
 #   transitively via reqwest -> rustls -> aws-lc-rs).
