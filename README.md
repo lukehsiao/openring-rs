@@ -110,3 +110,12 @@ We've added a GitHub workflow for it to show the holes.
 
 Finally, `proptest` tests for `src/feedfetcher.rs` are excessively slow.
 We should be able to speed those up.
+
+### Weighting feeds
+Some feeds are updated significantly more often than others.
+If you're using openring and your blogroll includes one of these feeds, then they will almost _always_ appear in your output.
+In some cases, you might want to distribute the inclusion a bit more than purely based on recency.
+
+We could implement a weighting scheme.
+For example, maybe you can specify an integer with each feed, where `N` means there need to be `>=N` articles that make the cutoff for a random article from those `N` to be included in the output.
+This would let you effectively "down weight" some feeds more than others.
