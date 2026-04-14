@@ -37,6 +37,8 @@ To see this in action, you can look at the footer of this blog post.
 
 ## Install
 
+### Cargo
+
 ```
 cargo install --locked openring
 ```
@@ -46,6 +48,8 @@ Or, if you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
 ```
 cargo binstall openring
 ```
+
+### Arch
 
 On Arch Linux, install from the [AUR](https://aur.archlinux.org/) using your preferred helper (e.g. [`paru`](https://github.com/Morganamilo/paru) or [`yay`](https://github.com/Jguer/yay)):
 
