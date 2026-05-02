@@ -170,7 +170,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if let Some(path) = args.url_file {
         let file_urls = parse_urls_from_file(&path)?;
-        urls.extend(file_urls.into_iter());
+        urls.extend(file_urls);
     }
 
     if urls.is_empty() {
