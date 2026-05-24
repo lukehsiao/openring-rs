@@ -16,18 +16,18 @@ categories = ["command-line-utilities"]
 ammonia = "4.1.2"
 clap = { version = "4.6.1", features = ["derive", "wrap_help", "cargo"] }
 clap-verbosity-flag = "3.0.4"
-dashmap = { version = "6.1.0", features = ["serde"] }
+dashmap = { version = "6.2.1", features = ["serde"] }
 directories = "6.0.0"
 feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
 indicatif = "0.18.4"
-jiff = { version = "0.2.24", features = ["serde"] }
-log = "0.4.29"
+jiff = { version = "0.2.28", features = ["serde"] }
+log = "0.4.30"
 miette = { version = "7.6.0", features = ["fancy"] }
-reqwest = { version = "0.13.3", features = ["gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.13.4", features = ["gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 tera = "1.20.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
