@@ -71,7 +71,8 @@ pub(crate) mod logic {
     /// Whether a cached 429 retry window is still open at `now`. While it is, the
     /// caller should serve from cache instead of issuing a request.
     pub(crate) fn retry_after_gate_open(cv: &CacheValue, now: Timestamp) -> bool {
-        cv.retry_after.is_some_and(|retry| cv.timestamp + retry > now)
+        cv.retry_after
+            .is_some_and(|retry| cv.timestamp + retry > now)
     }
 
     /// The conditional-request headers implied by a cached entry, if any.
@@ -86,12 +87,10 @@ pub(crate) mod logic {
     /// absent or not an integer count of seconds. The value is clamped to the span
     /// jiff can represent (`MAX_SPAN_SEC`) so a hostile header cannot panic a fetch.
     pub(crate) fn parse_retry_after(header: Option<&str>) -> Span {
-        header
-            .and_then(|s| s.parse::<i64>().ok())
-            .map_or_else(
-                || 4.hours(),
-                |secs| secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds(),
-            )
+        header.and_then(|s| s.parse::<i64>().ok()).map_or_else(
+            || 4.hours(),
+            |secs| secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds(),
+        )
     }
 
     /// Decide what to do with a response given its status, the already-normalized
@@ -439,7 +438,10 @@ mod tests {
             headers.if_modified_since,
             cv.as_ref().and_then(|c| c.last_modified.clone())
         );
-        assert_eq!(headers.if_none_match, cv.as_ref().and_then(|c| c.etag.clone()));
+        assert_eq!(
+            headers.if_none_match,
+            cv.as_ref().and_then(|c| c.etag.clone())
+        );
     }
 
     // A 2xx response stores the response metadata and body verbatim.
@@ -617,7 +619,10 @@ mod tests {
         );
 
         let entry = cache.get(&url).expect("cached after 200");
-        assert_eq!(entry.etag.as_deref(), Some(normalize_etag(etag_raw).as_str()));
+        assert_eq!(
+            entry.etag.as_deref(),
+            Some(normalize_etag(etag_raw).as_str())
+        );
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
     }
 

@@ -376,8 +376,9 @@ mod tests {
             generators::just("http".to_string()),
             generators::just("https".to_string())
         ));
-        let host = tc
-            .draw(generators::from_regex(r"(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}").fullmatch(true));
+        let host = tc.draw(
+            generators::from_regex(r"(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}").fullmatch(true),
+        );
         let port = tc.draw(generators::integers::<u16>().min_value(80).max_value(65535));
         let rel_path = tc.draw(generators::from_regex(r"/[a-zA-Z0-9_/-]{1,30}").fullmatch(true));
 
