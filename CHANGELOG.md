@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.10
+
+### Patch Changes
+
+- [`e3fc333`](https://github.com/lukehsiao/openring-rs/commit/e3fc33343ef05b83128b9882a695b90e49b86b38) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **fix**: harden feed fetching against edge-case, rate-limited feeds.
+
+  - A feed that responds with HTTP 429 and an extremely large `Retry-After` value
+    no longer crashes `openring`; the retry window is now capped.
+  - A feed that was rate-limited (429) now re-fetches promptly once it recovers,
+    instead of continuing to serve a stale cached copy until the old retry window
+    elapsed.
+
+<pre>
+$ git-stats v0.5.9..v0.5.10
+Author           Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao             4             17       +1143      -1047    +96
+dependabot[bot]        2              2          +2         -2      0
+Total                  6             19       +1145      -1049    +96
+</pre>
+
 ## 0.5.9
 
 ### Patch Changes
