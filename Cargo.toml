@@ -38,12 +38,9 @@ url = { version = "2.5.8", features = ["serde"] }
 yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 
 [dev-dependencies]
-proptest = "1.11.0"
+hegeltest = { version = "0.14.18", features = ["jiff"] }
 tempfile = "3.27.0"
 wiremock = "0.6.5"
-
-[profile.test.package.proptest]
-opt-level = 3
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"

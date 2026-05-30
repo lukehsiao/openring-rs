@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::{args::Args, error::Result};
 
-const MAX_SPAN_SEC: i64 = 631_107_417_600;
+pub(crate) const MAX_SPAN_SEC: i64 = 631_107_417_600;
 
 /// Options for loading cache
 #[derive(Copy, Clone, Debug)]
@@ -179,13 +179,17 @@ pub(crate) fn load_cache(args: &Args, cache_path: CachePath) -> Option<Cache> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::{fs::File, thread::sleep, time::Duration as StdDuration};
 
     use jiff::{Span, Timestamp};
-    use proptest::prelude::*;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
     use url::Url;
+
+    use hegel::TestCase;
+    use hegel::extras::jiff as jiff_gs;
+    use hegel::generators;
 
     use super::*;
 
@@ -194,170 +198,251 @@ mod tests {
         Timestamp::from_second(secs).expect("failed to clamp timestamp")
     }
 
-    // A random but well‑formed URL (http or https) – enough for the cache key.
-    fn url_gen() -> impl Strategy<Value = Url> {
-        // Simple host + path generator; you can extend it if you need more variety.
-        ("https?://", "[a-z]{1,10}\\.[a-z]{2,5}", "/[a-z]{0,15}")
-            .prop_map(|(scheme, host, path)| format!("{scheme}{host}{path}"))
-            .prop_filter_map("valid URL", |s| Url::parse(&s).ok())
+    // Cap on generated collection sizes. The cache is a flat map, so its
+    // round-trip and age-filtering properties are fully exercised well below this;
+    // a larger cap mostly inflates per-case entropy and runtime.
+    const MAX_TEST_ENTRIES: usize = 50;
+
+    // A well-formed http(s) URL, enough to act as a distinct cache key.
+    #[hegel::composite]
+    fn urls(tc: hegel::TestCase) -> Url {
+        let s = tc.draw(
+            generators::from_regex(r"https?://[a-z]{1,10}\.[a-z]{2,5}/[a-z]{0,15}").fullmatch(true),
+        );
+        Url::parse(&s).expect("generated string is a valid URL")
     }
 
-    // Random `CacheValue`.  All fields are optional except `timestamp`.
-    fn cache_value_gen() -> impl Strategy<Value = CacheValue> {
-        let ts = any::<i64>().prop_map(bounded_timestamp);
+    // A `CacheValue` with arbitrary fields. All are optional except `timestamp`,
+    // and the retry span is kept within what jiff can represent.
+    #[hegel::composite]
+    fn cache_values(tc: hegel::TestCase) -> CacheValue {
+        // retry_after only ever holds a time-only span in production, so we
+        // generate seconds rather than jiff_gs::spans(): its calendar-unit spans
+        // are out of domain and would trip the time-only `spans_equal`.
+        let retry_after = tc.draw(generators::optional(
+            generators::integers::<i64>()
+                .min_value(0)
+                .max_value(MAX_SPAN_SEC),
+        ));
+        // The string fields are opaque cache payloads; capping their length keeps
+        // per-case entropy modest when many values populate a collection, while
+        // still exercising escaping and unicode.
+        let text = || generators::optional(generators::text().max_size(64));
+        CacheValue {
+            timestamp: tc.draw(jiff_gs::timestamps()),
+            retry_after: retry_after.map(|secs| Span::new().seconds(secs)),
+            last_modified: tc.draw(text()),
+            etag: tc.draw(text()),
+            body: tc.draw(text()),
+        }
+    }
 
-        // `None`  – no retry‑after header
-        // `Some` – a non‑negative span built from a random i64
-        let retry_after = prop_oneof![
-            // None branch
-            Just(None),
-            // Some branch
-            any::<i64>()
-                .prop_map(|secs| Span::new().seconds(secs.clamp(0, MAX_SPAN_SEC)))
-                .prop_map(Some)
+    // `spans_equal` agrees with integer-seconds equality across the full range of
+    // representable spans.
+    #[hegel::test]
+    fn spans_equal_behavior(tc: hegel::TestCase) {
+        let a_secs = tc.draw(
+            generators::integers::<i64>()
+                .min_value(-MAX_SPAN_SEC)
+                .max_value(MAX_SPAN_SEC),
+        );
+        let b_secs = tc.draw(
+            generators::integers::<i64>()
+                .min_value(-MAX_SPAN_SEC)
+                .max_value(MAX_SPAN_SEC),
+        );
+        let a = Span::new().seconds(a_secs);
+        let b = Span::new().seconds(b_secs);
+        assert_eq!(spans_equal(&a, &b), a_secs == b_secs);
+    }
+
+    // A value with all-None optional fields survives a store/load round-trip.
+    #[hegel::test]
+    fn round_trip_all_none_fields(tc: hegel::TestCase) {
+        let url = tc.draw(urls());
+        let cache: Cache = DashMap::new();
+        let cv = CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: None,
+            etag: None,
+            body: None,
+        };
+        cache.insert(url.clone(), cv.clone());
+
+        let tmp = NamedTempFile::new().expect("temp file");
+        cache.store(tmp.path()).expect("store succeeds");
+
+        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+        let loaded_val = loaded.get(&url).expect("key present after load");
+        assert_eq!(&*loaded_val, &cv);
+    }
+
+    // An enormous max_age is clamped rather than overflowing, so the entry loads.
+    #[hegel::test]
+    fn load_clamps_max_age(tc: hegel::TestCase) {
+        let url = tc.draw(urls());
+        let value = tc.draw(cache_values());
+        let cache: Cache = DashMap::new();
+        cache.insert(url.clone(), value);
+        let tmp = NamedTempFile::new().expect("temp file");
+        cache.store(tmp.path()).expect("store succeeds");
+
+        let loaded_large =
+            Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+        let loaded_clamped =
+            Cache::load(tmp.path(), MAX_SPAN_SEC as u64, Timestamp::now()).expect("load succeeds");
+
+        assert!(loaded_large.contains_key(&url));
+        assert!(loaded_clamped.contains_key(&url));
+    }
+
+    // Every entry round-trips identically through store/load. Iterating the cache
+    // (rather than the raw inputs) sidesteps any duplicate-key collisions. Fewer
+    // cases than the default since each one writes and reads a whole cache file.
+    #[hegel::test(test_cases = 25)]
+    fn round_trip_preserves_entries(tc: hegel::TestCase) {
+        let n = tc.draw(
+            generators::integers::<usize>()
+                .min_value(0)
+                .max_value(MAX_TEST_ENTRIES),
+        );
+        let cache: Cache = DashMap::new();
+        for _ in 0..n {
+            cache.insert(tc.draw(urls()), tc.draw(cache_values()));
+        }
+
+        let tmp = NamedTempFile::new().expect("temp file");
+        cache.store(tmp.path()).expect("store succeeds");
+
+        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+        for entry in &cache {
+            let loaded_val = loaded.get(entry.key()).expect("key present after load");
+            assert_eq!(&*loaded_val, entry.value());
+        }
+        assert_eq!(loaded.len(), cache.len());
+    }
+
+    // Loading discards exactly the entries older than max_age. Fewer cases than
+    // the default since each one writes and reads a whole cache file.
+    #[hegel::test(test_cases = 25)]
+    fn age_filter_discards_old_entries(tc: hegel::TestCase) {
+        let now_secs = tc.draw(
+            generators::integers::<i64>()
+                .min_value(10_000)
+                .max_value(Timestamp::MAX.as_second()),
+        );
+        let max_age = tc.draw(generators::integers::<u32>().min_value(0).max_value(10_000));
+        let n = tc.draw(
+            generators::integers::<usize>()
+                .min_value(0)
+                .max_value(MAX_TEST_ENTRIES),
+        );
+
+        let now = bounded_timestamp(now_secs);
+        let max_age_span = Span::new().seconds(i64::from(max_age));
+
+        let cache: Cache = DashMap::new();
+        for i in 0..n {
+            let url = tc.draw(urls());
+            let mut value = tc.draw(cache_values());
+            // Make every even-indexed entry older than max_age.
+            if i % 2 == 0 {
+                value.timestamp = now - max_age_span - Span::new().seconds(1);
+            } else {
+                value.timestamp = now;
+            }
+            cache.insert(url, value);
+        }
+
+        let tmp = NamedTempFile::new().expect("temp file");
+        cache.store(tmp.path()).expect("store succeeds");
+        let loaded = Cache::load(tmp.path(), max_age.into(), now).expect("load succeeds");
+
+        for entry in &cache {
+            let cutoff = now - max_age_span;
+            let should_keep = entry.value().timestamp > cutoff;
+            assert_eq!(loaded.contains_key(entry.key()), should_keep);
+        }
+    }
+
+    // Stateful model test: the cache (subject) must agree with a HashMap (model)
+    // after every insert, get, and store/reload. This is the highest-value check
+    // for a keyed data structure with persistence, exercising overwrite and
+    // round-trip paths the isolated property tests above cannot.
+    struct CacheModel {
+        subject: Cache,
+        model: HashMap<Url, CacheValue>,
+        urls: Vec<Url>,
+    }
+
+    // Rule and invariant methods must take `TestCase` by value to match the
+    // fn-pointer type hegel's `Rule::new` expects, but `tc.draw()` only borrows it.
+    #[hegel::state_machine]
+    #[expect(clippy::needless_pass_by_value)]
+    impl CacheModel {
+        #[rule]
+        fn insert(&mut self, tc: TestCase) {
+            let i = tc.draw(
+                generators::integers::<usize>()
+                    .min_value(0)
+                    .max_value(self.urls.len() - 1),
+            );
+            let url = self.urls[i].clone();
+            let value = tc.draw(cache_values());
+            self.subject.insert(url.clone(), value.clone());
+            self.model.insert(url, value);
+        }
+
+        #[rule]
+        fn get(&mut self, tc: TestCase) {
+            let i = tc.draw(
+                generators::integers::<usize>()
+                    .min_value(0)
+                    .max_value(self.urls.len() - 1),
+            );
+            let url = &self.urls[i];
+            let from_subject = self.subject.get(url).map(|e| e.value().clone());
+            let from_model = self.model.get(url).cloned();
+            assert_eq!(from_subject, from_model);
+        }
+
+        #[rule]
+        fn store_reload(&mut self, _tc: TestCase) {
+            let tmp = NamedTempFile::new().expect("temp file");
+            self.subject.store(tmp.path()).expect("store succeeds");
+            // u64::MAX keeps every entry, so a reload should be a pure round-trip.
+            let reloaded =
+                Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+            self.subject = reloaded;
+        }
+
+        #[invariant]
+        fn agrees_with_model(&mut self, _tc: TestCase) {
+            assert_eq!(self.subject.len(), self.model.len());
+            for (url, value) in &self.model {
+                let got = self.subject.get(url).expect("model key present in subject");
+                assert_eq!(&*got, value);
+            }
+        }
+    }
+
+    #[hegel::test]
+    fn cache_matches_hashmap_model(tc: hegel::TestCase) {
+        let urls = vec![
+            Url::parse("https://a.example/").unwrap(),
+            Url::parse("https://b.example/").unwrap(),
+            Url::parse("https://c.example/feed").unwrap(),
+            Url::parse("https://d.example/atom").unwrap(),
         ];
-
-        let opt_string = ".*".prop_map(|s| if s.is_empty() { None } else { Some(s) });
-
-        (
-            ts,
-            retry_after,
-            opt_string.clone(),
-            opt_string.clone(),
-            opt_string,
-        )
-            .prop_map(
-                |(timestamp, retry_after, last_modified, etag, body)| CacheValue {
-                    timestamp,
-                    retry_after,
-                    last_modified,
-                    etag,
-                    body,
-                },
-            )
+        let machine = CacheModel {
+            subject: DashMap::new(),
+            model: HashMap::new(),
+            urls,
+        };
+        hegel::stateful::run(machine, tc);
     }
 
-    proptest! {
-        // spans_equal behaves as expected for equal and different spans
-        #[test]
-        fn spans_equal_behavior(a_secs in 0i64..1_000_000i64, b_secs in 0i64..1_000_000i64) {
-            let a = Span::new().seconds(a_secs);
-            let b = Span::new().seconds(b_secs);
-
-            let eq = spans_equal(&a, &b);
-            prop_assert_eq!(eq, a_secs == b_secs);
-        }
-
-        // Round-trip JSON when optional fields are all None
-        #[test]
-        fn round_trip_all_none_fields(url in url_gen()) {
-            let cache: Cache = DashMap::new();
-            let cv = CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: None,
-                body: None,
-            };
-            cache.insert(url.clone(), cv.clone());
-
-            let tmp = NamedTempFile::new().expect("temp file");
-            cache.store(tmp.path()).expect("store succeeds");
-
-            let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-            let loaded_val = loaded.get(&url).expect("key present after load");
-            prop_assert_eq!(&*loaded_val, &cv);
-        }
-
-        #[test]
-        fn load_clamps_max_age(url in url_gen(), value in cache_value_gen()) {
-            // create file with single entry
-            let cache: Cache = DashMap::new();
-            cache.insert(url.clone(), value.clone());
-            let tmp = NamedTempFile::new().expect("temp file");
-            cache.store(tmp.path()).expect("store succeeds");
-
-            // Use an enormous max_age (u128-sized) mapped to u64::MAX via API; ensure it doesn't overflow
-            let loaded_large = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-            let loaded_clamped = Cache::load(tmp.path(), MAX_SPAN_SEC as u64, Timestamp::now()).expect("load succeeds");
-
-            // Both should contain the same entry (since clamp should cap max age)
-            prop_assert!(loaded_large.contains_key(&url));
-            prop_assert!(loaded_clamped.contains_key(&url));
-        }
-
-        #[test]
-        fn round_trip_preserves_entries(
-            // generate a vector of (Url, CacheValue) pairs
-            entries in prop::collection::vec((url_gen(), cache_value_gen()), 0..100)
-        ) {
-            // Build a cache and insert the generated entries
-            let cache: Cache = DashMap::new();
-            for (url, value) in &entries {
-                cache.insert(url.clone(), value.clone());
-            }
-
-            // Write to a temporary file
-            let tmp = NamedTempFile::new().expect("temp file");
-            cache.store(tmp.path()).expect("store succeeds");
-
-            // Load with a very large max_age so nothing is filtered out
-            let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-
-            // The two maps must contain the same keys and values
-            for (url, value) in entries {
-                let loaded_val = loaded.get(&url).expect("key present after load");
-                prop_assert_eq!(&*loaded_val, &value);
-            }
-        }
-
-        #[test]
-        fn age_filter_discards_old_entries(
-            // generate a fresh timestamp (now) and a max_age in seconds, ensuring they can be subtracted
-            now_secs in 10_000i64..Timestamp::MAX.as_second(),
-            max_age in 0u32..10_000,
-            // generate a mix of recent and old entries
-            entries in prop::collection::vec(
-                (url_gen(), cache_value_gen()),
-                0..200
-            )
-        ) {
-            // Freeze “now” for the test
-            let now = bounded_timestamp(now_secs);
-            let max_age_span = Span::new().seconds(i64::from(max_age));
-
-            // Build a cache where half the entries are artificially old
-            let cache: Cache = DashMap::new();
-
-            for (i, (url, mut value)) in entries.into_iter().enumerate() {
-                // Make every even index entry older than max_age
-                if i % 2 == 0 {
-                    value.timestamp = now - max_age_span - Span::new().seconds(1);
-                } else {
-                    value.timestamp = now;
-                }
-                cache.insert(url, value);
-            }
-
-            // Write to a temporary file
-            let tmp = NamedTempFile::new().expect("temp file");
-            cache.store(tmp.path()).expect("store succeeds");
-
-            // Load with the generated max_age
-            let loaded = Cache::load(tmp.path(), max_age.into(), now).expect("load succeeds");
-
-            // Verify that only the “new” entries survived
-            for entry in &cache {
-                let url   = entry.key();    // &Url
-                let value = entry.value(); // &CacheValue
-
-                let cutoff = now - max_age_span;          // Timestamp that is `max_age` old
-                let should_keep = value.timestamp > cutoff;
-                let present = loaded.contains_key(url);
-                prop_assert_eq!(present, should_keep);
-            }
-        }
-    }
     #[test]
     fn load_cache_returns_none_when_cache_disabled() {
         let tmp_cache_path = NamedTempFile::new().expect("temp file");
