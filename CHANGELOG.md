@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.11
+
+### Patch Changes
+
+- [`7890be1`](https://github.com/lukehsiao/openring-rs/commit/7890be1733393667750906ed87c0ba7713667432) Thanks [@lukehsiao](https://github.com/lukehsiao)! - Re-release due to botched CI. Functionally equivalent to the yanked v0.5.10.
+
+<pre>
+$ git-stats v0.5.9..v0.5.11
+Author               Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao                 5             18       +1148      -1047   +101
+dependabot[bot]            2              2          +2         -2      0
+github-actions[bot]        1              7         +40        -25    +15
+Total                      8             27       +1190      -1074   +116
+</pre>
+
 ## 0.5.10
 
 ### Patch Changes
