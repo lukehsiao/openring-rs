@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.12
+
+### Patch Changes
+
+- [`0d09ab9`](https://github.com/lukehsiao/openring-rs/commit/0d09ab99359b883eb49431cc81105d4beb2e85c6) Thanks [@lukehsiao](https://github.com/lukehsiao)! - **fix**: don't crash on feeds that omit a `<title>`.
+
+  A feed whose top-level element has no `<title>` previously panicked `openring`,
+  aborting the entire run even when every other feed was fine. Such feeds are now
+  handled like any other: the source title falls back to the feed's domain, and
+  the source link falls back to the feed's links (or the feed URL itself).
+
+<pre>
+$ git-stats v0.5.11..v0.5.12
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        1              2        +634       -159   +475
+Total             1              2        +634       -159   +475
+</pre>
+
 ## 0.5.11
 
 ### Patch Changes
