@@ -1,5 +1,5 @@
 use clap::Parser;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use std::io;
 use tracing_log::AsTrace;
 
@@ -16,5 +16,9 @@ async fn main() -> Result<()> {
         ))
         .with_writer(io::stderr)
         .init();
-    openring::run(args).await.into_diagnostic()
+    // `?` converts `OpenringError` into a `miette::Report` via its `Diagnostic`
+    // impl, so the `#[diagnostic(code(..))]` codes render (unlike `into_diagnostic`,
+    // which discards them).
+    openring::run(args).await?;
+    Ok(())
 }
