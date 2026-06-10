@@ -235,13 +235,19 @@ fn select_articles(
     num_articles: usize,
     before: Option<Date>,
 ) -> Result<Vec<Article>> {
+    // Convert the cutoff to an instant once: midnight at the start of
+    // `before` in the system timezone.
+    let cutoff = before
+        .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
+        .transpose()?;
+
     let mut articles = Vec::new();
     for (feed, url) in feeds {
         let source_title = resolve_source_title(&feed, &url);
         let source_link = resolve_source_link(&feed, &url)?;
         let mut from_feed = Vec::new();
         for entry in &feed.entries {
-            if let Some(article) = build_article(entry, &url, &source_title, &source_link, before)?
+            if let Some(article) = build_article(entry, &url, &source_title, &source_link, cutoff)?
             {
                 from_feed.push(article);
             }
@@ -344,14 +350,14 @@ fn sanitize_text(raw: &str) -> String {
 /// Build a renderable [`Article`] from a feed entry.
 ///
 /// Returns `Ok(None)` when the entry lacks a usable link, title, or date, or
-/// when it falls at or after `before`. Errors only when the entry's date is
-/// out of representable range.
+/// when it falls at or after the `cutoff` instant. Errors only when the
+/// entry's date is out of representable range.
 fn build_article(
     entry: &Entry,
     feed_url: &Url,
     source_title: &str,
     source_link: &Url,
-    before: Option<Date>,
+    cutoff: Option<Timestamp>,
 ) -> Result<Option<Article>> {
     let (Some(link), Some(title), Some(date)) = (
         resolve_entry_link(entry, feed_url),
@@ -370,8 +376,8 @@ fn build_article(
     };
 
     let timestamp = Timestamp::from_second(date.timestamp())?;
-    if let Some(before) = before
-        && timestamp > before.to_zoned(TimeZone::system())?.timestamp()
+    if let Some(cutoff) = cutoff
+        && timestamp >= cutoff
     {
         return Ok(None);
     }
@@ -890,8 +896,6 @@ mod tests {
 
     #[test]
     fn build_article_assembles_fields_and_applies_filters() {
-        use jiff::civil::date;
-
         let source_link = Url::parse("https://example.com/").unwrap();
         let future = first_entry(
             r#"<entry>
@@ -912,14 +916,14 @@ mod tests {
         assert_eq!(built.source_title, "Src");
         assert_eq!(built.source_link, source_link);
 
-        // An entry at or after `before` is dropped.
+        // An entry at or after the cutoff instant is dropped.
         assert!(
             build_article(
                 &future,
                 &feed_url(),
                 "Src",
                 &source_link,
-                Some(date(2022, 1, 1))
+                Some("2022-01-01T00:00:00Z".parse().unwrap())
             )
             .unwrap()
             .is_none()
@@ -1116,6 +1120,36 @@ mod tests {
         assert_eq!(articles[0].title, "Newest");
         assert_eq!(articles[1].title, "Middle");
         assert!(articles[0].timestamp > articles[1].timestamp);
+    }
+
+    #[test]
+    fn select_articles_drops_entry_published_exactly_at_the_cutoff() {
+        use jiff::{civil::date, tz::TimeZone};
+
+        // An article published at the very instant `before` begins is not
+        // "before" that date and must be excluded.
+        let cutoff_date = date(2022, 1, 1);
+        let cutoff = cutoff_date
+            .to_zoned(TimeZone::system())
+            .unwrap()
+            .timestamp();
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(&format!(
+                r#"<entry>
+                    <title>At Cutoff</title>
+                    <link href="https://example.com/at"/>
+                    <published>{cutoff}</published>
+                    <summary>x</summary>
+                </entry>"#
+            )),
+        )];
+
+        let articles = select_articles(feeds, 10, 10, Some(cutoff_date)).unwrap();
+        assert!(
+            articles.is_empty(),
+            "boundary article was kept: {articles:?}"
+        );
     }
 
     #[test]
