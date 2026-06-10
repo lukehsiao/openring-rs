@@ -160,6 +160,39 @@ pub(crate) mod logic {
     }
 }
 
+/// Read the response body, failing once it grows past `limit` bytes. This
+/// backstops the Content-Length check for chunked or compressed responses,
+/// which present no usable length up front. A transfer error mid-read yields
+/// `None`, the same as any other failed body read.
+async fn read_body_capped(
+    url: &Url,
+    mut resp: reqwest::Response,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, OpenringError> {
+    // The limit always fits in usize on supported platforms.
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let total = body.len().saturating_add(chunk.len());
+                if total > limit {
+                    return Err(OpenringError::FeedTooLargeError {
+                        url: url.as_str().to_string(),
+                        bytes: u64::try_from(total).unwrap_or(u64::MAX),
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(Some(body)),
+            Err(e) => {
+                warn!(url=%url.as_str(), error=%e, "failed reading feed body.");
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Parse feed bytes, logging and converting any parse error. The bytes are
 /// the raw transfer body so the parser can honor the feed's own encoding.
 fn parse_feed(url: &Url, feed_bytes: &[u8]) -> Result<Feed, OpenringError> {
@@ -306,7 +339,7 @@ impl FeedFetcher for Url {
         // as UTF-8 while the XML prolog still declares the original charset,
         // so the parser would decode non-UTF-8 feeds twice into mojibake.
         let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            resp.bytes().await.ok().map(|b| b.to_vec())
+            read_body_capped(self, resp, MAX_FEED_BYTES).await?
         } else {
             None
         };
@@ -734,6 +767,21 @@ mod tests {
         let cached = cache.get(&url).expect("cached").body.clone().unwrap();
         let reparsed = feed_rs::parser::parse(cached.as_slice()).expect("cache reparses");
         assert_eq!(reparsed.title.unwrap().content, "caf\u{e9}");
+    }
+
+    #[tokio::test]
+    async fn streamed_bodies_without_content_length_are_capped() {
+        use super::{MAX_FEED_BYTES, read_body_capped};
+
+        // A response with no Content-Length header, the shape a chunked or
+        // compressed transfer takes once reqwest strips the encoding. The
+        // header fast-path cannot see these; only the streaming cap can.
+        let big = vec![b'x'; usize::try_from(MAX_FEED_BYTES).unwrap() + 1];
+        let resp = reqwest::Response::from(http::Response::new(big));
+        let url = Url::parse("https://example.com/feed.xml").unwrap();
+
+        let res = read_body_capped(&url, resp, MAX_FEED_BYTES).await;
+        assert!(matches!(res, Err(OpenringError::FeedTooLargeError { .. })));
     }
 
     #[tokio::test]

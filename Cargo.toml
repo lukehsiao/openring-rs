@@ -39,6 +39,7 @@ yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 
 [dev-dependencies]
 hegeltest = { version = "0.17.1", features = ["jiff"] }
+http = "1.4.2"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
 

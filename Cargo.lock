@@ -1794,6 +1794,7 @@ dependencies = [
  "feed-rs",
  "hegeltest",
  "html-escape",
+ "http",
  "humantime",
  "indicatif",
  "jiff",
