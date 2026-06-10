@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # paste is unmaintained (RUSTSEC-2024-0436), not vulnerable. It reaches us
+    # only as a compile-time transitive dev-dependency of hegeltest, so there
+    # is no runtime exposure. Drop this once hegel moves off it.
+    "RUSTSEC-2024-0436",
+]
