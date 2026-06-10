@@ -26,11 +26,20 @@ pub(crate) trait FeedFetcher {
 const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Build the HTTP client shared by every feed fetch: one connection pool and
-/// one TLS setup for the whole run, a 30s timeout, and the openring
-/// user agent.
+/// one TLS setup for the whole run, and the openring user agent.
+///
+/// Timeouts are granular rather than one total deadline: a large feed on a
+/// slow server (e.g. 1.7 MiB at ~85 KiB/s) is legitimate and must be allowed
+/// to finish, while a dead or stalled server should fail fast.
 pub(crate) fn build_client() -> Result<Client, OpenringError> {
     Ok(ClientBuilder::new()
-        .timeout(Duration::from_secs(30))
+        // A server that cannot complete a TCP/TLS handshake in 10s is down.
+        .connect_timeout(Duration::from_secs(10))
+        // A transfer may take as long as it keeps flowing, but 30s with no
+        // bytes at all means a stall.
+        .read_timeout(Duration::from_secs(30))
+        // Ceiling so a trickling server cannot pin a fetch slot forever.
+        .timeout(Duration::from_mins(5))
         .user_agent(concat!(crate_name!(), '/', crate_version!()))
         .build()?)
 }
