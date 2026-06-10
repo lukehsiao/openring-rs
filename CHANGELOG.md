@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.15
+
+### Patch Changes
+
+- [`98e23c6`](https://github.com/lukehsiao/openring-rs/commit/98e23c6149bf7200cbf4dd5b9b34121496eb2ea5) - **fix**: report each fetch failure once, with its real cause.
+
+  Failed fetches logged a warning and then surfaced the same failure again as the per-feed error line, so every broken feed printed twice.
+  A body that fails mid-transfer also no longer masquerades as "the feed was empty": the underlying error (e.g. "error decoding response body") is what gets reported, and the previously cached copy of the feed is left intact instead of being overwritten by the failed attempt.
+
+- [`1917143`](https://github.com/lukehsiao/openring-rs/commit/191714398d9140ca33a4819d7b7256d14ab236fc) - **fix**: stop timing out large feeds on slow servers.
+
+  The 30-second timeout was a total deadline covering the entire transfer, so a perfectly healthy feed that is just large and slow (a 1.7 MiB feed at ~85 KiB/s) failed midway through its body, especially with many feeds sharing bandwidth.
+  Timeouts are now granular: 10 seconds to connect, 30 seconds of complete silence to declare a stall, and a 5-minute overall ceiling so a trickling server cannot hold a fetch slot forever.
+  A transfer that keeps flowing is allowed to finish.
+
+<pre>
+$ git-stats v0.5.14..v0.5.15
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        2              4         +40        -33     +7
+Total             2              4         +40        -33     +7
+</pre>
+
 ## 0.5.14
 
 ### Patch Changes
