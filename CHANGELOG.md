@@ -1,5 +1,136 @@
 # Changelog
 
+## 0.5.13
+
+### Patch Changes
+
+- [`0dc6a57`](https://github.com/lukehsiao/openring-rs/commit/0dc6a57128708fe6377113d065f9ca30f77cd6e2) - **fix**: keep cached validators current when a `304 Not Modified` rotates them.
+
+  A 304 response may carry updated `ETag` or `Last-Modified` headers, but openring kept validating against the old ones, so a server that rotates validators would answer every later run with a full download.
+  Validators carried on a 304 now replace the cached ones; absent headers leave them untouched.
+
+- [`a22b97c`](https://github.com/lukehsiao/openring-rs/commit/a22b97cc128d81224b56996aa19b1ab504435ef7) - **fix**: `--before` now excludes articles published exactly at the cutoff instant.
+
+  An article published at the very moment the `--before` date begins (midnight, system timezone) was included even though it is not strictly before that date.
+  The comparison is now inclusive of the boundary on the exclusion side, matching the documented "only include articles before this date".
+
+- [`4c3825c`](https://github.com/lukehsiao/openring-rs/commit/4c3825ca99d8e0972e09e6929a52616996f19a7c) - **fix**: recover from cache entries that have metadata but no body.
+
+  When a feed's body failed to download, the cache kept its `ETag`/`Last-Modified` anyway, so every later run sent a conditional request, got `304 Not Modified` back, and failed with "feed was empty" until the entry expired.
+  Conditional headers are now only sent when the cache actually has a body to serve, so the next run refetches the feed in full.
+
+- [`deb7c97`](https://github.com/lukehsiao/openring-rs/commit/deb7c97e96159dc54ca8af504d4a5d8f65c866e3) - **fix**: exit cleanly when stdout closes early instead of panicking.
+
+  Piping output into a tool that stops reading, like `openring ... | head`, used to panic with a broken-pipe error.
+  A closed stdout is now treated as success, so openring exits quietly the way Unix tools are expected to.
+
+- [`e95df6f`](https://github.com/lukehsiao/openring-rs/commit/e95df6f59ad0a04b83a5169c193f274e6641c8b8) - **fix**: a failed cache write no longer aborts the run.
+
+  If the cache directory was unwritable (read-only home, full disk), openring errored out after fetching every feed but before rendering any output.
+  The cache is an optimization, so a failed write now logs a warning and the run continues, matching how unreadable caches are already handled at load time.
+
+- [`0bad74e`](https://github.com/lukehsiao/openring-rs/commit/0bad74ec290f1a8953028c58b15d515786e41044) - **fix**: article order is now deterministic when timestamps tie.
+
+  Feeds are fetched concurrently and finish in a different order every run, so articles sharing a publication timestamp could swap places between runs and churn otherwise-unchanged generated pages.
+  Ties are now broken by article link, so the same inputs always render in the same order.
+
+- [`ab77a3e`](https://github.com/lukehsiao/openring-rs/commit/ab77a3eac89edaca8781f3664007f8157ba8a6da) - **fix**: an empty feed response is no longer cached as servable content.
+
+  A 200 response with an empty body was stored in the cache as real content, so later runs sent conditional requests, received `304 Not Modified`, and kept serving the empty feed (as a confusing parse error) until the entry expired.
+  Empty bodies are now treated as no body at all: the run reports the feed as empty and the next run refetches it in full.
+
+- [`c29abbf`](https://github.com/lukehsiao/openring-rs/commit/c29abbf3a581c6231672733c96136d5ef1d11bd2) - **fix**: reject feeds larger than 64 MiB instead of buffering them.
+
+  A urls-file mistake pointing at a video or other huge file used to be downloaded in full into memory and then written into the cache file.
+  Responses declaring a Content-Length over 64 MiB are rejected up front, and chunked or compressed responses without a usable length are cut off as soon as the streamed body crosses the same limit.
+  Either way the run reports a clear "feed is too large" error for that feed; even full-content feeds typically run single-digit MiB.
+
+- [`2b56035`](https://github.com/lukehsiao/openring-rs/commit/2b56035a9a6abc5746273e510cf7c1b2cc895008) - **fix**: bound concurrent feed fetches so long URL lists don't drop feeds.
+
+  Every feed was fetched simultaneously, so a urls file with more entries than the process's file-descriptor limit (256 by default on macOS) made fetches fail with exhaustion errors and feeds silently vanish from the output.
+  At most 32 fetches are now in flight at a time, which keeps the network saturated while staying well below any sane descriptor limit.
+
+- [`dc283bc`](https://github.com/lukehsiao/openring-rs/commit/dc283bc9cc8f37793140ed970e0c11ca4033ab2f) - **fix**: don't crash on titleless feeds served from an IP address.
+
+  The source-title fallback assumed every feed URL has a domain name, so a feed fetched from an IP host (e.g. `http://127.0.0.1:8000/feed.xml`) that omitted its `<title>` crashed the whole run.
+  The fallback now uses the URL's host, whether that is a domain name or an IP address.
+
+- [`04b760b`](https://github.com/lukehsiao/openring-rs/commit/04b760bdcd70a0d3c656d804fce430818f819ef2) - **fix**: feeds in non-UTF-8 encodings no longer render as mojibake.
+
+  The HTTP response was decoded to UTF-8 text before parsing, but the feed parser honors the XML prolog, so a feed declaring `encoding="ISO-8859-1"` was decoded twice and its accented characters came out garbled.
+  The raw response bytes now go straight to the feed parser, which decodes them per the feed's own declaration.
+  The cache stores the body as base64-encoded bytes to support this; caches written by older versions are discarded once with a warning and rebuilt on the next run.
+
+- [`38c95e6`](https://github.com/lukehsiao/openring-rs/commit/38c95e63f4e130702fbd2a31b946ca32e3ddb7c5) - **fix**: `--per-source` now picks each feed's most recent articles, as documented.
+
+  The per-source cap used to take the first N entries in the order the feed listed them, but nothing in RSS or Atom guarantees newest-first, so feeds sorted oldest-first contributed their oldest posts.
+  Entries filtered out by `--before` (or missing required fields) also consumed the cap, which could leave a feed contributing nothing even when it had qualifying articles.
+  Each feed now contributes its N most recent qualifying entries by publication date.
+
+- [`63c17a8`](https://github.com/lukehsiao/openring-rs/commit/63c17a8cda865c5e3a657f32991675cbebb54be5) - **feat**: warn when a feed URL redirects.
+
+  Redirects were followed silently forever, so a feed that moved kept working without the urls file ever being updated.
+  A fetch that lands on a different URL than requested now logs a warning naming the new location (visible with `-v`).
+
+- [`e4c5548`](https://github.com/lukehsiao/openring-rs/commit/e4c55489e355f1261f01d3a096f9e763e8d2f45e) - **fix**: resolve relative feed links per RFC 3986 instead of mangling them.
+
+  Links in feeds were resolved by gluing the href onto the feed's origin, so a path-relative href like `page.html` produced a mangled host such as `https://example.compage.html`, and a protocol-relative href like `//other.example/x` pointed at the wrong site.
+  Hrefs are now joined against the feed URL with standard URL resolution, so absolute, root-relative, path-relative, and protocol-relative links all land where the feed intended.
+
+- [`8e2f67f`](https://github.com/lukehsiao/openring-rs/commit/8e2f67fa1f4c419eee1fea54eeea0a10e2bcfe10) - **fix**: honor the HTTP-date form of `Retry-After`.
+
+  RFC 9110 allows `Retry-After` to carry either delta-seconds or an HTTP-date, but only the seconds form was parsed; a date fell back to the 4-hour default window.
+  Date values are now parsed and the retry window is computed relative to the fetch time, so well-behaved rate limiting servers are respected precisely.
+
+- [`bd6f34e`](https://github.com/lukehsiao/openring-rs/commit/bd6f34e165f9edb0024749cff3b53c2323084796) - **fix**: don't crash on cache files with extreme retry windows.
+
+  The 429 retry window check added the cached timestamp and retry span with arithmetic that panics on overflow, so a corrupt or hand-edited cache file could crash every subsequent run until the cache was deleted.
+  The check now uses checked arithmetic and falls back to the span's sign when the deadline is unrepresentable.
+
+- [`ac2cf04`](https://github.com/lukehsiao/openring-rs/commit/ac2cf044177892c1ae6852e3f5e6072db7c7406d) - **fix**: stop entity-encoded markup from reaching templates live, and sanitize titles.
+
+  Summaries were sanitized and then entity-decoded, so harmless text like `&lt;script&gt;` in a feed turned back into a live `<script>` tag, which the default template embeds raw via `| safe`.
+  Entities are now decoded before sanitizing, so the output is guaranteed safe HTML.
+  Article titles and source titles, which the default template also marks `| safe`, were not sanitized at all; they are now reduced to plain text with all markup stripped.
+
+- [`f28a4d6`](https://github.com/lukehsiao/openring-rs/commit/f28a4d6d587fdc90c70f54b73dfc7188b54f6172) - **perf**: reuse one HTTP client across all feed fetches.
+
+  Every feed fetch used to build its own HTTP client, paying for TLS setup per feed and never reusing connections.
+  A single shared client now serves the whole run, so fetches share a connection pool.
+
+- [`02d2553`](https://github.com/lukehsiao/openring-rs/commit/02d25539cb93f519ad611569c9aaffe2e277c4e7) - **fix**: skip entries without links instead of aborting the whole run.
+
+  A single feed entry with no `<link>` used to abort the entire run with a confusing "bad title" error.
+  Such entries are now skipped with a warning, the same way entries missing a title or date already were.
+
+- [`78f716c`](https://github.com/lukehsiao/openring-rs/commit/78f716cb4c0e4c10580ca2e4a4065ec5c5e40ff1) - **fix**: don't truncate the cache file before holding its lock.
+
+  The cache writer truncated the file first and acquired the exclusive lock second, so a concurrent openring run reading the cache under its shared lock could see the data vanish mid-read.
+  The file is now emptied only after the lock is held, and the write buffer is flushed explicitly so disk errors surface instead of being silently dropped.
+
+- [`2e0b624`](https://github.com/lukehsiao/openring-rs/commit/2e0b624cc701c4fb9ea1d40b30ac489d043f6dd2) - **fix**: fail on a missing or invalid template before fetching any feeds.
+
+  A wrong `--template-file` path or a template syntax error used to surface only after every feed had been fetched, wasting the whole network round.
+  The template is now read and parsed up front, so those mistakes fail in milliseconds.
+
+- [`ca43755`](https://github.com/lukehsiao/openring-rs/commit/ca43755a0e33de0fc29491a73257d4ba7e71cd3a) - **fix**: handle unreadable URL files gracefully and point diagnostics at the right line.
+
+  A URL file that was not valid UTF-8 crashed openring instead of reporting a readable error.
+  When an invalid URL shared text with an earlier comment, the diagnostic underlined the comment instead of the bad line; spans are now computed from the line's actual position.
+
+- [`6d06cd9`](https://github.com/lukehsiao/openring-rs/commit/6d06cd9334d19d3edf356edc2cb4faa3c80e2234) - **fix**: show warnings by default instead of hiding them behind `-v`.
+
+  Warnings about skipped entries, cache problems, and redirected feed URLs were only visible with `-v`, so the actionable ones went unseen.
+  Warnings now print by default; `-q` restores the old errors-only behavior and `-qq` silences everything.
+  Log lines also suspend the fetch progress bar while they print, so the two no longer splice together on a terminal.
+
+<pre>
+$ git-stats v0.5.12..v0.5.13
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao       36             82       +1978       -400  +1578
+Total            36             82       +1978       -400  +1578
+</pre>
+
 ## 0.5.12
 
 ### Patch Changes
