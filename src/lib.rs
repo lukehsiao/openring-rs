@@ -17,7 +17,7 @@ use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use miette::NamedSource;
 use serde::Serialize;
 use tera::Tera;
-use tokio::task::JoinSet;
+use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::{debug, info, warn};
 use url::Url;
 use yansi::Paint;
@@ -82,6 +82,11 @@ fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
     Ok(urls)
 }
 
+/// Cap on in-flight fetches so a long urls file cannot exhaust the process's
+/// file descriptors (macOS defaults to 256 per process). 32 keeps the network
+/// saturated while staying well below that floor.
+const MAX_CONCURRENT_FETCHES: usize = 32;
+
 // Get all feeds from URLs concurrently.
 //
 // Skips feeds if there are errors. Shows progress. Errors only when the
@@ -108,6 +113,8 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
     );
     pb.set_prefix("Fetching".bold().to_string());
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+
     let mut join_set = JoinSet::new();
     let mut pending_urls: HashSet<&Url> = HashSet::from_iter(urls);
 
@@ -117,8 +124,15 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
         let cache_clone = Arc::clone(cache);
         // reqwest::Client is a cheap handle to the shared pool.
         let client_clone = client.clone();
+        let semaphore_clone = Arc::clone(&semaphore);
         let url_clone = url.clone();
         join_set.spawn(async move {
+            // acquire_owned errors only when the semaphore is closed, and
+            // this one never is.
+            let _permit = semaphore_clone
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
             let fetch_result = url_clone.fetch_feed(&client_clone, &cache_clone).await;
             (url_clone, fetch_result)
         });
