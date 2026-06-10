@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     fs,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -84,11 +84,20 @@ impl StoreExt for Cache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let f = fs::File::create(path)?;
-        // Grab a lock to avoid multiple processes writing simultaneously
+        // Open without truncating: the file may only be emptied after the
+        // exclusive lock is held, or concurrent readers holding the shared
+        // lock would see their data vanish mid-read.
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         f.lock()?;
-        let w = BufWriter::new(f);
-        serde_json::to_writer_pretty(w, self)?;
+        f.set_len(0)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer_pretty(&mut w, self)?;
+        // BufWriter's Drop swallows write errors; flush so they surface.
+        w.flush()?;
         Ok(())
     }
 
@@ -461,6 +470,61 @@ mod tests {
             urls,
         };
         hegel::stateful::run(machine, tc);
+    }
+
+    #[test]
+    fn store_waits_for_readers_instead_of_truncating_under_them() {
+        let url = Url::parse("https://example.test/").unwrap();
+        let value = CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: None,
+            etag: None,
+            body: Some("body".into()),
+        };
+        let cache = Cache::new();
+        cache.insert(url.clone(), value);
+
+        let tmp = NamedTempFile::new().expect("temp file");
+        cache.store(tmp.path()).expect("initial store");
+
+        // A concurrent reader mid-read: holds the shared lock.
+        let reader = File::open(tmp.path()).expect("open for read");
+        reader.lock_shared().expect("shared lock");
+
+        // A second store must block on the lock without having touched the
+        // file; truncating first would yank the data out from under readers.
+        let path = tmp.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let cache = Cache::new();
+            cache.insert(
+                Url::parse("https://other.test/").unwrap(),
+                CacheValue {
+                    timestamp: Timestamp::now(),
+                    retry_after: None,
+                    last_modified: None,
+                    etag: None,
+                    body: None,
+                },
+            );
+            cache.store(&path).expect("store after readers release");
+        });
+
+        // Give the writer ample time to reach its truncation.
+        sleep(StdDuration::from_millis(200));
+        let len = fs::metadata(tmp.path()).expect("metadata").len();
+        assert!(
+            len > 0,
+            "store truncated the file while a reader held the lock"
+        );
+
+        drop(reader);
+        writer.join().expect("writer thread");
+
+        // After the lock was released the new contents landed intact.
+        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
+        assert!(loaded.contains_key(&Url::parse("https://other.test/").unwrap()));
+        assert!(!loaded.contains_key(&url));
     }
 
     #[test]
