@@ -129,11 +129,14 @@ pub(crate) mod logic {
         if status == StatusCode::NOT_MODIFIED && had_cache_entry {
             Disposition::Reuse
         } else if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            // A 2xx, or a 304 with no prior entry, stores the response as-is.
+            // A 2xx, or a 304 with no prior entry, stores the response. An
+            // empty body counts as no body: caching it as servable would make
+            // later runs send conditional requests, get 304s, and serve the
+            // empty feed until the entry expired.
             Disposition::Store {
                 etag: etag.map(ToString::to_string),
                 last_modified: last_modified.map(ToString::to_string),
-                body,
+                body: body.filter(|b| !b.is_empty()),
             }
         } else if status == StatusCode::TOO_MANY_REQUESTS {
             if had_cache_entry {
@@ -481,7 +484,8 @@ mod tests {
         assert_eq!(headers.if_none_match, servable.and_then(|c| c.etag.clone()));
     }
 
-    // A 2xx response stores the response metadata and body verbatim.
+    // A 2xx response stores the response metadata verbatim and the body with
+    // the empty string collapsed to None.
     #[hegel::test]
     fn disposition_success_stores_response(tc: hegel::TestCase) {
         let code = tc.draw(generators::integers::<u16>().min_value(200).max_value(299));
@@ -509,7 +513,7 @@ mod tests {
         };
         assert_eq!(e, etag);
         assert_eq!(lm, last_modified);
-        assert_eq!(b, body);
+        assert_eq!(b, body.filter(|s| !s.is_empty()));
     }
 
     // A 304 with a cache entry reuses it; with no entry it stores the response.
@@ -531,7 +535,7 @@ mod tests {
             let logic::Disposition::Store { body: b, .. } = disp else {
                 panic!("expected Store, got {disp:?}");
             };
-            assert_eq!(b, body);
+            assert_eq!(b, body.filter(|s| !s.is_empty()));
         }
     }
 
@@ -667,6 +671,42 @@ mod tests {
             Some(normalize_etag(etag_raw).as_str())
         );
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_not_cached_as_servable() {
+        let server = MockServer::start().await;
+        // A misbehaving feed: 200 with an etag but a completely empty body.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("etag", "\"empty\"")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        let client = build_client().unwrap();
+
+        let first = url.fetch_feed(&client, &cache).await;
+        assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
+
+        // The cached entry must not pretend to have something to serve. If it
+        // did, the next fetch would send If-None-Match, the server would say
+        // 304, and the run would serve the empty body until the entry aged
+        // out of the cache.
+        let second = url.fetch_feed(&client, &cache).await;
+        assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(
+            !received[1].headers.contains_key("if-none-match"),
+            "second fetch sent a conditional request with nothing to serve"
+        );
     }
 
     #[tokio::test]
