@@ -1796,7 +1796,6 @@ dependencies = [
  "humantime",
  "indicatif",
  "jiff",
- "log",
  "miette",
  "reqwest",
  "serde",
