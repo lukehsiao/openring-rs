@@ -111,19 +111,31 @@ pub(crate) mod logic {
             })
     }
 
-    /// Parse a `Retry-After` header into a `Span`, defaulting to 4 hours when it is
-    /// absent or not an integer count of seconds. The value is clamped to the span
-    /// jiff can represent (`MAX_SPAN_SEC`) so a hostile header cannot panic a fetch.
-    pub(crate) fn parse_retry_after(header: Option<&str>) -> Span {
-        header.and_then(|s| s.parse::<i64>().ok()).map_or_else(
-            || 4.hours(),
-            |secs| secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds(),
-        )
+    /// Parse a `Retry-After` header into a `Span` relative to `now`, accepting
+    /// both forms RFC 9110 allows: delta-seconds and an HTTP-date. Defaults to
+    /// 4 hours when the header is absent or in neither form. Values are
+    /// clamped to the span jiff can represent (`MAX_SPAN_SEC`) so a hostile
+    /// header cannot panic a fetch.
+    pub(crate) fn parse_retry_after(header: Option<&str>, now: Timestamp) -> Span {
+        let Some(header) = header else {
+            return 4.hours();
+        };
+        if let Ok(secs) = header.parse::<i64>() {
+            return secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds();
+        }
+        if let Ok(date) = jiff::fmt::rfc2822::parse(header) {
+            // Whole seconds, consistent with the delta form; a date in the
+            // past yields a negative span and the gate stays closed.
+            let secs = date.timestamp().as_second() - now.as_second();
+            return secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds();
+        }
+        4.hours()
     }
 
     /// Decide what to do with a response given its status, the already-normalized
     /// `etag` and `last_modified` headers, the body text, whether a cache entry
-    /// already exists, and the raw `retry-after` header.
+    /// already exists, the raw `retry-after` header, and the time `now` that
+    /// date-form `Retry-After` values are interpreted against.
     pub(crate) fn disposition(
         status: StatusCode,
         etag: Option<&str>,
@@ -131,6 +143,7 @@ pub(crate) mod logic {
         body: Option<Vec<u8>>,
         had_cache_entry: bool,
         retry_after_header: Option<&str>,
+        now: Timestamp,
     ) -> Disposition {
         if status == StatusCode::NOT_MODIFIED && had_cache_entry {
             Disposition::Reuse
@@ -147,7 +160,7 @@ pub(crate) mod logic {
         } else if status == StatusCode::TOO_MANY_REQUESTS {
             if had_cache_entry {
                 Disposition::RateLimited {
-                    retry_after: parse_retry_after(retry_after_header),
+                    retry_after: parse_retry_after(retry_after_header, now),
                 }
             } else {
                 Disposition::RateLimitedNoCache
@@ -351,6 +364,7 @@ impl FeedFetcher for Url {
             body,
             cached.is_some(),
             retry_after.as_deref(),
+            now,
         );
         let feed_str = apply_disposition(self, cache, now, disposition)?;
         parse_feed(self, &feed_str)
@@ -435,20 +449,23 @@ mod tests {
     #[hegel::test]
     fn parse_retry_after_never_panics(tc: hegel::TestCase) {
         let header = tc.draw(generators::optional(generators::text()));
-        let _ = logic::parse_retry_after(header.as_deref());
+        let now = tc.draw(jiff_gs::timestamps());
+        let _ = logic::parse_retry_after(header.as_deref(), now);
     }
 
     // An integer header yields that many seconds, clamped to jiff's span range.
     #[hegel::test]
     fn parse_retry_after_clamps_integer_seconds(tc: hegel::TestCase) {
         let secs = tc.draw(generators::integers::<i64>());
-        let span = logic::parse_retry_after(Some(&secs.to_string()));
+        let now = tc.draw(jiff_gs::timestamps());
+        let span = logic::parse_retry_after(Some(&secs.to_string()), now);
         assert_eq!(span.get_seconds(), secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC));
     }
 
-    // Anything that is not an integer count of seconds falls back to 4 hours.
+    // Anything that is neither delta-seconds nor an HTTP-date falls back to
+    // 4 hours.
     #[hegel::test]
-    fn parse_retry_after_defaults_when_not_seconds(tc: hegel::TestCase) {
+    fn parse_retry_after_defaults_when_unparseable(tc: hegel::TestCase) {
         let header = tc.draw(generators::optional(generators::text()));
         tc.assume(
             header
@@ -456,8 +473,50 @@ mod tests {
                 .and_then(|s| s.parse::<i64>().ok())
                 .is_none(),
         );
-        let span = logic::parse_retry_after(header.as_deref());
+        tc.assume(
+            header
+                .as_deref()
+                .is_none_or(|s| jiff::fmt::rfc2822::parse(s).is_err()),
+        );
+        let now = tc.draw(jiff_gs::timestamps());
+        let span = logic::parse_retry_after(header.as_deref(), now);
         assert_eq!(span.fieldwise(), 4.hours().fieldwise());
+    }
+
+    // The IMF-fixdate form servers actually send, GMT zone and all.
+    #[test]
+    fn parse_retry_after_accepts_imf_fixdate() {
+        let now: Timestamp = "2003-06-10T04:00:00Z".parse().unwrap();
+        let span = logic::parse_retry_after(Some("Tue, 10 Jun 2003 05:00:00 GMT"), now);
+        assert_eq!(span.get_seconds(), 3600);
+    }
+
+    // A date-form header yields exactly the seconds between now and the date,
+    // round-tripping through jiff's RFC 2822 printer. Past dates go negative.
+    #[hegel::test]
+    fn parse_retry_after_handles_http_dates(tc: hegel::TestCase) {
+        // Bounded integers rather than jiff_gs::timestamps(): RFC 2822 only
+        // prints four-digit positive years, so the native generator's full
+        // ±9999y range would reject about half its draws, and constructing
+        // the printable domain directly also gives an exact integer oracle.
+        let date_secs = tc.draw(
+            generators::integers::<i64>()
+                .min_value(0)
+                .max_value(GATE_SECONDS_MAX),
+        );
+        let now_secs = tc.draw(
+            generators::integers::<i64>()
+                .min_value(0)
+                .max_value(GATE_SECONDS_MAX),
+        );
+        let date = Timestamp::from_second(date_secs)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let header = jiff::fmt::rfc2822::to_string(&date).unwrap();
+
+        let span =
+            logic::parse_retry_after(Some(&header), Timestamp::from_second(now_secs).unwrap());
+        assert_eq!(span.get_seconds(), date_secs - now_secs);
     }
 
     // The gate is open exactly when the retry deadline is still in the future.
@@ -554,6 +613,7 @@ mod tests {
             .draw(generators::optional(generators::text()))
             .map(String::into_bytes);
         let had_cache_entry = tc.draw(generators::booleans());
+        let now = tc.draw(jiff_gs::timestamps());
 
         let disp = logic::disposition(
             status,
@@ -562,6 +622,7 @@ mod tests {
             body.clone(),
             had_cache_entry,
             None,
+            now,
         );
         let logic::Disposition::Store {
             etag: e,
@@ -583,6 +644,7 @@ mod tests {
             .draw(generators::optional(generators::text()))
             .map(String::into_bytes);
         let had_cache_entry = tc.draw(generators::booleans());
+        let now = tc.draw(jiff_gs::timestamps());
         let disp = logic::disposition(
             StatusCode::NOT_MODIFIED,
             None,
@@ -590,6 +652,7 @@ mod tests {
             body.clone(),
             had_cache_entry,
             None,
+            now,
         );
         if had_cache_entry {
             assert!(matches!(disp, logic::Disposition::Reuse));
@@ -607,6 +670,7 @@ mod tests {
     fn disposition_too_many_requests_depends_on_cache(tc: hegel::TestCase) {
         let retry_after = tc.draw(generators::optional(generators::text()));
         let had_cache_entry = tc.draw(generators::booleans());
+        let now = tc.draw(jiff_gs::timestamps());
         let disp = logic::disposition(
             StatusCode::TOO_MANY_REQUESTS,
             None,
@@ -614,6 +678,7 @@ mod tests {
             None,
             had_cache_entry,
             retry_after.as_deref(),
+            now,
         );
         if had_cache_entry {
             let logic::Disposition::RateLimited { retry_after: span } = disp else {
@@ -621,7 +686,7 @@ mod tests {
             };
             assert_eq!(
                 span.fieldwise(),
-                logic::parse_retry_after(retry_after.as_deref()).fieldwise()
+                logic::parse_retry_after(retry_after.as_deref(), now).fieldwise()
             );
         } else {
             assert!(matches!(disp, logic::Disposition::RateLimitedNoCache));
@@ -636,8 +701,9 @@ mod tests {
         tc.assume(!(200..=299).contains(&code) && code != 304 && code != 429);
         let status = StatusCode::from_u16(code).expect("100..=599 is valid");
         let had_cache_entry = tc.draw(generators::booleans());
+        let now = tc.draw(jiff_gs::timestamps());
 
-        let disp = logic::disposition(status, None, None, None, had_cache_entry, None);
+        let disp = logic::disposition(status, None, None, None, had_cache_entry, None, now);
         let logic::Disposition::Unexpected { status: s } = disp else {
             panic!("expected Unexpected, got {disp:?}");
         };
@@ -947,6 +1013,45 @@ mod tests {
             received[0].headers.get("user-agent").unwrap(),
             concat!(crate_name!(), '/', crate_version!())
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_with_http_date_records_window() {
+        let server = MockServer::start().await;
+        // RFC 9110 allows Retry-After to be an HTTP-date as well as seconds.
+        let date = (Timestamp::now() + 600.seconds()).to_zoned(jiff::tz::TimeZone::UTC);
+        let header = jiff::fmt::rfc2822::to_string(&date).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", header.as_str()))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        cache.insert(
+            url.clone(),
+            CacheValue {
+                timestamp: Timestamp::now(),
+                retry_after: None,
+                last_modified: None,
+                etag: None,
+                body: Some(get_valid_rss_feed("rate-limited").into_bytes()),
+            },
+        );
+
+        url.fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("served cache on 429");
+        // The recorded window is the time until the given date, allowing for
+        // the seconds the test itself takes, not the 4h unparseable default.
+        let secs = cache
+            .get(&url)
+            .expect("entry present")
+            .retry_after
+            .expect("window recorded")
+            .get_seconds();
+        assert!((540..=600).contains(&secs), "recorded window: {secs}s");
     }
 
     #[tokio::test]
