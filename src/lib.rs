@@ -211,9 +211,11 @@ fn write_output(mut w: impl Write, output: &str) -> Result<()> {
 
 /// Build the sorted, truncated list of articles to render from the fetched feeds.
 ///
-/// `per_source` caps how many entries each feed contributes, `before` drops
-/// anything published at or after that date (interpreted in the system
-/// timezone), and `num_articles` caps the final newest-first list.
+/// Each feed contributes its `per_source` most recent qualifying entries,
+/// judged by publication date rather than the order the feed lists them in.
+/// `before` drops anything published after that date (interpreted in the
+/// system timezone) before the cap applies, and `num_articles` caps the final
+/// newest-first list.
 fn select_articles(
     feeds: Vec<(Feed, Url)>,
     per_source: usize,
@@ -224,15 +226,19 @@ fn select_articles(
     for (feed, url) in feeds {
         let source_title = resolve_source_title(&feed, &url);
         let source_link = resolve_source_link(&feed, &url)?;
-        for entry in feed.entries.iter().take(per_source) {
+        let mut from_feed = Vec::new();
+        for entry in &feed.entries {
             if let Some(article) = build_article(entry, &url, &source_title, &source_link, before)?
             {
-                articles.push(article);
+                from_feed.push(article);
             }
         }
+        from_feed.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
+        from_feed.truncate(per_source);
+        articles.append(&mut from_feed);
     }
 
-    articles.sort_unstable_by(|a, b| a.timestamp.cmp(&b.timestamp).reverse());
+    articles.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
     articles.truncate(num_articles);
     Ok(articles)
 }
@@ -941,10 +947,72 @@ mod tests {
             ),
         )];
 
-        // per_source = 1 keeps only the first entry in document order.
+        // per_source = 1 keeps only the most recent entry.
         let articles = select_articles(feeds, 1, 10, None).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Newest");
+    }
+
+    #[test]
+    fn select_articles_picks_most_recent_per_source_regardless_of_feed_order() {
+        // Entries listed oldest-first: per_source must still pick by date,
+        // not document order. Nothing in RSS/Atom promises newest-first.
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r#"<entry>
+                    <title>Oldest</title>
+                    <link href="https://example.com/1"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>
+                <entry>
+                    <title>Middle</title>
+                    <link href="https://example.com/2"/>
+                    <published>2021-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>
+                <entry>
+                    <title>Newest</title>
+                    <link href="https://example.com/3"/>
+                    <published>2022-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>"#,
+            ),
+        )];
+
+        let articles = select_articles(feeds, 1, 10, None).unwrap();
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0].title, "Newest");
+    }
+
+    #[test]
+    fn select_articles_per_source_counts_only_qualifying_entries() {
+        use jiff::civil::date;
+
+        // The newest entry falls after --before; it must not use up the
+        // per-source budget and shadow the older entry that qualifies.
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r#"<entry>
+                    <title>New</title>
+                    <link href="https://example.com/new"/>
+                    <published>2024-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>
+                <entry>
+                    <title>Old</title>
+                    <link href="https://example.com/old"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>"#,
+            ),
+        )];
+
+        let articles = select_articles(feeds, 1, 10, Some(date(2022, 1, 1))).unwrap();
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0].title, "Old");
     }
 
     #[test]
