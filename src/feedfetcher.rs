@@ -82,7 +82,15 @@ pub(crate) mod logic {
     /// caller should serve from cache instead of issuing a request.
     pub(crate) fn retry_after_gate_open(cv: &CacheValue, now: Timestamp) -> bool {
         cv.retry_after
-            .is_some_and(|retry| cv.timestamp + retry > now)
+            .is_some_and(|retry| match cv.timestamp.checked_add(retry) {
+                Ok(deadline) => deadline > now,
+                // The cache file is user-editable JSON, so the deadline can
+                // overflow jiff's range or the span can carry calendar units
+                // that need a relative date. Fall back to the span's sign: a
+                // positive span puts the deadline in the far future (gate
+                // open), a negative one in the far past (closed).
+                Err(_) => retry.signum() > 0,
+            })
     }
 
     /// The conditional-request headers implied by a cached entry, if any.
@@ -423,6 +431,27 @@ mod tests {
             logic::retry_after_gate_open(&cv, now),
             now_secs < deadline_secs
         );
+    }
+
+    // The gate must answer, never panic, for any entry a cache file can hold:
+    // the file is user-editable JSON, so timestamp + retry may overflow jiff's
+    // range or carry calendar units that cannot be added to a timestamp. The
+    // explicit boundary branches make the overflowing corner reachable.
+    #[hegel::test]
+    fn gate_never_panics_for_any_cache_value(tc: hegel::TestCase) {
+        let mut cv = tc.draw(cache_values());
+        cv.timestamp = tc.draw(hegel::one_of!(
+            jiff_gs::timestamps(),
+            generators::just(Timestamp::MAX),
+            generators::just(Timestamp::MIN),
+        ));
+        cv.retry_after = tc.draw(generators::optional(hegel::one_of!(
+            jiff_gs::spans(),
+            generators::just(MAX_SPAN_SEC.seconds()),
+            generators::just(Span::new().years(1)),
+        )));
+        let now = tc.draw(jiff_gs::timestamps());
+        let _ = logic::retry_after_gate_open(&cv, now);
     }
 
     // Without a retry_after window the gate is always closed.
