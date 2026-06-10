@@ -87,6 +87,17 @@ fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
 // Skips feeds if there are errors. Shows progress. Errors only when the
 // shared HTTP client cannot be built at all.
 async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
+    // The progress bar's message lists the fetches still in flight.
+    fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
+        pb.set_message(
+            pending
+                .iter()
+                .map(|u| u.as_str())
+                .collect::<Vec<&str>>()
+                .join(", "),
+        );
+    }
+
     // One client for the whole run, so every fetch shares a connection pool
     // instead of paying for TLS setup per feed.
     let client = feedfetcher::build_client()?;
@@ -100,13 +111,7 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
     let mut join_set = JoinSet::new();
     let mut pending_urls: HashSet<&Url> = HashSet::from_iter(urls);
 
-    pb.set_message(
-        pending_urls
-            .iter()
-            .map(|u| u.as_str())
-            .collect::<Vec<&str>>()
-            .join(", "),
-    );
+    show_pending(&pb, &pending_urls);
 
     for url in urls {
         let cache_clone = Arc::clone(cache);
@@ -125,28 +130,25 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
         match result {
             Ok((url, Ok(feed))) => {
                 pending_urls.remove(&url);
-                pb.set_message(
-                    pending_urls
-                        .iter()
-                        .map(|u| u.as_str())
-                        .collect::<Vec<&str>>()
-                        .join(", "),
-                );
+                show_pending(&pb, &pending_urls);
                 pb.println(format!("{:>8} {url}", "Fetched".bold().green()));
                 feeds.push((feed, url));
             }
             Ok((url, Err(e))) => {
                 pending_urls.remove(&url);
-                pb.set_message(
-                    pending_urls
-                        .iter()
-                        .map(|u| u.as_str())
-                        .collect::<Vec<&str>>()
-                        .join(", "),
-                );
+                show_pending(&pb, &pending_urls);
                 pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
             }
-            _ => (),
+            Err(e) => {
+                // A fetch task that panicked or was aborted. The URL is lost
+                // with the task, so it cannot be removed from the pending
+                // list, but the failure must not be silent.
+                warn!(error=%e, "feed fetch task failed");
+                pb.println(format!(
+                    "{:>8} fetch task failed ({e})",
+                    "Error".bold().red()
+                ));
+            }
         }
     }
 
