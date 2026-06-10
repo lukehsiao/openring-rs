@@ -94,11 +94,15 @@ pub(crate) mod logic {
     }
 
     /// The conditional-request headers implied by a cached entry, if any.
+    ///
+    /// An entry without a body sends none: a 304 answer would leave nothing
+    /// to serve, so the request must go out unconditional.
     pub(crate) fn conditional_headers(cv: Option<&CacheValue>) -> ConditionalHeaders {
-        cv.map_or_else(ConditionalHeaders::default, |cv| ConditionalHeaders {
-            if_modified_since: cv.last_modified.clone(),
-            if_none_match: cv.etag.clone(),
-        })
+        cv.filter(|cv| cv.body.is_some())
+            .map_or_else(ConditionalHeaders::default, |cv| ConditionalHeaders {
+                if_modified_since: cv.last_modified.clone(),
+                if_none_match: cv.etag.clone(),
+            })
     }
 
     /// Parse a `Retry-After` header into a `Span`, defaulting to 4 hours when it is
@@ -463,19 +467,18 @@ mod tests {
         assert!(!logic::retry_after_gate_open(&cv, now));
     }
 
-    // Conditional headers are exactly the cached etag and last-modified values.
+    // Conditional headers are exactly the cached etag and last-modified
+    // values when the entry has a body to serve, and absent otherwise.
     #[hegel::test]
     fn conditional_headers_project_cache_fields(tc: hegel::TestCase) {
         let cv = tc.draw(generators::optional(cache_values()));
         let headers = logic::conditional_headers(cv.as_ref());
+        let servable = cv.as_ref().filter(|c| c.body.is_some());
         assert_eq!(
             headers.if_modified_since,
-            cv.as_ref().and_then(|c| c.last_modified.clone())
+            servable.and_then(|c| c.last_modified.clone())
         );
-        assert_eq!(
-            headers.if_none_match,
-            cv.as_ref().and_then(|c| c.etag.clone())
-        );
+        assert_eq!(headers.if_none_match, servable.and_then(|c| c.etag.clone()));
     }
 
     // A 2xx response stores the response metadata and body verbatim.
@@ -664,6 +667,54 @@ mod tests {
             Some(normalize_etag(etag_raw).as_str())
         );
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+    }
+
+    #[tokio::test]
+    async fn refetches_unconditionally_when_cached_entry_has_no_body() {
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        let etag = normalize_etag("abc123");
+        // A conditional request gets 304; only an unconditional one gets the
+        // feed. With a bodyless cache entry, a 304 leaves nothing to serve,
+        // so the fetch must go out unconditional.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(header("if-none-match", etag.as_str()))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("fresh")))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        // What a 200 whose body read failed leaves behind: metadata, no body.
+        cache.insert(
+            url.clone(),
+            CacheValue {
+                timestamp: Timestamp::now(),
+                retry_after: None,
+                last_modified: None,
+                etag: Some(etag),
+                body: None,
+            },
+        );
+
+        let feed = url
+            .fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("refetched the feed instead of erroring on 304");
+        assert!(
+            feed.title
+                .as_ref()
+                .is_some_and(|t| t.content.contains("fresh"))
+        );
+        // The fresh body must now be cached for the next run.
+        assert!(cache.get(&url).expect("entry present").body.is_some());
     }
 
     #[tokio::test]
