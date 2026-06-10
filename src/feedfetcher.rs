@@ -74,8 +74,13 @@ pub(crate) mod logic {
             last_modified: Option<String>,
             body: Option<Vec<u8>>,
         },
-        /// 304 with an existing entry: keep the cached body and metadata.
-        Reuse,
+        /// 304 with an existing entry: keep the cached body, refreshing the
+        /// validators with any the response carried (RFC 7232 allows a 304 to
+        /// rotate them).
+        Reuse {
+            etag: Option<String>,
+            last_modified: Option<String>,
+        },
         /// 429 with an existing entry: record the retry window and serve cache.
         RateLimited { retry_after: Span },
         /// 429 with no cached entry: there is nothing to serve.
@@ -146,7 +151,10 @@ pub(crate) mod logic {
         now: Timestamp,
     ) -> Disposition {
         if status == StatusCode::NOT_MODIFIED && had_cache_entry {
-            Disposition::Reuse
+            Disposition::Reuse {
+                etag: etag.map(ToString::to_string),
+                last_modified: last_modified.map(ToString::to_string),
+            }
         } else if status.is_success() || status == StatusCode::NOT_MODIFIED {
             // A 2xx, or a 304 with no prior entry, stores the response. An
             // empty body counts as no body: caching it as servable would make
@@ -251,10 +259,20 @@ fn apply_disposition(
             }
             body.ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string()))
         }
-        logic::Disposition::Reuse => cache
+        logic::Disposition::Reuse {
+            etag,
+            last_modified,
+        } => cache
             .get_mut(url)
             .and_then(|mut cv| {
                 cv.timestamp = now;
+                // Absent headers leave the stored validators untouched.
+                if etag.is_some() {
+                    cv.etag = etag;
+                }
+                if last_modified.is_some() {
+                    cv.last_modified = last_modified;
+                }
                 cv.body.clone()
             })
             .ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string())),
@@ -637,9 +655,12 @@ mod tests {
         assert_eq!(b, body.filter(|s| !s.is_empty()));
     }
 
-    // A 304 with a cache entry reuses it; with no entry it stores the response.
+    // A 304 with a cache entry reuses it, carrying any rotated validators;
+    // with no entry it stores the response.
     #[hegel::test]
     fn disposition_not_modified_depends_on_cache(tc: hegel::TestCase) {
+        let etag = tc.draw(generators::optional(generators::text()));
+        let last_modified = tc.draw(generators::optional(generators::text()));
         let body = tc
             .draw(generators::optional(generators::text()))
             .map(String::into_bytes);
@@ -647,15 +668,23 @@ mod tests {
         let now = tc.draw(jiff_gs::timestamps());
         let disp = logic::disposition(
             StatusCode::NOT_MODIFIED,
-            None,
-            None,
+            etag.as_deref(),
+            last_modified.as_deref(),
             body.clone(),
             had_cache_entry,
             None,
             now,
         );
         if had_cache_entry {
-            assert!(matches!(disp, logic::Disposition::Reuse));
+            let logic::Disposition::Reuse {
+                etag: e,
+                last_modified: lm,
+            } = disp
+            else {
+                panic!("expected Reuse, got {disp:?}");
+            };
+            assert_eq!(e, etag);
+            assert_eq!(lm, last_modified);
         } else {
             let logic::Disposition::Store { body: b, .. } = disp else {
                 panic!("expected Store, got {disp:?}");
@@ -761,6 +790,45 @@ mod tests {
                 .to_str()
                 .unwrap(),
             last_modified
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshes_validators_from_304_headers() {
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        let old_etag = normalize_etag("old");
+        let new_etag = normalize_etag("new");
+        // RFC 7232 allows a 304 to rotate the validators it confirms.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(header("if-none-match", old_etag.as_str()))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", new_etag.as_str()))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        cache.insert(
+            url.clone(),
+            CacheValue {
+                timestamp: Timestamp::now(),
+                retry_after: None,
+                last_modified: None,
+                etag: Some(old_etag),
+                body: Some(get_valid_rss_feed("cached").into_bytes()),
+            },
+        );
+
+        url.fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("served cache on 304");
+        // The next run must validate against the rotated etag, or the server
+        // will answer with a full 200 every time.
+        assert_eq!(
+            cache.get(&url).expect("entry present").etag.as_deref(),
+            Some(new_etag.as_str())
         );
     }
 
