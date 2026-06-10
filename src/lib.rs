@@ -307,11 +307,24 @@ fn raw_summary(entry: &Entry) -> Option<&str> {
         .or_else(|| entry.content.as_ref().and_then(|c| c.body.as_deref()))
 }
 
-/// Strip unsafe markup and decode HTML entities, returning trimmed text.
+/// Decode HTML entities, then strip unsafe markup, returning trimmed HTML
+/// that is safe to embed even through the template's `| safe` filter.
+///
+/// Decoding must come first: cleaning and then decoding would turn harmless
+/// entity-encoded text like `&lt;script&gt;` back into live markup.
 fn sanitize_html(raw: &str) -> String {
-    let mut safe = String::new();
-    html_escape::decode_html_entities_to_string(ammonia::clean(raw), &mut safe);
-    safe.trim().to_string()
+    let decoded = html_escape::decode_html_entities(raw);
+    ammonia::clean(&decoded).trim().to_string()
+}
+
+/// Reduce feed-supplied text like titles to plain text: entities decoded,
+/// every tag stripped, script/style bodies dropped, and the remaining text
+/// kept entity-escaped so it is safe to embed in HTML.
+fn sanitize_text(raw: &str) -> String {
+    let decoded = html_escape::decode_html_entities(raw);
+    let mut builder = ammonia::Builder::empty();
+    builder.clean_content_tags(["script", "style"].into_iter().collect());
+    builder.clean(&decoded).to_string().trim().to_string()
 }
 
 /// Build a renderable [`Article`] from a feed entry.
@@ -359,10 +372,12 @@ fn build_article(
 
     Ok(Some(Article {
         link,
-        title: title.clone(),
+        // Titles are feed-controlled and the default template embeds them
+        // with `| safe`, so they get the same boundary treatment as summaries.
+        title: sanitize_text(title),
         summary,
         source_link: source_link.clone(),
-        source_title: source_title.to_owned(),
+        source_title: sanitize_text(source_title),
         timestamp,
     }))
 }
@@ -762,13 +777,61 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_html_strips_scripts_decodes_entities_and_trims() {
+    fn sanitize_html_strips_scripts_keeps_text_and_trims() {
         let out = sanitize_html("  <p>Safe</p><script>alert(1)</script> Tom &amp; Jerry  ");
-        // ammonia removes the <script>; html_escape decodes &amp; back to '&'.
+        // ammonia removes the <script> and keeps text entity-escaped, so the
+        // result stays safe even through the template's `| safe` filter.
         assert!(!out.contains("script"));
         assert!(out.contains("Safe"));
-        assert!(out.contains("Tom & Jerry"));
+        assert!(out.contains("Tom &amp; Jerry"));
         assert_eq!(out, out.trim());
+    }
+
+    // No input, however it encodes its markup, may come out of sanitization
+    // with a live <script> tag. Decoding entities after cleaning used to turn
+    // harmless text like "&lt;script&gt;" back into real markup, which the
+    // default template then embedded raw via `| safe`.
+    #[hegel::test]
+    fn sanitize_html_never_emits_live_markup(tc: hegel::TestCase) {
+        let payload = tc.draw(hegel::one_of!(
+            generators::just("<script>alert(1)</script>".to_string()),
+            generators::just("&lt;script&gt;alert(1)&lt;/script&gt;".to_string()),
+            generators::just("&amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt;".to_string()),
+            generators::text(),
+        ));
+        let prefix = tc.draw(generators::text().max_size(16));
+        let suffix = tc.draw(generators::text().max_size(16));
+        let out = sanitize_html(&format!("{prefix}{payload}{suffix}"));
+        assert!(
+            !out.to_lowercase().contains("<script"),
+            "live script tag in sanitized output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn build_article_sanitizes_title_and_source_title() {
+        let source_link = Url::parse("https://example.com/").unwrap();
+        // The XML parser decodes the entities, so the in-memory title holds
+        // real <script> markup, exactly as a hostile feed would deliver it.
+        let entry = first_entry(
+            r#"<entry>
+                <title>&lt;script&gt;alert(1)&lt;/script&gt;Hello</title>
+                <link href="https://example.com/x"/>
+                <published>2020-01-01T00:00:00Z</published>
+                <summary>s</summary>
+            </entry>"#,
+        );
+        let article = build_article(
+            &entry,
+            &feed_url(),
+            "<script>evil()</script>Src",
+            &source_link,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(article.title, "Hello");
+        assert_eq!(article.source_title, "Src");
     }
 
     #[test]
