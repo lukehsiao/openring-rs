@@ -281,20 +281,15 @@ fn resolve_source_link(feed: &Feed, feed_url: &Url) -> Result<Url> {
     Ok(feed_url.clone())
 }
 
-/// The best link for an entry, resolved against the feed origin.
+/// The best link for an entry, resolved against the feed URL.
 ///
 /// Prefers an `alternate` link, falling back to the first link present.
-/// Returns `Ok(None)` when a link exists but cannot be parsed (the entry is
-/// then skipped); errors only when the entry has no links at all.
-fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Result<Option<Url>> {
-    let href = match find_alternate_link(&entry.links) {
-        Some(href) => href,
-        None => match entry.links.first() {
-            Some(link) => link.href.as_str(),
-            None => return Err(OpenringError::FeedBadTitle(feed_url.to_string())),
-        },
-    };
-    Ok(resolve_href(feed_url, href).ok())
+/// `None` when the entry has no links or the href cannot be parsed; the
+/// caller skips such entries like any other incomplete entry.
+fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Option<Url> {
+    let href = find_alternate_link(&entry.links)
+        .or_else(|| entry.links.first().map(|link| link.href.as_str()))?;
+    resolve_href(feed_url, href).ok()
 }
 
 /// The entry's summary text, preferring an explicit `<summary>` and falling back
@@ -330,8 +325,8 @@ fn sanitize_text(raw: &str) -> String {
 /// Build a renderable [`Article`] from a feed entry.
 ///
 /// Returns `Ok(None)` when the entry lacks a usable link, title, or date, or
-/// when it falls at or after `before`. Errors only when the entry has no links
-/// or its date is out of representable range.
+/// when it falls at or after `before`. Errors only when the entry's date is
+/// out of representable range.
 fn build_article(
     entry: &Entry,
     feed_url: &Url,
@@ -340,7 +335,7 @@ fn build_article(
     before: Option<Date>,
 ) -> Result<Option<Article>> {
     let (Some(link), Some(title), Some(date)) = (
-        resolve_entry_link(entry, feed_url)?,
+        resolve_entry_link(entry, feed_url),
         entry.title.as_ref().map(|t| &t.content),
         entry.published.or(entry.updated),
     ) else {
@@ -691,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_entry_link_resolves_relative_and_errors_without_links() {
+    fn resolve_entry_link_resolves_relative_and_skips_linkless() {
         // An absolute link is returned unchanged.
         let abs = first_entry(
             r#"<entry>
@@ -701,10 +696,7 @@ mod tests {
             </entry>"#,
         );
         assert_eq!(
-            resolve_entry_link(&abs, &feed_url())
-                .unwrap()
-                .unwrap()
-                .as_str(),
+            resolve_entry_link(&abs, &feed_url()).unwrap().as_str(),
             "https://other.example/abs"
         );
 
@@ -717,24 +709,18 @@ mod tests {
             </entry>"#,
         );
         assert_eq!(
-            resolve_entry_link(&rel, &feed_url())
-                .unwrap()
-                .unwrap()
-                .as_str(),
+            resolve_entry_link(&rel, &feed_url()).unwrap().as_str(),
             "https://example.com/rel-path"
         );
 
-        // An entry with no links at all is a hard error.
+        // An entry with no links has no resolvable link; the caller skips it.
         let none = first_entry(
             r"<entry>
                 <title>t</title>
                 <published>2020-01-01T00:00:00Z</published>
             </entry>",
         );
-        assert!(matches!(
-            resolve_entry_link(&none, &feed_url()),
-            Err(crate::error::OpenringError::FeedBadTitle(_))
-        ));
+        assert_eq!(resolve_entry_link(&none, &feed_url()), None);
     }
 
     #[test]
@@ -901,6 +887,32 @@ mod tests {
         assert_eq!(a.summary, "Hello world");
         assert_eq!(a.source_title, "Example Blog");
         assert_eq!(a.source_link.as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn select_articles_skips_malformed_entries_instead_of_aborting() {
+        // One linkless entry in one feed must not take down the whole run;
+        // it is skipped exactly like entries missing a title or date.
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r#"<entry>
+                    <title>No Link</title>
+                    <published>2021-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>
+                <entry>
+                    <title>Good</title>
+                    <link href="https://example.com/good"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>"#,
+            ),
+        )];
+
+        let articles = select_articles(feeds, 10, 10, None).unwrap();
+        assert_eq!(articles.len(), 1);
+        assert_eq!(articles[0].title, "Good");
     }
 
     #[test]

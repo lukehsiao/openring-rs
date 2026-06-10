@@ -13,9 +13,6 @@ pub enum OpenringError {
     DateError,
     #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
     FeedMissing,
-    #[error("The feed at `{0}` has a bad a title (e.g., missing link or title).")]
-    #[diagnostic(code(openring::feed_title_error))]
-    FeedBadTitle(String),
     #[error("Failed to parse civil date.")]
     CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
