@@ -248,14 +248,22 @@ fn select_articles(
                 from_feed.push(article);
             }
         }
-        from_feed.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
+        from_feed.sort_unstable_by(article_order);
         from_feed.truncate(per_source);
         articles.append(&mut from_feed);
     }
 
-    articles.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
+    articles.sort_unstable_by(article_order);
     articles.truncate(num_articles);
     Ok(articles)
+}
+
+/// Newest first, with ties broken by link so the output is identical no
+/// matter what order the feeds finished fetching in.
+fn article_order(a: &Article, b: &Article) -> std::cmp::Ordering {
+    b.timestamp
+        .cmp(&a.timestamp)
+        .then_with(|| a.link.cmp(&b.link))
 }
 
 /// The href of the first link explicitly tagged `rel="alternate"`, if any.
@@ -1116,6 +1124,35 @@ mod tests {
         assert_eq!(articles[0].title, "Newest");
         assert_eq!(articles[1].title, "Middle");
         assert!(articles[0].timestamp > articles[1].timestamp);
+    }
+
+    #[test]
+    fn select_articles_orders_ties_deterministically() {
+        // Feeds arrive in fetch-completion order, which varies run to run.
+        // Articles with identical timestamps must still come out in the same
+        // order, or downstream static sites churn on every regeneration.
+        let entry_a = r#"<entry>
+            <title>A</title>
+            <link href="https://a.example/post"/>
+            <published>2022-01-01T00:00:00Z</published>
+            <summary>x</summary>
+        </entry>"#;
+        let entry_b = r#"<entry>
+            <title>B</title>
+            <link href="https://b.example/post"/>
+            <published>2022-01-01T00:00:00Z</published>
+            <summary>x</summary>
+        </entry>"#;
+        let feed_a = || feed("https://a.example/feed.xml", &atom(entry_a));
+        let feed_b = || feed("https://b.example/feed.xml", &atom(entry_b));
+
+        let one = select_articles(vec![feed_a(), feed_b()], 10, 10, None).unwrap();
+        let two = select_articles(vec![feed_b(), feed_a()], 10, 10, None).unwrap();
+
+        let titles = |articles: &[super::Article]| {
+            articles.iter().map(|a| a.title.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(titles(&one), titles(&two));
     }
 
     #[test]
