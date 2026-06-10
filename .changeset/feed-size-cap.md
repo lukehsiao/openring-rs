@@ -1,0 +1,8 @@
+---
+"openring": patch
+---
+
+**fix**: reject feeds larger than 64 MiB instead of buffering them.
+
+A urls-file mistake pointing at a video or other huge file used to be downloaded in full into memory and then written into the cache file.
+Responses declaring a Content-Length over 64 MiB are now rejected up front with a clear "feed is too large" error; even full-content feeds run single-digit MiB.

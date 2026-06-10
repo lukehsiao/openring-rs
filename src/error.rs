@@ -23,6 +23,9 @@ pub enum OpenringError {
     #[error("The feed at `{0}` was empty.")]
     #[diagnostic(code(openring::empty_feed_error))]
     EmptyFeedError(String),
+    #[error("The feed at `{url}` is too large ({bytes} bytes).")]
+    #[diagnostic(code(openring::feed_too_large_error))]
+    FeedTooLargeError { url: String, bytes: u64 },
     #[error("The request feed at `{0}` was rate limited (HTTP 429).")]
     #[diagnostic(code(openring::rate_limit_error))]
     RateLimitError(String),

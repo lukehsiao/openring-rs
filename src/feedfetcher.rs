@@ -19,6 +19,12 @@ pub(crate) trait FeedFetcher {
     async fn fetch_feed(&self, client: &Client, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
 }
 
+/// The largest response body accepted as a feed. Even full-content,
+/// full-history feeds run single-digit MiB; anything bigger is almost
+/// certainly a urls-file mistake pointing at media, and buffering it would
+/// balloon memory and the on-disk cache.
+const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Build the HTTP client shared by every feed fetch: one connection pool and
 /// one TLS setup for the whole run, a 30s timeout, and the openring
 /// user agent.
@@ -264,6 +270,18 @@ impl FeedFetcher for Url {
             }
         };
         debug!(url=%self, response=?resp, "received response");
+
+        // Reject grossly oversized responses before buffering them. Responses
+        // that arrive compressed or chunked report no length and are bounded
+        // by the request timeout instead.
+        if let Some(bytes) = resp.content_length()
+            && bytes > MAX_FEED_BYTES
+        {
+            return Err(OpenringError::FeedTooLargeError {
+                url: self.as_str().to_string(),
+                bytes,
+            });
+        }
 
         // Pull the plain values the decision logic needs out of the response before
         // `text()` consumes it. The etag is normalized at this boundary.
@@ -671,6 +689,28 @@ mod tests {
             Some(normalize_etag(etag_raw).as_str())
         );
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+    }
+
+    #[tokio::test]
+    async fn oversized_feeds_are_rejected_without_buffering() {
+        let server = MockServer::start().await;
+        // A valid feed padded past the size limit, standing in for a urls-file
+        // typo that points at a video or other huge file.
+        let padding = format!("<!-- {} -->", "x".repeat(65 * 1024 * 1024));
+        let body =
+            get_valid_rss_feed("huge").replace("</channel>", &format!("{padding}</channel>"));
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        let res = url.fetch_feed(&build_client().unwrap(), &cache).await;
+        assert!(matches!(res, Err(OpenringError::FeedTooLargeError { .. })));
+        // Nothing that big belongs in the cache either.
+        assert!(!cache.contains_key(&url));
     }
 
     #[tokio::test]
