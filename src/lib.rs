@@ -39,24 +39,15 @@ pub struct Article {
     timestamp: Timestamp,
 }
 
-/// Resolve a possibly-relative URL `href` against the feed’s base `feed_url`.
-/// Expects `href` to have a leading `/`.
+/// Resolve a possibly-relative URL `href` against the URL of the feed it came
+/// from, following RFC 3986: absolute hrefs stand alone, root-relative hrefs
+/// resolve against the feed's origin, and path-relative or protocol-relative
+/// hrefs resolve against the feed URL itself.
 pub(crate) fn resolve_href(
     feed_url: &Url,
     href: &str,
 ) -> std::result::Result<Url, url::ParseError> {
-    match Url::parse(href) {
-        Ok(u) => Ok(u),
-        Err(url::ParseError::RelativeUrlWithoutBase) => {
-            // Prepend the origin (scheme + authority) of the feed URL.
-            Url::parse(&format!(
-                "{}{}",
-                feed_url.origin().ascii_serialization(),
-                href
-            ))
-        }
-        Err(e) => Err(e),
-    }
+    feed_url.join(href)
 }
 
 /// Parse the file into a vector of URLs.
@@ -436,7 +427,10 @@ mod tests {
             generators::from_regex(r"(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}").fullmatch(true),
         );
         let port = tc.draw(generators::integers::<u16>().min_value(80).max_value(65535));
-        let rel_path = tc.draw(generators::from_regex(r"/[a-zA-Z0-9_/-]{1,30}").fullmatch(true));
+        // A second leading '/' would make the href protocol-relative, which
+        // names its own host and is covered by its own test below.
+        let rel_path =
+            tc.draw(generators::from_regex(r"/[a-zA-Z0-9_-][a-zA-Z0-9_/-]{0,29}").fullmatch(true));
 
         let base_str = format!("{scheme}://{host}:{port}");
         let base_url = Url::parse(&base_str);
@@ -495,6 +489,31 @@ mod tests {
             parse_urls_from_file(tmp.path()),
             Err(crate::error::OpenringError::FeedUrlError(_))
         ));
+    }
+
+    // Path-relative hrefs (no leading '/') resolve against the feed URL's
+    // directory, never by string-concatenating onto the origin, which used to
+    // produce mangled hosts like `https://example.compage.html`.
+    #[hegel::test]
+    fn resolve_href_resolves_path_relative_hrefs(tc: hegel::TestCase) {
+        let dir = tc.draw(generators::from_regex(r"(/[a-z0-9]{1,8}){0,3}/").fullmatch(true));
+        let rel =
+            tc.draw(generators::from_regex(r"[a-z0-9]{1,8}(/[a-z0-9]{1,8}){0,2}").fullmatch(true));
+        let base = Url::parse(&format!("https://example.com{dir}feed.xml")).unwrap();
+        let resolved = resolve_href(&base, &rel).unwrap();
+        assert_eq!(resolved.origin(), base.origin());
+        assert_eq!(resolved.path(), format!("{dir}{rel}"));
+    }
+
+    #[test]
+    fn resolve_href_handles_protocol_relative_hrefs() {
+        let base = Url::parse("https://example.com/feed.xml").unwrap();
+        // A protocol-relative href names its own host; only the scheme comes
+        // from the feed URL.
+        assert_eq!(
+            resolve_href(&base, "//other.example/x").unwrap().as_str(),
+            "https://other.example/x"
+        );
     }
 
     #[test]
