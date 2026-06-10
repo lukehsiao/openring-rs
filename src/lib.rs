@@ -86,8 +86,13 @@ fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
 
 // Get all feeds from URLs concurrently.
 //
-// Skips feeds if there are errors. Shows progress.
-async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
+// Skips feeds if there are errors. Shows progress. Errors only when the
+// shared HTTP client cannot be built at all.
+async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
+    // One client for the whole run, so every fetch shares a connection pool
+    // instead of paying for TLS setup per feed.
+    let client = feedfetcher::build_client()?;
+
     let pb = ProgressBar::new(urls.len() as u64).with_style(
         ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
             .unwrap(),
@@ -107,9 +112,11 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
 
     for url in urls {
         let cache_clone = Arc::clone(cache);
+        // reqwest::Client is a cheap handle to the shared pool.
+        let client_clone = client.clone();
         let url_clone = url.clone();
         join_set.spawn(async move {
-            let fetch_result = url_clone.fetch_feed(&cache_clone).await;
+            let fetch_result = url_clone.fetch_feed(&client_clone, &cache_clone).await;
             (url_clone, fetch_result)
         });
     }
@@ -146,7 +153,7 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url
     }
 
     pb.finish_and_clear();
-    feeds
+    Ok(feeds)
 }
 
 /// Fetch every configured feed, render the most recent articles through the
@@ -179,7 +186,7 @@ pub async fn run(args: Args) -> Result<()> {
         unique.into_iter().collect()
     };
 
-    let feeds = get_feeds_from_urls(&urls, &cache).await;
+    let feeds = get_feeds_from_urls(&urls, &cache).await?;
 
     if let Some(cache_path) = cache::get_cache_path()
         && !args.no_cache

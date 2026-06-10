@@ -15,8 +15,18 @@ use crate::{
 };
 
 pub(crate) trait FeedFetcher {
-    /// Fetch a feed
-    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
+    /// Fetch a feed using the shared HTTP `client`.
+    async fn fetch_feed(&self, client: &Client, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
+}
+
+/// Build the HTTP client shared by every feed fetch: one connection pool and
+/// one TLS setup for the whole run, a 30s timeout, and the openring
+/// user agent.
+pub(crate) fn build_client() -> Result<Client, OpenringError> {
+    Ok(ClientBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!(crate_name!(), '/', crate_version!()))
+        .build()?)
 }
 
 /// Normalize an etag so it carries the literal double quotes HTTP requires.
@@ -200,15 +210,10 @@ fn apply_disposition(
 
 impl FeedFetcher for Url {
     /// Fetch a feed for a URL
-    async fn fetch_feed(&self, cache: &Arc<Cache>) -> Result<Feed, OpenringError> {
+    async fn fetch_feed(&self, client: &Client, cache: &Arc<Cache>) -> Result<Feed, OpenringError> {
         // Capture the clock once so every timestamp written during this call agrees
         // and so the decision logic can be exercised deterministically.
         let now = Timestamp::now();
-
-        let client: Client = ClientBuilder::new()
-            .timeout(Duration::from_secs(30))
-            .user_agent(concat!(crate_name!(), '/', crate_version!()))
-            .build()?;
 
         // Snapshot the entry by value so no DashMap guard is held across an await
         // point; concurrent fetches share the map through a JoinSet.
@@ -298,7 +303,7 @@ mod tests {
     use crate::cache::{Cache, CacheValue, MAX_SPAN_SEC};
     use crate::error::OpenringError;
 
-    use super::{FeedFetcher, logic, normalize_etag};
+    use super::{FeedFetcher, build_client, logic, normalize_etag};
 
     // Bounds for gate timestamps/spans. 50e9 seconds is ~1585 years past the
     // epoch; a timestamp plus a span stays under jiff's Timestamp::MAX, while
@@ -569,7 +574,10 @@ mod tests {
             },
         );
 
-        let feed = url.fetch_feed(&cache).await.expect("served cache on 304");
+        let feed = url
+            .fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("served cache on 304");
         assert!(
             feed.title
                 .as_ref()
@@ -611,7 +619,10 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
 
-        let feed = url.fetch_feed(&cache).await.expect("fetched fresh feed");
+        let feed = url
+            .fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("fetched fresh feed");
         assert!(
             feed.title
                 .as_ref()
@@ -648,7 +659,10 @@ mod tests {
             },
         );
 
-        let feed = url.fetch_feed(&cache).await.expect("served cache on 429");
+        let feed = url
+            .fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("served cache on 429");
         assert!(
             feed.title
                 .as_ref()
@@ -656,6 +670,30 @@ mod tests {
         );
         let entry = cache.get(&url).expect("entry present");
         assert_eq!(entry.retry_after.unwrap().get_seconds(), 120);
+    }
+
+    #[tokio::test]
+    async fn sends_openring_user_agent() {
+        use clap::{crate_name, crate_version};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("ua")))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        url.fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("fetched");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received[0].headers.get("user-agent").unwrap(),
+            concat!(crate_name!(), '/', crate_version!())
+        );
     }
 
     #[tokio::test]
@@ -669,7 +707,7 @@ mod tests {
 
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
-        let res = url.fetch_feed(&cache).await;
+        let res = url.fetch_feed(&build_client().unwrap(), &cache).await;
         assert!(matches!(
             res,
             Err(OpenringError::UnexpectedStatusError { .. })
