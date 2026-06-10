@@ -203,12 +203,10 @@ mod tests {
     // a larger cap mostly inflates per-case entropy and runtime.
     const MAX_TEST_ENTRIES: usize = 50;
 
-    // A well-formed http(s) URL, enough to act as a distinct cache key.
+    // A well-formed URL, enough to act as a distinct cache key.
     #[hegel::composite]
     fn urls(tc: hegel::TestCase) -> Url {
-        let s = tc.draw(
-            generators::from_regex(r"https?://[a-z]{1,10}\.[a-z]{2,5}/[a-z]{0,15}").fullmatch(true),
-        );
+        let s = tc.draw(generators::urls());
         Url::parse(&s).expect("generated string is a valid URL")
     }
 

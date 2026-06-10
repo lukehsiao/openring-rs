@@ -438,9 +438,7 @@ mod tests {
             generators::just("http".to_string()),
             generators::just("https".to_string())
         ));
-        let host = tc.draw(
-            generators::from_regex(r"(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}").fullmatch(true),
-        );
+        let host = tc.draw(generators::domains());
         let port = tc.draw(generators::integers::<u16>().min_value(80).max_value(65535));
         // A second leading '/' would make the href protocol-relative, which
         // names its own host and is covered by its own test below.
@@ -448,11 +446,7 @@ mod tests {
             tc.draw(generators::from_regex(r"/[a-zA-Z0-9_-][a-zA-Z0-9_/-]{0,29}").fullmatch(true));
 
         let base_str = format!("{scheme}://{host}:{port}");
-        let base_url = Url::parse(&base_str);
-
-        // The naive host regex can still emit invalid punycode; skip those inputs.
-        tc.assume(base_url.is_ok());
-        let base_url = base_url.unwrap();
+        let base_url = Url::parse(&base_str).expect("generated domain is a valid host");
 
         let absolute = format!("{base_str}/{rel_path}");
         let resolved_abs = resolve_href(&base_url, &absolute).unwrap();
@@ -627,15 +621,14 @@ mod tests {
     // fetched from, including IP-address hosts where `Url::domain()` is None.
     #[hegel::test]
     fn resolve_source_title_falls_back_for_any_http_host(tc: hegel::TestCase) {
+        use hegel::generators::Generator;
         let host = tc.draw(hegel::one_of!(
-            generators::from_regex(r"(?:[a-z0-9-]{1,10}\.)+[a-z]{2,6}").fullmatch(true),
-            generators::from_regex(r"(?:\d{1,3}\.){3}\d{1,3}").fullmatch(true),
-            generators::just("[::1]".to_string()),
+            generators::domains(),
+            generators::ip_addresses().v4(),
+            // IPv6 hosts go in brackets inside a URL.
+            generators::ip_addresses().v6().map(|ip| format!("[{ip}]")),
         ));
-        let url = Url::parse(&format!("http://{host}/feed.xml"));
-        // The naive regexes can emit hosts url rejects (e.g. bad punycode).
-        tc.assume(url.is_ok());
-        let url = url.unwrap();
+        let url = Url::parse(&format!("http://{host}/feed.xml")).expect("generated host is valid");
 
         let blank = parse_feed(
             r#"<?xml version="1.0"?>
