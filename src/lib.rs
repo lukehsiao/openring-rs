@@ -261,11 +261,27 @@ fn select_articles(
         let source_title = resolve_source_title(&feed, &url);
         let source_link = resolve_source_link(&feed, &url)?;
         let mut from_feed = Vec::new();
+        let mut incomplete = 0_usize;
         for entry in &feed.entries {
-            if let Some(article) = build_article(entry, &url, &source_title, &source_link, cutoff)?
-            {
-                from_feed.push(article);
+            match build_article(entry, &url, &source_title, &source_link)? {
+                Some(article) => {
+                    if cutoff.is_none_or(|c| article.timestamp < c) {
+                        from_feed.push(article);
+                    }
+                }
+                None => incomplete += 1,
             }
+        }
+        // One actionable signal instead of a warning per malformed entry: a
+        // feed that yields nothing usable would otherwise vanish silently
+        // from the output. Entries the user filtered out via --before do not
+        // count against the feed.
+        if from_feed.is_empty() && incomplete > 0 {
+            warn!(
+                source = url.as_str(),
+                skipped = incomplete,
+                "feed contributed no articles: its entries are missing a link, title, or date"
+            );
         }
         from_feed.sort_unstable_by(article_order);
         from_feed.truncate(per_source);
@@ -372,22 +388,25 @@ fn sanitize_text(raw: &str) -> String {
 
 /// Build a renderable [`Article`] from a feed entry.
 ///
-/// Returns `Ok(None)` when the entry lacks a usable link, title, or date, or
-/// when it falls at or after the `cutoff` instant. Errors only when the
-/// entry's date is out of representable range.
+/// Returns `Ok(None)` exactly when the entry is incomplete: missing a usable
+/// link, title, or date. Errors only when the entry's date is out of
+/// representable range. Selection policy (date cutoff, per-source caps)
+/// belongs to the caller.
 fn build_article(
     entry: &Entry,
     feed_url: &Url,
     source_title: &str,
     source_link: &Url,
-    cutoff: Option<Timestamp>,
 ) -> Result<Option<Article>> {
     let (Some(link), Some(title), Some(date)) = (
         resolve_entry_link(entry, feed_url),
         entry.title.as_ref().map(|t| &t.content),
         entry.published.or(entry.updated),
     ) else {
-        warn!(
+        // Routine for third-party feeds and recurring every run, so the
+        // per-entry detail stays at debug; select_articles warns once per
+        // feed when nothing at all is usable.
+        debug!(
             entry_links = ?entry.links,
             entry_title = ?entry.title,
             entry_published = ?entry.published,
@@ -399,11 +418,6 @@ fn build_article(
     };
 
     let timestamp = Timestamp::from_second(date.timestamp())?;
-    if let Some(cutoff) = cutoff
-        && timestamp >= cutoff
-    {
-        return Ok(None);
-    }
 
     let summary = raw_summary(entry).map_or_else(
         || {
@@ -909,7 +923,6 @@ mod tests {
             &feed_url(),
             "<script>evil()</script>Src",
             &source_link,
-            None,
         )
         .unwrap()
         .unwrap();
@@ -918,39 +931,27 @@ mod tests {
     }
 
     #[test]
-    fn build_article_assembles_fields_and_applies_filters() {
+    fn build_article_assembles_fields_and_skips_incomplete() {
         let source_link = Url::parse("https://example.com/").unwrap();
-        let future = first_entry(
+        let complete = first_entry(
             r#"<entry>
-                <title>Future Post</title>
-                <link href="https://example.com/future"/>
+                <title>Complete Post</title>
+                <link href="https://example.com/complete"/>
                 <published>2024-01-01T00:00:00Z</published>
                 <summary>hello</summary>
             </entry>"#,
         );
 
-        // With no cutoff, every field flows through, including the source info.
-        let built = build_article(&future, &feed_url(), "Src", &source_link, None)
+        // Every field of a complete entry flows through, source info included.
+        // The date cutoff is select_articles' concern, exercised there.
+        let built = build_article(&complete, &feed_url(), "Src", &source_link)
             .unwrap()
             .unwrap();
-        assert_eq!(built.title, "Future Post");
-        assert_eq!(built.link.as_str(), "https://example.com/future");
+        assert_eq!(built.title, "Complete Post");
+        assert_eq!(built.link.as_str(), "https://example.com/complete");
         assert_eq!(built.summary, "hello");
         assert_eq!(built.source_title, "Src");
         assert_eq!(built.source_link, source_link);
-
-        // An entry at or after the cutoff instant is dropped.
-        assert!(
-            build_article(
-                &future,
-                &feed_url(),
-                "Src",
-                &source_link,
-                Some("2022-01-01T00:00:00Z".parse().unwrap())
-            )
-            .unwrap()
-            .is_none()
-        );
 
         // An entry missing its date is skipped rather than erroring.
         let dateless = first_entry(
@@ -961,7 +962,7 @@ mod tests {
             </entry>"#,
         );
         assert!(
-            build_article(&dateless, &feed_url(), "Src", &source_link, None)
+            build_article(&dateless, &feed_url(), "Src", &source_link)
                 .unwrap()
                 .is_none()
         );
@@ -989,6 +990,123 @@ mod tests {
         assert_eq!(a.summary, "Hello world");
         assert_eq!(a.source_title, "Example Blog");
         assert_eq!(a.source_link.as_str(), "https://example.com/");
+    }
+
+    // Capture everything openring logs at warn level and above while `f`
+    // runs, through tracing's own subscriber machinery rather than a mock.
+    fn warnings_logged(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Buffer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("log output is UTF-8")
+    }
+
+    #[test]
+    fn select_articles_warns_once_when_a_feed_yields_nothing() {
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r"<entry>
+                    <title>No Link A</title>
+                    <published>2021-01-01T00:00:00Z</published>
+                </entry>
+                <entry>
+                    <title>No Link B</title>
+                    <published>2021-01-02T00:00:00Z</published>
+                </entry>",
+            ),
+        )];
+
+        let logs = warnings_logged(|| {
+            let articles = select_articles(feeds, 10, 10, None).unwrap();
+            assert!(articles.is_empty());
+        });
+        // One aggregated warning naming the feed and the count, not one line
+        // per malformed entry.
+        assert_eq!(
+            logs.matches("contributed no articles").count(),
+            1,
+            "logs: {logs}"
+        );
+        assert!(logs.contains("skipped=2"), "logs: {logs}");
+    }
+
+    #[test]
+    fn select_articles_is_quiet_about_partial_skips() {
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r#"<entry>
+                    <title>No Link</title>
+                    <published>2021-01-01T00:00:00Z</published>
+                </entry>
+                <entry>
+                    <title>Good</title>
+                    <link href="https://example.com/g"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>"#,
+            ),
+        )];
+
+        let logs = warnings_logged(|| {
+            let articles = select_articles(feeds, 10, 10, None).unwrap();
+            assert_eq!(articles.len(), 1);
+        });
+        // A feed that still renders something is not warn-worthy; the
+        // per-entry detail lives at debug level.
+        assert_eq!(logs, "", "expected no warnings for a partially usable feed");
+    }
+
+    #[test]
+    fn select_articles_is_quiet_when_only_the_cutoff_filters() {
+        use jiff::civil::date;
+
+        let feeds = vec![feed(
+            FEED_URL,
+            &atom(
+                r#"<entry>
+                    <title>New</title>
+                    <link href="https://example.com/new"/>
+                    <published>2024-01-01T00:00:00Z</published>
+                    <summary>x</summary>
+                </entry>"#,
+            ),
+        )];
+
+        let logs = warnings_logged(|| {
+            let articles = select_articles(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
+            assert!(articles.is_empty());
+        });
+        // --before is the user's own setting; filtering on it is not a fault
+        // of the feed and must not warn.
+        assert_eq!(logs, "", "expected no warnings for cutoff-only filtering");
     }
 
     #[test]
