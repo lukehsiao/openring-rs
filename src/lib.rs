@@ -162,8 +162,8 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
 /// # Errors
 ///
 /// Returns an error if no feed URLs are given, a URL file cannot be read or
-/// holds an invalid URL, the template file cannot be read, the cache cannot be
-/// written, a feed entry has no usable link, or the template fails to render.
+/// holds an invalid URL, the template file cannot be read or parsed, or the
+/// template fails to render.
 pub async fn run(args: Args) -> Result<()> {
     debug!(?args);
 
