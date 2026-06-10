@@ -254,12 +254,17 @@ fn find_alternate_link(links: &[Link]) -> Option<&str> {
         .map(|l| l.href.as_str())
 }
 
-/// The display title for a feed: its declared title, or the fetch URL's domain
-/// when the feed omits the title or leaves it blank.
+/// The display title for a feed: its declared title, or the fetch URL's host
+/// (domain or IP address) when the feed omits the title or leaves it blank.
 fn resolve_source_title(feed: &Feed, feed_url: &Url) -> String {
     match &feed.title {
         Some(t) if !t.content.is_empty() => t.content.clone(),
-        _ => feed_url.domain().unwrap().to_owned(),
+        // Hostless URLs (e.g. file:) can't be fetched anyway, so the full URL
+        // is an adequate last resort.
+        _ => feed_url
+            .host_str()
+            .unwrap_or_else(|| feed_url.as_str())
+            .to_owned(),
     }
 }
 
@@ -582,6 +587,32 @@ mod tests {
             </feed>"#,
         );
         assert_eq!(resolve_source_title(&blank, &feed_url()), "example.com");
+    }
+
+    // A titleless feed must get a fallback title for any URL a feed can be
+    // fetched from, including IP-address hosts where `Url::domain()` is None.
+    #[hegel::test]
+    fn resolve_source_title_falls_back_for_any_http_host(tc: hegel::TestCase) {
+        let host = tc.draw(hegel::one_of!(
+            generators::from_regex(r"(?:[a-z0-9-]{1,10}\.)+[a-z]{2,6}").fullmatch(true),
+            generators::from_regex(r"(?:\d{1,3}\.){3}\d{1,3}").fullmatch(true),
+            generators::just("[::1]".to_string()),
+        ));
+        let url = Url::parse(&format!("http://{host}/feed.xml"));
+        // The naive regexes can emit hosts url rejects (e.g. bad punycode).
+        tc.assume(url.is_ok());
+        let url = url.unwrap();
+
+        let blank = parse_feed(
+            r#"<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title></title>
+                <link href="https://example.com/"/>
+                <updated>2020-01-01T00:00:00Z</updated>
+            </feed>"#,
+        );
+        let title = resolve_source_title(&blank, &url);
+        assert_eq!(title, url.host_str().unwrap());
     }
 
     #[test]
