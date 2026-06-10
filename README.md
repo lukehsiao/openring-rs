@@ -90,6 +90,7 @@ We use OS-standard locations for caching.
 - **Windows**: `{FOLDERID_LocalAppData}\hsiao\openring\cache\cache.json`
 
 The cache file is simple JSON.
+Feed bodies are stored as base64-encoded bytes so the original transfer encoding survives for the parser; the other fields are plain text.
 
 The cache only prevents refetching a feed if the feed source responds with a 429.
 In this case, we respect `Retry-After`, or default to 4 hours.
