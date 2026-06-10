@@ -166,6 +166,14 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
 /// written, a feed entry has no usable link, or the template fails to render.
 pub async fn run(args: Args) -> Result<()> {
     debug!(?args);
+
+    // Read and parse the template before anything else: a wrong path or a
+    // syntax error should fail in milliseconds, not after fetching every feed.
+    // The name's .html suffix is what turns on Tera's autoescaping.
+    let template_name = "template.html";
+    let mut tera = Tera::default();
+    tera.add_raw_template(template_name, &fs::read_to_string(&args.template_file)?)?;
+
     let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
 
@@ -194,13 +202,11 @@ pub async fn run(args: Args) -> Result<()> {
         cache.store(cache_path)?;
     }
 
-    let template = fs::read_to_string(&args.template_file)?;
     let articles = select_articles(feeds, args.per_source, args.num_articles, args.before)?;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
-    // TODO: this validation of the template should come before all the time spent fetching feeds.
-    let output = Tera::one_off(&template, &context, true)?;
+    let output = tera.render(template_name, &context)?;
     write_output(io::stdout().lock(), &output)
 }
 
@@ -1082,6 +1088,40 @@ mod tests {
         let articles = select_articles(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Old");
+    }
+
+    #[tokio::test]
+    async fn run_fails_on_bad_template_before_fetching_any_feed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::run;
+        use crate::args::Args;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // A template with a syntax error: rendering could never succeed, so
+        // the run must fail before spending time on the network.
+        let mut template = tempfile::NamedTempFile::new().unwrap();
+        template.write_all(b"{% for a in %}").unwrap();
+
+        let args = Args {
+            url: vec![Url::parse(&server.uri()).unwrap()],
+            template_file: template.path().to_path_buf(),
+            no_cache: true,
+            ..Default::default()
+        };
+        assert!(run(args).await.is_err());
+
+        let received = server.received_requests().await.unwrap();
+        assert!(
+            received.is_empty(),
+            "feeds were fetched despite a template that can never render"
+        );
     }
 
     #[tokio::test]
