@@ -1,5 +1,4 @@
 #![allow(clippy::module_name_repetitions)]
-#![allow(unused_assignments)]
 use std::result;
 
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -9,17 +8,12 @@ pub(crate) type Result<T> = result::Result<T, OpenringError>;
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum OpenringError {
-    #[error("No valid published or updated date found.")]
-    DateError,
     #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
     FeedMissing,
     #[error("Failed to parse civil date.")]
     CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ChronoError(#[from] ChronoError),
     #[error(transparent)]
     #[diagnostic(code(openring::cache_error))]
     SerdeJsonError(#[from] serde_json::Error),
@@ -47,18 +41,6 @@ pub enum OpenringError {
     #[error("Failed to parse tera template.")]
     #[diagnostic(code(openring::template_error))]
     TemplateError(#[from] tera::Error),
-}
-
-#[derive(Error, Diagnostic, Debug)]
-#[error("Failed to parse datetime.")]
-#[diagnostic(code(openring::chrono_error))]
-pub struct ChronoError {
-    #[source_code]
-    pub src: NamedSource<String>,
-    #[label("this date is invalid")]
-    pub span: SourceSpan,
-    #[help]
-    pub help: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
