@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, builder::ValueHint};
-use clap_verbosity_flag::Verbosity;
+use clap_verbosity_flag::{Verbosity, WarnLevel};
 use jiff::civil::Date;
 use url::Url;
 
@@ -45,8 +45,10 @@ pub struct Args {
         default_value = "30d"
     )]
     pub max_cache_age: Duration,
+    // WarnLevel: warnings are actionable (skipped entries, cache failures,
+    // redirected feeds) and must not require -v; -q silences them.
     #[clap(flatten)]
-    pub verbose: Verbosity,
+    pub verbose: Verbosity<WarnLevel>,
 }
 
 #[cfg(test)]
@@ -56,5 +58,16 @@ mod test {
     fn verify_app() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn warnings_are_visible_by_default() {
+        use tracing_log::AsTrace;
+        // Warnings (skipped entries, cache failures, redirected feeds) are
+        // actionable and must not require -v to see.
+        assert_eq!(
+            Args::default().verbose.log_level_filter().as_trace(),
+            tracing::level_filters::LevelFilter::WARN
+        );
     }
 }

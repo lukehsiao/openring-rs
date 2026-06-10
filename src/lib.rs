@@ -2,6 +2,7 @@ pub mod args;
 pub mod cache;
 pub mod error;
 pub mod feedfetcher;
+pub mod progress;
 
 use std::{
     collections::HashSet,
@@ -107,9 +108,13 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
     // instead of paying for TLS setup per feed.
     let client = feedfetcher::build_client()?;
 
-    let pb = ProgressBar::new(urls.len() as u64).with_style(
-        ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
-            .unwrap(),
+    // Registered with the shared progress area so tracing output suspends
+    // the bar instead of splicing into it.
+    let pb = progress::add(
+        ProgressBar::new(urls.len() as u64).with_style(
+            ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
+                .unwrap(),
+        ),
     );
     pb.set_prefix("Fetching".bold().to_string());
 

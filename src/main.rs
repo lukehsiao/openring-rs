@@ -1,9 +1,8 @@
 use clap::Parser;
 use miette::Result;
-use std::io;
 use tracing_log::AsTrace;
 
-use openring::{self, args::Args};
+use openring::{self, args::Args, progress::SuspendingStderr};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,7 +13,9 @@ async fn main() -> Result<()> {
             "openring={},html5ever=off",
             args.verbose.log_level_filter().as_trace()
         ))
-        .with_writer(io::stderr)
+        // Suspends any active progress bar around each log line, so the two
+        // don't splice on a tty.
+        .with_writer(|| SuspendingStderr)
         .init();
     // `?` converts `OpenringError` into a `miette::Report` via its `Diagnostic`
     // impl, so the `#[diagnostic(code(..))]` codes render (unlike `into_diagnostic`,
