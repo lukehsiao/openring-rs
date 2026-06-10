@@ -336,6 +336,16 @@ impl FeedFetcher for Url {
         };
         debug!(url=%self, response=?resp, "received response");
 
+        // reqwest follows redirects silently, so a moved feed keeps working
+        // and the user never learns they should update their urls file.
+        if resp.url() != self {
+            warn!(
+                from=%self.as_str(),
+                to=%resp.url().as_str(),
+                "feed URL redirects; consider updating it"
+            );
+        }
+
         // Reject grossly oversized responses before buffering them. Responses
         // that arrive compressed or chunked report no length and are bounded
         // by the request timeout instead.
@@ -1081,6 +1091,36 @@ mod tests {
             received[0].headers.get("user-agent").unwrap(),
             concat!(crate_name!(), '/', crate_version!())
         );
+    }
+
+    #[tokio::test]
+    async fn follows_redirects_and_caches_under_the_requested_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/new"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("moved")))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&format!("{}/old", server.uri())).unwrap();
+        let cache = Arc::new(Cache::new());
+        let feed = url
+            .fetch_feed(&build_client().unwrap(), &cache)
+            .await
+            .expect("followed the redirect");
+        assert!(
+            feed.title
+                .as_ref()
+                .is_some_and(|t| t.content.contains("moved"))
+        );
+        // The cache stays keyed by the URL the user configured, so later runs
+        // still find their entry.
+        assert!(cache.contains_key(&url));
     }
 
     #[tokio::test]
