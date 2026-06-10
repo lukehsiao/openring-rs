@@ -5,8 +5,8 @@ pub mod feedfetcher;
 
 use std::{
     collections::HashSet,
-    fs::{self, File},
-    io::{self, BufRead, BufReader, Write},
+    fs,
+    io::{self, Write},
     path::Path,
     sync::Arc,
 };
@@ -50,38 +50,36 @@ pub(crate) fn resolve_href(
     feed_url.join(href)
 }
 
-/// Parse the file into a vector of URLs.
+/// Parse the file into a set of feed URLs.
+///
+/// Blank lines and lines starting with `#` or `//` are ignored. The first
+/// invalid URL fails the parse with a diagnostic spanning that exact line.
 fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let file_src = fs::read_to_string(path)?;
 
-    reader
-        .lines()
-        // Allow '#' or "//" comments in the urls file
-        .filter(|l| {
-            let line = l.as_ref().unwrap();
-            let trimmed = line.trim();
-            !(trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.is_empty())
-        })
-        .map(|line| {
-            let line = &line.unwrap();
-            let line = line.trim();
-            Url::parse(line).map_err(|e| {
-                // Give a nice diagnostic error
-                let file_src = fs::read_to_string(path).unwrap();
-                let offset = file_src.find(line).unwrap();
-                FeedUrlError {
-                    src: NamedSource::new(
-                        path.to_path_buf().into_os_string().to_string_lossy(),
-                        file_src,
-                    ),
-                    span: (offset..offset + line.len()).into(),
-                    help: e.to_string(),
+    let mut urls = HashSet::new();
+    let mut offset = 0;
+    for raw_line in file_src.split_inclusive('\n') {
+        let line = raw_line.trim();
+        if !(line.is_empty() || line.starts_with('#') || line.starts_with("//")) {
+            match Url::parse(line) {
+                Ok(url) => {
+                    urls.insert(url);
                 }
-                .into()
-            })
-        })
-        .collect()
+                Err(e) => {
+                    let start = offset + (raw_line.len() - raw_line.trim_start().len());
+                    return Err(FeedUrlError {
+                        src: NamedSource::new(path.to_string_lossy(), file_src.clone()),
+                        span: (start..start + line.len()).into(),
+                        help: e.to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
+        offset += raw_line.len();
+    }
+    Ok(urls)
 }
 
 // Get all feeds from URLs concurrently.
@@ -498,6 +496,62 @@ mod tests {
             Url::parse("https://second.example/").unwrap(),
         ]);
         assert_eq!(parsed, expected);
+    }
+
+    // Round-trip: any mix of valid URL lines, comments, blanks, and stray
+    // whitespace parses back to exactly the set of URLs written.
+    #[hegel::test(test_cases = 25)]
+    fn parse_urls_round_trips_urls_through_a_file(tc: hegel::TestCase) {
+        let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
+        let mut expected = HashSet::new();
+        let mut lines = Vec::new();
+        for _ in 0..n {
+            let url = Url::parse(&tc.draw(generators::urls())).expect("generated URL is valid");
+            lines.push(format!("  {url}  "));
+            expected.insert(url);
+            if tc.draw(generators::booleans()) {
+                lines.push(tc.draw(hegel::one_of!(
+                    generators::just("# comment".to_string()),
+                    generators::just("// comment".to_string()),
+                    generators::just(String::new()),
+                    generators::just("   ".to_string()),
+                )));
+            }
+        }
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        for line in &lines {
+            writeln!(tmp, "{line}").unwrap();
+        }
+
+        assert_eq!(parse_urls_from_file(tmp.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_urls_errors_instead_of_panicking_on_invalid_utf8() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0xFF, 0xFE, b'\n']).unwrap();
+        // A urls file in a non-UTF-8 encoding is a user mistake, not a crash.
+        assert!(matches!(
+            parse_urls_from_file(tmp.path()),
+            Err(crate::error::OpenringError::IoError(_))
+        ));
+    }
+
+    #[test]
+    fn parse_urls_diagnostic_points_at_the_offending_line() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // The same text appears first inside a comment; the span must point
+        // at the real line, not the first substring match in the file.
+        writeln!(tmp, "# not a url").unwrap();
+        writeln!(tmp, "not a url").unwrap();
+
+        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let crate::error::OpenringError::FeedUrlError(feed_url_error) = err else {
+            panic!("expected FeedUrlError, got {err:?}");
+        };
+        assert_eq!(feed_url_error.span.offset(), "# not a url\n".len());
+        assert_eq!(feed_url_error.span.len(), "not a url".len());
     }
 
     #[test]
