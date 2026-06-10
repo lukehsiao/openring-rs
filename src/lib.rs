@@ -24,7 +24,7 @@ use yansi::Paint;
 
 use crate::{
     args::Args,
-    cache::{Cache, CachePath, StoreExt},
+    cache::{Cache, CachePath},
     error::{FeedUrlError, OpenringError, Result},
     feedfetcher::FeedFetcher,
 };
@@ -196,11 +196,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let feeds = get_feeds_from_urls(&urls, &cache).await?;
 
-    if let Some(cache_path) = cache::get_cache_path()
-        && !args.no_cache
-    {
-        cache.store(cache_path)?;
-    }
+    cache::store_cache(&cache, args.no_cache, CachePath::Default);
 
     let articles = select_articles(feeds, args.per_source, args.num_articles, args.before)?;
 

@@ -37,7 +37,7 @@ pub(crate) struct CacheValue {
 }
 
 /// Get the path to cache location.
-pub(crate) fn get_cache_path() -> Option<PathBuf> {
+fn get_cache_path() -> Option<PathBuf> {
     if let Some(proj_dirs) = ProjectDirs::from("dev", "hsiao", "openring") {
         return Some(proj_dirs.cache_dir().join("cache.json"));
     }
@@ -126,6 +126,27 @@ impl StoreExt for Cache {
         Ok(map)
     }
 }
+/// Persist the cache, best-effort.
+///
+/// The cache is purely an optimization, so a failed write (read-only cache
+/// dir, full disk) only logs a warning; failing the run here would throw away
+/// an entire round of fetches right before the output is rendered.
+pub(crate) fn store_cache(cache: &Cache, no_cache: bool, cache_path: CachePath) {
+    if no_cache {
+        return;
+    }
+    let path = match cache_path {
+        CachePath::Default => {
+            let Some(path) = get_cache_path() else { return };
+            path
+        }
+        CachePath::Path(p) => p.to_path_buf(),
+    };
+    if let Err(e) = cache.store(path) {
+        warn!("Error while storing cache: {e}. Continuing without.");
+    }
+}
+
 /// Load cache (if exists and is still valid).
 ///
 /// This returns an `Option` as starting without a cache is a common scenario
@@ -440,6 +461,51 @@ mod tests {
             urls,
         };
         hegel::stateful::run(machine, tc);
+    }
+
+    #[test]
+    fn store_cache_swallows_write_failures() {
+        let cache = Cache::new();
+        cache.insert(
+            Url::parse("https://example.test/").unwrap(),
+            CacheValue {
+                timestamp: Timestamp::now(),
+                retry_after: None,
+                last_modified: None,
+                etag: None,
+                body: None,
+            },
+        );
+        // The parent "directory" is a file, so every write attempt fails. The
+        // cache is an optimization: failure must not propagate to the run.
+        let blocker = NamedTempFile::new().expect("temp file");
+        let path = blocker.path().join("sub").join("cache.json");
+        super::store_cache(&cache, false, CachePath::Path(&path));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn store_cache_respects_no_cache_and_writes_otherwise() {
+        let cache = Cache::new();
+        let url = Url::parse("https://example.test/").unwrap();
+        let value = CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: None,
+            etag: None,
+            body: Some("body".into()),
+        };
+        cache.insert(url.clone(), value.clone());
+
+        let tmpdir = TempDir::new().expect("tempdir");
+        let path = tmpdir.path().join("cache.json");
+
+        super::store_cache(&cache, true, CachePath::Path(&path));
+        assert!(!path.exists(), "no_cache must not write anything");
+
+        super::store_cache(&cache, false, CachePath::Path(&path));
+        let loaded = Cache::load(&path, u64::MAX, Timestamp::now()).expect("load succeeds");
+        assert_eq!(&*loaded.get(&url).expect("key present"), &value);
     }
 
     #[test]
