@@ -183,19 +183,19 @@ pub(crate) mod logic {
 
 /// Read the response body, failing once it grows past `limit` bytes. This
 /// backstops the Content-Length check for chunked or compressed responses,
-/// which present no usable length up front. A transfer error mid-read yields
-/// `None`, the same as any other failed body read.
+/// which present no usable length up front. A transfer error mid-read fails
+/// the fetch with the underlying cause and leaves the cache untouched.
 async fn read_body_capped(
     url: &Url,
     mut resp: reqwest::Response,
     limit: u64,
-) -> Result<Option<Vec<u8>>, OpenringError> {
+) -> Result<Vec<u8>, OpenringError> {
     // The limit always fits in usize on supported platforms.
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut body = Vec::new();
     loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
+        match resp.chunk().await? {
+            Some(chunk) => {
                 let total = body.len().saturating_add(chunk.len());
                 if total > limit {
                     return Err(OpenringError::FeedTooLargeError {
@@ -205,22 +205,9 @@ async fn read_body_capped(
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(Some(body)),
-            Err(e) => {
-                warn!(url=%url.as_str(), error=%e, "failed reading feed body.");
-                return Ok(None);
-            }
+            None => return Ok(body),
         }
     }
-}
-
-/// Parse feed bytes, logging and converting any parse error. The bytes are
-/// the raw transfer body so the parser can honor the feed's own encoding.
-fn parse_feed(url: &Url, feed_bytes: &[u8]) -> Result<Feed, OpenringError> {
-    parser::parse(feed_bytes).map_err(|e| {
-        warn!(url=%url.as_str(), error=%e, "failed to parse feed.");
-        OpenringError::from(e)
-    })
 }
 
 /// Apply a decided [`logic::Disposition`] to the cache and return the feed body to
@@ -312,9 +299,9 @@ impl FeedFetcher for Url {
         {
             debug!(timestamp=%cv.timestamp, retry_after=?cv.retry_after, "skipping request due to 429, using feed from cache");
             if let Some(feed_str) = &cv.body {
-                return parse_feed(self, feed_str);
+                return Ok(parser::parse(feed_str.as_slice())?);
             }
-            warn!(url=%self.as_str(), "empty feed");
+            debug!(url=%self.as_str(), "retry window open but nothing cached; fetching anyway");
         }
 
         let mut req = client.get(self.as_str());
@@ -327,13 +314,7 @@ impl FeedFetcher for Url {
         }
         debug!(url=%self, request=?req, "sending request");
 
-        let resp = match req.send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!(url=%self.as_str(), error=%e, "failed to get feed.");
-                return Err(e.into());
-            }
-        };
+        let resp = req.send().await?;
         debug!(url=%self, response=?resp, "received response");
 
         // reqwest follows redirects silently, so a moved feed keeps working
@@ -380,7 +361,7 @@ impl FeedFetcher for Url {
         // as UTF-8 while the XML prolog still declares the original charset,
         // so the parser would decode non-UTF-8 feeds twice into mojibake.
         let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            read_body_capped(self, resp, MAX_FEED_BYTES).await?
+            Some(read_body_capped(self, resp, MAX_FEED_BYTES).await?)
         } else {
             None
         };
@@ -395,7 +376,7 @@ impl FeedFetcher for Url {
             now,
         );
         let feed_str = apply_disposition(self, cache, now, disposition)?;
-        parse_feed(self, &feed_str)
+        Ok(parser::parse(feed_str.as_slice())?)
     }
 }
 
