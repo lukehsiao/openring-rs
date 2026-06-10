@@ -1042,9 +1042,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hegeltest"
-version = "0.17.1"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17460a695719ea7d9dfbacc415099d7a78a1acb17780dcb7c4f4ad845e422789"
+checksum = "dfb3a1b2121f5264b5aa3f961b485c2d450ccd5f220237d705cd95cdb2eddd8f"
 dependencies = [
  "ciborium",
  "crc32fast",
@@ -1062,9 +1062,9 @@ dependencies = [
 
 [[package]]
 name = "hegeltest-macros"
-version = "0.17.1"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45213106f9ca7731b7914b34ab1d8c5c2a53d48e7c3d52b0961edafdaa65a6f6"
+checksum = "59a8cbb38406991160ac589e92b162fc8d067dc9d27abaa6b7473555360a3871"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1783,7 +1783,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openring"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "ammonia",
  "base64",
