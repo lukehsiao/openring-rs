@@ -1786,6 +1786,7 @@ name = "openring"
 version = "0.5.12"
 dependencies = [
  "ammonia",
+ "base64",
  "clap",
  "clap-verbosity-flag",
  "dashmap",

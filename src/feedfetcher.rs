@@ -72,7 +72,7 @@ pub(crate) mod logic {
         Store {
             etag: Option<String>,
             last_modified: Option<String>,
-            body: Option<String>,
+            body: Option<Vec<u8>>,
         },
         /// 304 with an existing entry: keep the cached body and metadata.
         Reuse,
@@ -128,7 +128,7 @@ pub(crate) mod logic {
         status: StatusCode,
         etag: Option<&str>,
         last_modified: Option<&str>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
         had_cache_entry: bool,
         retry_after_header: Option<&str>,
     ) -> Disposition {
@@ -160,9 +160,10 @@ pub(crate) mod logic {
     }
 }
 
-/// Parse feed bytes, logging and converting any parse error.
-fn parse_feed(url: &Url, feed_str: &str) -> Result<Feed, OpenringError> {
-    parser::parse(feed_str.as_bytes()).map_err(|e| {
+/// Parse feed bytes, logging and converting any parse error. The bytes are
+/// the raw transfer body so the parser can honor the feed's own encoding.
+fn parse_feed(url: &Url, feed_bytes: &[u8]) -> Result<Feed, OpenringError> {
+    parser::parse(feed_bytes).map_err(|e| {
         warn!(url=%url.as_str(), error=%e, "failed to parse feed.");
         OpenringError::from(e)
     })
@@ -176,7 +177,7 @@ fn apply_disposition(
     cache: &Cache,
     now: Timestamp,
     disposition: logic::Disposition,
-) -> Result<String, OpenringError> {
+) -> Result<Vec<u8>, OpenringError> {
     match disposition {
         logic::Disposition::Store {
             etag,
@@ -301,8 +302,11 @@ impl FeedFetcher for Url {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        // Keep the raw bytes: pre-decoding to text re-encodes the transfer
+        // as UTF-8 while the XML prolog still declares the original charset,
+        // so the parser would decode non-UTF-8 feeds twice into mojibake.
         let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            resp.text().await.ok()
+            resp.bytes().await.ok().map(|b| b.to_vec())
         } else {
             None
         };
@@ -387,7 +391,10 @@ mod tests {
             retry_after: tc.draw(generators::optional(retry_spans())),
             last_modified: tc.draw(generators::optional(generators::text())),
             etag: tc.draw(generators::optional(generators::text())),
-            body: tc.draw(generators::optional(generators::text())),
+            // Arbitrary bytes, exercising the base64 round-trip fully.
+            body: tc.draw(generators::optional(
+                generators::vecs(generators::integers::<u8>()).max_size(64),
+            )),
         }
     }
 
@@ -510,7 +517,9 @@ mod tests {
         let status = StatusCode::from_u16(code).expect("2xx is valid");
         let etag = tc.draw(generators::optional(generators::text()));
         let last_modified = tc.draw(generators::optional(generators::text()));
-        let body = tc.draw(generators::optional(generators::text()));
+        let body = tc
+            .draw(generators::optional(generators::text()))
+            .map(String::into_bytes);
         let had_cache_entry = tc.draw(generators::booleans());
 
         let disp = logic::disposition(
@@ -537,7 +546,9 @@ mod tests {
     // A 304 with a cache entry reuses it; with no entry it stores the response.
     #[hegel::test]
     fn disposition_not_modified_depends_on_cache(tc: hegel::TestCase) {
-        let body = tc.draw(generators::optional(generators::text()));
+        let body = tc
+            .draw(generators::optional(generators::text()))
+            .map(String::into_bytes);
         let had_cache_entry = tc.draw(generators::booleans());
         let disp = logic::disposition(
             StatusCode::NOT_MODIFIED,
@@ -624,7 +635,7 @@ mod tests {
                 retry_after: None,
                 last_modified: Some(last_modified.clone()),
                 etag: Some(etag.clone()),
-                body: Some(get_valid_rss_feed("cached")),
+                body: Some(get_valid_rss_feed("cached").into_bytes()),
             },
         );
 
@@ -689,6 +700,40 @@ mod tests {
             Some(normalize_etag(etag_raw).as_str())
         );
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+    }
+
+    #[tokio::test]
+    async fn decodes_non_utf8_feeds_per_their_xml_prolog() {
+        let server = MockServer::start().await;
+        // A real ISO-8859-1 feed: 0xE9 is é, and the prolog declares the
+        // encoding. Decoding the transfer as UTF-8 first would corrupt the
+        // byte before the XML parser ever saw the prolog.
+        let mut body = br#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<rss version="2.0"><channel><title>caf"#
+            .to_vec();
+        body.push(0xE9);
+        body.extend_from_slice(
+            br"</title><link>https://x.example/</link><description>d</description></channel></rss>",
+        );
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        let client = build_client().unwrap();
+        let feed = url
+            .fetch_feed(&client, &cache)
+            .await
+            .expect("parsed latin-1 feed");
+        assert_eq!(feed.title.unwrap().content, "caf\u{e9}");
+
+        // The cached bytes must reparse identically (e.g. on a later 304).
+        let cached = cache.get(&url).expect("cached").body.clone().unwrap();
+        let reparsed = feed_rs::parser::parse(cached.as_slice()).expect("cache reparses");
+        assert_eq!(reparsed.title.unwrap().content, "caf\u{e9}");
     }
 
     #[tokio::test]
@@ -815,7 +860,7 @@ mod tests {
                 retry_after: None,
                 last_modified: None,
                 etag: None,
-                body: Some(get_valid_rss_feed("rate-limited")),
+                body: Some(get_valid_rss_feed("rate-limited").into_bytes()),
             },
         );
 

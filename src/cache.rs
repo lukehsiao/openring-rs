@@ -33,7 +33,41 @@ pub(crate) struct CacheValue {
     pub(crate) retry_after: Option<Span>,
     pub(crate) last_modified: Option<String>,
     pub(crate) etag: Option<String>,
-    pub(crate) body: Option<String>,
+    /// The raw transfer bytes, not text: the feed parser must see the
+    /// original encoding, since a latin-1 feed pre-decoded to UTF-8 turns to
+    /// mojibake when the parser honors the XML prolog.
+    #[serde(with = "body_base64")]
+    pub(crate) body: Option<Vec<u8>>,
+}
+
+/// Serialize the body as base64: `serde_json` would otherwise render a byte
+/// vector as an integer array, one element per byte. Caches written by
+/// versions that stored the body as plain text fail to decode and are
+/// discarded wholesale by `load_cache`, which is the intended migration.
+mod body_base64 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    // serde's `with` contract passes the field by reference, so the
+    // idiomatic Option<&Vec<u8>> is not an option here.
+    #[expect(clippy::ref_option)]
+    pub(crate) fn serialize<S: Serializer>(
+        body: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        body.as_ref()
+            .map(|bytes| STANDARD.encode(bytes))
+            .serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let encoded: Option<String> = Option::deserialize(deserializer)?;
+        encoded
+            .map(|s| STANDARD.decode(s).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 /// Get the path to cache location.
@@ -262,7 +296,10 @@ mod tests {
             retry_after: retry_after.map(|secs| Span::new().seconds(secs)),
             last_modified: tc.draw(text()),
             etag: tc.draw(text()),
-            body: tc.draw(text()),
+            // Arbitrary bytes, exercising the base64 round-trip fully.
+            body: tc.draw(generators::optional(
+                generators::vecs(generators::integers::<u8>()).max_size(64),
+            )),
         }
     }
 
@@ -480,7 +517,7 @@ mod tests {
             retry_after: None,
             last_modified: None,
             etag: None,
-            body: Some("body".into()),
+            body: Some(b"body".to_vec()),
         };
         let cache = Cache::new();
         cache.insert(url.clone(), value);
@@ -557,7 +594,7 @@ mod tests {
             retry_after: None,
             last_modified: None,
             etag: None,
-            body: Some("body".into()),
+            body: Some(b"body".to_vec()),
         };
         cache.insert(url.clone(), value.clone());
 
@@ -570,6 +607,23 @@ mod tests {
         super::store_cache(&cache, false, CachePath::Path(&path));
         let loaded = Cache::load(&path, u64::MAX, Timestamp::now()).expect("load succeeds");
         assert_eq!(&*loaded.get(&url).expect("key present"), &value);
+    }
+
+    #[test]
+    fn load_cache_discards_old_format_plain_text_bodies() {
+        let tmp = NamedTempFile::new().expect("temp file");
+        // A cache written by versions that stored the body as plain text. The
+        // body is not valid base64, so the whole file is discarded and the
+        // run continues cacheless instead of erroring.
+        let old = r#"{"https://example.test/":{"timestamp":"2026-01-01T00:00:00Z","retry_after":null,"last_modified":null,"etag":null,"body":"<?xml version=\"1.0\"?><rss/>"}}"#;
+        fs::write(tmp.path(), old).expect("write old cache");
+
+        let args = Args {
+            no_cache: false,
+            max_cache_age: Duration::from_hours(24),
+            ..Default::default()
+        };
+        assert!(super::load_cache(&args, CachePath::Path(tmp.path())).is_none());
     }
 
     #[test]
@@ -626,7 +680,7 @@ mod tests {
             retry_after: None,
             last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
             etag: Some("etag".into()),
-            body: Some("body".into()),
+            body: Some(b"body".to_vec()),
         };
         let cache = Cache::new();
         cache.insert(url.clone(), value.clone());
@@ -658,7 +712,7 @@ mod tests {
             retry_after: None,
             last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
             etag: Some("etag".into()),
-            body: Some("body".into()),
+            body: Some(b"body".to_vec()),
         };
         cache.insert(valid_url.clone(), valid_value.clone());
 
@@ -669,7 +723,7 @@ mod tests {
             retry_after: None,
             last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
             etag: Some("etag".into()),
-            body: Some("body".into()),
+            body: Some(b"body".to_vec()),
         };
         cache.insert(expired_url.clone(), expired_value.clone());
         cache.store(&tmp_cache_path).expect("store");
