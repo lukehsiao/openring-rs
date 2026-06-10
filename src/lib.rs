@@ -6,7 +6,7 @@ pub mod feedfetcher;
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     path::Path,
     sync::Arc,
 };
@@ -203,8 +203,19 @@ pub async fn run(args: Args) -> Result<()> {
     context.insert("articles", &articles);
     // TODO: this validation of the template should come before all the time spent fetching feeds.
     let output = Tera::one_off(&template, &context, true)?;
-    println!("{output}");
-    Ok(())
+    write_output(io::stdout().lock(), &output)
+}
+
+/// Write the rendered output to `w`, followed by a newline.
+///
+/// A closed pipe (e.g. `openring ... | head`) is treated as success: the
+/// reader has everything it wants, and Unix convention is to exit quietly
+/// rather than panic the way `println!` does on EPIPE.
+fn write_output(mut w: impl Write, output: &str) -> Result<()> {
+    match writeln!(w, "{output}").and_then(|()| w.flush()) {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => Ok(result?),
+    }
 }
 
 /// Build the sorted, truncated list of articles to render from the fetched feeds.
@@ -371,7 +382,41 @@ mod tests {
     use super::{
         build_article, find_alternate_link, parse_urls_from_file, raw_summary, resolve_entry_link,
         resolve_href, resolve_source_link, resolve_source_title, sanitize_html, select_articles,
+        write_output,
     };
+
+    // A writer that always fails with the given kind, standing in for a stdout
+    // that has gone away.
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "stub failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_output_appends_newline() {
+        let mut buf = Vec::new();
+        write_output(&mut buf, "hello").unwrap();
+        assert_eq!(buf, b"hello\n");
+    }
+
+    #[test]
+    fn write_output_treats_broken_pipe_as_success() {
+        assert!(write_output(FailingWriter(std::io::ErrorKind::BrokenPipe), "x").is_ok());
+    }
+
+    #[test]
+    fn write_output_propagates_other_io_errors() {
+        assert!(matches!(
+            write_output(FailingWriter(std::io::ErrorKind::PermissionDenied), "x"),
+            Err(crate::error::OpenringError::IoError(_))
+        ));
+    }
 
     // Generates a base URL and a random path fragment. The property asserts that:
     // * If `href` is already absolute, the result equals `Url::parse(href)`.
