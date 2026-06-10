@@ -21,7 +21,8 @@ pub(crate) const MAX_SPAN_SEC: i64 = 631_107_417_600;
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum CachePath<'a> {
     Default,
-    #[allow(dead_code)]
+    // Only tests construct Path, so the variant is dead in non-test builds.
+    #[cfg_attr(not(test), expect(dead_code))]
     Path(&'a Path),
 }
 
