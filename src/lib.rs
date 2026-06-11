@@ -5,9 +5,11 @@ pub mod feedfetcher;
 pub mod progress;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
+    num::NonZeroUsize,
+    ops::Range,
     path::Path,
     sync::Arc,
 };
@@ -16,6 +18,7 @@ use feed_rs::model::{Entry, Feed, Link};
 use indicatif::{ProgressBar, ProgressStyle};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use miette::NamedSource;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use tera::Tera;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -26,7 +29,7 @@ use yansi::Paint;
 use crate::{
     args::Args,
     cache::{Cache, CachePath},
-    error::{FeedUrlError, OpenringError, Result},
+    error::{FeedUrlError, FeedWeightError, OpenringError, Result},
     feedfetcher::FeedFetcher,
 };
 
@@ -51,36 +54,252 @@ pub(crate) fn resolve_href(
     feed_url.join(href)
 }
 
-/// Parse the file into a set of feed URLs.
+/// Whitespace-separated tokens of `line`, each with the byte offset it
+/// starts at, so diagnostics can point at the exact offending token.
+fn tokens_with_offsets(line: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        match (start, c.is_whitespace()) {
+            (None, false) => start = Some(i),
+            (Some(s), true) => {
+                tokens.push((s, &line[s..i]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        tokens.push((s, &line[s..]));
+    }
+    tokens
+}
+
+/// Why a feed line failed to parse, with the byte range of the offending
+/// part so file diagnostics can label it precisely.
+struct LineIssue {
+    span: Range<usize>,
+    kind: LineIssueKind,
+    help: String,
+}
+
+enum LineIssueKind {
+    Url,
+    Weight,
+}
+
+/// A parsed weight together with the byte range of its token, which the file
+/// parser needs to label duplicate-weight conflicts discovered only after
+/// the line itself parsed.
+type SpannedWeight = (NonZeroUsize, Range<usize>);
+
+/// Parse one `URL [WEIGHT]` feed line.
 ///
-/// Blank lines and lines starting with `#` or `//` are ignored. The first
-/// invalid URL fails the parse with a diagnostic spanning that exact line.
-fn parse_urls_from_file(path: &Path) -> Result<HashSet<Url>> {
+/// Tokenization happens before URL parsing on purpose: `Url::parse`
+/// percent-encodes interior spaces, so handing it the whole line would
+/// silently swallow the weight as part of the URL path.
+fn parse_feed_line(line: &str) -> std::result::Result<(Url, Option<SpannedWeight>), LineIssue> {
+    let tokens = tokens_with_offsets(line);
+    let trimmed_end = tokens.last().map_or(0, |&(off, tok)| off + tok.len());
+    let Some(&(first_start, url_token)) = tokens.first() else {
+        return Err(LineIssue {
+            span: 0..line.len(),
+            kind: LineIssueKind::Url,
+            help: "expected a feed URL".to_string(),
+        });
+    };
+
+    let url = Url::parse(url_token).map_err(|e| LineIssue {
+        // The whole line is suspect when its first token is not a URL.
+        span: first_start..trimmed_end,
+        kind: LineIssueKind::Url,
+        help: e.to_string(),
+    })?;
+
+    let weight = match tokens.len() {
+        1 => None,
+        2 => {
+            let (w_start, w_token) = tokens[1];
+            let span = w_start..w_start + w_token.len();
+            let weight = w_token.parse::<NonZeroUsize>().map_err(|e| LineIssue {
+                span: span.clone(),
+                kind: LineIssueKind::Weight,
+                help: format!(
+                    "the weight after a URL must be a positive integer ({e}); omit it for the default unweighted behavior"
+                ),
+            })?;
+            Some((weight, span))
+        }
+        _ => {
+            let (extra_start, _) = tokens[1];
+            return Err(LineIssue {
+                span: extra_start..trimmed_end,
+                kind: LineIssueKind::Weight,
+                help: "expected `URL [WEIGHT]`: at most one integer weight may follow the URL"
+                    .to_string(),
+            });
+        }
+    };
+
+    Ok((url, weight))
+}
+
+/// Wrap a [`LineIssue`] into the matching diagnostic, with `src` as the
+/// source text and the issue's span shifted by `base` into that text.
+fn diagnostic_for(issue: LineIssue, src: NamedSource<String>, base: usize) -> OpenringError {
+    let span = (base + issue.span.start..base + issue.span.end).into();
+    match issue.kind {
+        LineIssueKind::Url => FeedUrlError {
+            src,
+            span,
+            help: issue.help,
+        }
+        .into(),
+        LineIssueKind::Weight => FeedWeightError {
+            src,
+            span,
+            help: issue.help,
+        }
+        .into(),
+    }
+}
+
+/// Parse one `-s/--url` argument in the same `URL [WEIGHT]` grammar as
+/// urls-file lines, with the argument text as the diagnostic source so
+/// errors point at the offending token.
+fn parse_cli_url(raw: &str) -> Result<(Url, Option<NonZeroUsize>)> {
+    parse_feed_line(raw)
+        .map(|(url, weight)| (url, weight.map(|(w, _)| w)))
+        .map_err(|issue| diagnostic_for(issue, NamedSource::new("-s/--url", raw.to_owned()), 0))
+}
+
+/// Merge a newly seen weight for a feed into the weight already on record.
+///
+/// Absence means "no opinion", so an explicit weight wins over none and
+/// repeating the same weight is fine. Two different explicit weights are a
+/// contradiction only the user can resolve; the pair comes back as the error.
+fn merge_weight(
+    existing: &mut Option<NonZeroUsize>,
+    incoming: Option<NonZeroUsize>,
+) -> std::result::Result<(), (NonZeroUsize, NonZeroUsize)> {
+    match (*existing, incoming) {
+        (Some(a), Some(b)) if a != b => Err((a, b)),
+        (None, Some(b)) => {
+            *existing = Some(b);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Record one configured feed, merging duplicates per [`merge_weight`].
+fn record_feed(
+    feeds: &mut HashMap<Url, Option<NonZeroUsize>>,
+    url: Url,
+    weight: Option<NonZeroUsize>,
+) -> Result<()> {
+    if let Some(existing) = feeds.get_mut(&url) {
+        merge_weight(existing, weight).map_err(|(a, b)| OpenringError::ConflictingWeightError {
+            url: String::from(url),
+            a: a.get(),
+            b: b.get(),
+        })?;
+    } else {
+        feeds.insert(url, weight);
+    }
+    Ok(())
+}
+
+/// Every configured feed, with `-s` values and the urls file merged into one
+/// weight per URL. This is the typed boundary between raw command-line input
+/// and the rest of the program.
+#[derive(Debug)]
+struct FeedSet {
+    /// Every feed to fetch, weighted or not.
+    urls: Vec<Url>,
+    /// Only the explicitly weighted feeds appear here.
+    weights: HashMap<Url, NonZeroUsize>,
+}
+
+impl FeedSet {
+    /// Parse and merge the configured feeds from `-s` values and the urls
+    /// file, rejecting contradictory weights for the same URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no feeds are configured at all, a `-s` value or
+    /// file line fails to parse, the file cannot be read, or one feed is
+    /// given two different weights.
+    fn resolve(cli_urls: &[String], url_file: Option<&Path>) -> Result<Self> {
+        let mut configured: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
+        for raw in cli_urls {
+            let (url, weight) = parse_cli_url(raw)?;
+            record_feed(&mut configured, url, weight)?;
+        }
+        if let Some(path) = url_file {
+            for (url, weight) in parse_urls_from_file(path)? {
+                record_feed(&mut configured, url, weight)?;
+            }
+        }
+        if configured.is_empty() {
+            return Err(OpenringError::FeedMissing);
+        }
+
+        let urls = configured.keys().cloned().collect();
+        let weights = configured
+            .into_iter()
+            .filter_map(|(url, weight)| weight.map(|w| (url, w)))
+            .collect();
+        Ok(FeedSet { urls, weights })
+    }
+}
+
+/// Parse the file into feed URLs, each with its optional weight.
+///
+/// Each line is `URL [WEIGHT]`. Blank lines and lines starting with `#` or
+/// `//` are ignored, and duplicate URLs merge per [`merge_weight`]. The first
+/// invalid line fails the parse with a diagnostic spanning the offending
+/// tokens.
+fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>>> {
     let file_src = fs::read_to_string(path)?;
 
-    let mut urls = HashSet::new();
+    let mut feeds: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
     let mut offset = 0;
     for raw_line in file_src.split_inclusive('\n') {
         let line = raw_line.trim();
         if !(line.is_empty() || line.starts_with('#') || line.starts_with("//")) {
-            match Url::parse(line) {
-                Ok(url) => {
-                    urls.insert(url);
-                }
-                Err(e) => {
-                    let start = offset + (raw_line.len() - raw_line.trim_start().len());
-                    return Err(FeedUrlError {
-                        src: NamedSource::new(path.to_string_lossy(), file_src.clone()),
-                        span: (start..start + line.len()).into(),
-                        help: e.to_string(),
+            let (url, weight) = parse_feed_line(raw_line).map_err(|issue| {
+                diagnostic_for(
+                    issue,
+                    NamedSource::new(path.to_string_lossy(), file_src.clone()),
+                    offset,
+                )
+            })?;
+            match weight {
+                Some((w, w_span)) => {
+                    if let Err((existing, _)) =
+                        merge_weight(feeds.entry(url).or_insert(None), Some(w))
+                    {
+                        return Err(FeedWeightError {
+                            src: NamedSource::new(path.to_string_lossy(), file_src.clone()),
+                            span: (offset + w_span.start..offset + w_span.end).into(),
+                            help: format!(
+                                "this feed is already listed with weight {existing}; each feed takes a single weight"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
+                }
+                // The URL is recorded either way; a bare line has no opinion
+                // about an existing weight.
+                None => {
+                    feeds.entry(url).or_insert(None);
                 }
             }
         }
         offset += raw_line.len();
     }
-    Ok(urls)
+    Ok(feeds)
 }
 
 /// Cap on in-flight fetches so a long urls file cannot exhaust the process's
@@ -176,14 +395,16 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
 }
 
 /// Fetch every configured feed, render the most recent articles through the
-/// template, and print the result to stdout.
+/// template, and write the result to `out`, followed by a newline. `main`
+/// passes stdout; tests pass a buffer so they can assert the rendered bytes.
 ///
 /// # Errors
 ///
-/// Returns an error if no feed URLs are given, a URL file cannot be read or
-/// holds an invalid URL, the template file cannot be read or parsed, or the
-/// template fails to render.
-pub async fn run(args: Args) -> Result<()> {
+/// Returns an error if no feed URLs are given, a `-s/--url` value or url-file
+/// line holds an invalid URL or weight, one feed is listed with two different
+/// weights, the url file cannot be read, the template file cannot be read or
+/// parsed, or the template fails to render.
+pub async fn run(args: Args, out: impl Write) -> Result<()> {
     debug!(?args);
 
     // Read and parse the template before anything else: a wrong path or a
@@ -196,33 +417,34 @@ pub async fn run(args: Args) -> Result<()> {
     let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
 
-    let mut urls = args.url;
+    // Merge -s urls and the urls file into one weight-per-feed view, so
+    // duplicate listings collapse and contradictory weights fail fast.
+    let feed_set = FeedSet::resolve(&args.url, args.url_file.as_deref())?;
 
-    if let Some(path) = args.url_file {
-        let file_urls = parse_urls_from_file(&path)?;
-        urls.extend(file_urls);
-    }
-
-    if urls.is_empty() {
-        return Err(OpenringError::FeedMissing);
-    }
-
-    // Deduplicate here, too, in case urls are provided in args + file.
-    let urls: Vec<Url> = {
-        let unique: HashSet<Url> = urls.into_iter().collect();
-        unique.into_iter().collect()
-    };
-
-    let feeds = get_feeds_from_urls(&urls, &cache).await?;
+    let feeds = get_feeds_from_urls(&feed_set.urls, &cache).await?;
 
     cache::store_cache(&cache, args.no_cache, CachePath::Default);
 
-    let articles = select_articles(feeds, args.per_source, args.num_articles, args.before)?;
+    // Entropy by default: rotating the weighted picks between runs is the
+    // point. A fixed seed reproduces the same picks for tests and stable
+    // site builds.
+    let mut rng = match args.seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_rng(&mut rand::rng()),
+    };
+    let articles = select_articles(
+        feeds,
+        args.per_source,
+        args.num_articles,
+        args.before,
+        &feed_set.weights,
+        &mut rng,
+    )?;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
     let output = tera.render(template_name, &context)?;
-    write_output(io::stdout().lock(), &output)
+    write_output(out, &output)
 }
 
 /// Write the rendered output to `w`, followed by a newline.
@@ -241,20 +463,35 @@ fn write_output(mut w: impl Write, output: &str) -> Result<()> {
 ///
 /// Each feed contributes its `per_source` most recent qualifying entries,
 /// judged by publication date rather than the order the feed lists them in.
-/// `before` drops anything published after that date (interpreted in the
-/// system timezone) before the cap applies, and `num_articles` caps the final
-/// newest-first list.
+/// A feed with weight N in `weights` instead fills min(`per_source`, N)
+/// slots drawn at random from its N most recent qualifying entries, so a
+/// prolific feed stops monopolizing the output; slots drawn past the end of
+/// what the feed actually has contribute nothing (see
+/// [`draw_weighted_slots`]). `before` drops anything published after that
+/// date (interpreted in the system timezone) before the caps apply, and
+/// `num_articles` caps the final newest-first list.
+///
+/// Output is a function of the arguments alone: feeds are processed in URL
+/// order, so a fixed `rng` reproduces the same picks no matter what order
+/// the fetches finished in.
 fn select_articles(
-    feeds: Vec<(Feed, Url)>,
+    mut feeds: Vec<(Feed, Url)>,
     per_source: usize,
     num_articles: usize,
     before: Option<Date>,
+    weights: &HashMap<Url, NonZeroUsize>,
+    rng: &mut impl Rng,
 ) -> Result<Vec<Article>> {
     // Convert the cutoff to an instant once: midnight at the start of
     // `before` in the system timezone.
     let cutoff = before
         .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
         .transpose()?;
+
+    // Fetches finish in nondeterministic order, and every weighted feed
+    // consumes RNG draws, so a fixed iteration order is what makes a fixed
+    // seed actually reproduce the output.
+    feeds.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
 
     let mut articles = Vec::new();
     for (feed, url) in feeds {
@@ -284,13 +521,55 @@ fn select_articles(
             );
         }
         from_feed.sort_unstable_by(article_order);
-        from_feed.truncate(per_source);
+        match weights.get(&url) {
+            None => from_feed.truncate(per_source),
+            Some(&weight) => {
+                let eligible = from_feed.len();
+                apply_weight(&mut from_feed, weight, per_source, rng);
+                if eligible > 0 && from_feed.is_empty() {
+                    debug!(
+                        source = url.as_str(),
+                        weight = weight.get(),
+                        eligible,
+                        "weighted feed drew only empty slots and sits out this run"
+                    );
+                }
+            }
+        }
         articles.append(&mut from_feed);
     }
 
     articles.sort_unstable_by(article_order);
     articles.truncate(num_articles);
     Ok(articles)
+}
+
+/// The 0-based ranks a feed with this weight fills on one run:
+/// min(`per_source`, `weight`) distinct ranks drawn uniformly from
+/// 0..weight, where rank i means "the feed's i-th newest eligible article".
+///
+/// Ranks come from the full 0..weight range on purpose. A rank the feed has
+/// no article for is an empty slot, so a feed with E < N eligible articles
+/// participates in roughly E/N of runs instead of concentrating its odds on
+/// the few articles it has.
+fn draw_weighted_slots(weight: NonZeroUsize, per_source: usize, rng: &mut impl Rng) -> Vec<usize> {
+    rand::seq::index::sample(rng, weight.get(), per_source.min(weight.get())).into_vec()
+}
+
+/// Reduce a weighted feed's newest-first eligible articles to the drawn slots.
+fn apply_weight(
+    from_feed: &mut Vec<Article>,
+    weight: NonZeroUsize,
+    per_source: usize,
+    rng: &mut impl Rng,
+) {
+    let slots = draw_weighted_slots(weight, per_source, rng);
+    let mut rank = 0;
+    from_feed.retain(|_| {
+        let keep = slots.contains(&rank);
+        rank += 1;
+        keep
+    });
 }
 
 /// Newest first, with ties broken by link so the output is identical no
@@ -441,14 +720,16 @@ fn build_article(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, io::Write};
+    use std::{collections::HashMap, io::Write, num::NonZeroUsize};
     use url::Url;
 
     use feed_rs::model::{Entry, Feed, Link};
-    use hegel::generators;
+    use hegel::{extras::rand as rand_gs, generators};
+    use rand::{SeedableRng, rngs::StdRng};
 
     use super::{
-        build_article, find_alternate_link, parse_urls_from_file, raw_summary, resolve_entry_link,
+        Article, FeedSet, build_article, draw_weighted_slots, find_alternate_link, merge_weight,
+        parse_cli_url, parse_urls_from_file, raw_summary, record_feed, resolve_entry_link,
         resolve_href, resolve_source_link, resolve_source_title, sanitize_html, select_articles,
         write_output,
     };
@@ -536,24 +817,37 @@ mod tests {
 
         let parsed = parse_urls_from_file(tmp.path()).unwrap();
 
-        let expected = HashSet::from([
-            Url::parse("https://first.example/").unwrap(),
-            Url::parse("https://second.example/").unwrap(),
+        let expected = HashMap::from([
+            (Url::parse("https://first.example/").unwrap(), None),
+            (Url::parse("https://second.example/").unwrap(), None),
         ]);
         assert_eq!(parsed, expected);
     }
 
-    // Round-trip: any mix of valid URL lines, comments, blanks, and stray
-    // whitespace parses back to exactly the set of URLs written.
+    // Round-trip: any mix of valid `URL [WEIGHT]` lines, comments, blanks,
+    // and stray whitespace parses back to exactly the map written.
     #[hegel::test(test_cases = 25)]
     fn parse_urls_round_trips_urls_through_a_file(tc: hegel::TestCase) {
         let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
-        let mut expected = HashSet::new();
+        let mut expected: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
         let mut lines = Vec::new();
         for _ in 0..n {
             let url = Url::parse(&tc.draw(generators::urls())).expect("generated URL is valid");
-            lines.push(format!("  {url}  "));
-            expected.insert(url);
+            // A duplicate URL repeats its recorded weight: conflicting
+            // weights are a parse error with its own test.
+            let weight = match expected.get(&url) {
+                Some(&w) => w,
+                None => tc
+                    .draw(generators::optional(
+                        generators::integers::<usize>().min_value(1).max_value(1000),
+                    ))
+                    .and_then(NonZeroUsize::new),
+            };
+            match weight {
+                Some(w) => lines.push(format!("  {url} {w}  ")),
+                None => lines.push(format!("  {url}  ")),
+            }
+            expected.insert(url, weight);
             if tc.draw(generators::booleans()) {
                 lines.push(tc.draw(hegel::one_of!(
                     generators::just("# comment".to_string()),
@@ -610,6 +904,234 @@ mod tests {
         assert!(matches!(
             parse_urls_from_file(tmp.path()),
             Err(crate::error::OpenringError::FeedUrlError(_))
+        ));
+    }
+
+    #[test]
+    fn parse_urls_parses_optional_weights() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://weighted.example/feed.xml 7").unwrap();
+        writeln!(tmp, "https://plain.example/feed.xml").unwrap();
+
+        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+
+        let expected = HashMap::from([
+            (
+                Url::parse("https://weighted.example/feed.xml").unwrap(),
+                NonZeroUsize::new(7),
+            ),
+            (Url::parse("https://plain.example/feed.xml").unwrap(), None),
+        ]);
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_urls_weight_diagnostic_points_at_the_token() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://valid.example/ abc").unwrap();
+
+        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let crate::error::OpenringError::FeedWeightError(e) = err else {
+            panic!("expected FeedWeightError, got {err:?}");
+        };
+        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
+        assert_eq!(e.span.len(), "abc".len());
+    }
+
+    #[test]
+    fn parse_urls_rejects_a_zero_weight() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://valid.example/ 0").unwrap();
+
+        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let crate::error::OpenringError::FeedWeightError(e) = err else {
+            panic!("expected FeedWeightError, got {err:?}");
+        };
+        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
+        assert_eq!(e.span.len(), 1);
+    }
+
+    #[test]
+    fn parse_urls_rejects_trailing_garbage_after_the_weight() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://valid.example/ 7 9").unwrap();
+
+        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let crate::error::OpenringError::FeedWeightError(e) = err else {
+            panic!("expected FeedWeightError, got {err:?}");
+        };
+        // The span covers everything after the URL.
+        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
+        assert_eq!(e.span.len(), "7 9".len());
+    }
+
+    #[test]
+    fn parse_urls_rejects_conflicting_duplicate_weights() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://valid.example/ 3").unwrap();
+        writeln!(tmp, "https://valid.example/ 7").unwrap();
+
+        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let crate::error::OpenringError::FeedWeightError(e) = err else {
+            panic!("expected FeedWeightError, got {err:?}");
+        };
+        // The diagnostic points at the second line's weight token and names
+        // the weight it contradicts.
+        let second_weight_offset = "https://valid.example/ 3\nhttps://valid.example/ ".len();
+        assert_eq!(e.span.offset(), second_weight_offset);
+        assert_eq!(e.span.len(), 1);
+        assert!(e.help.contains('3'), "help: {}", e.help);
+    }
+
+    #[test]
+    fn parse_urls_merges_duplicates_per_weight_policy() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Same explicit weight twice, explicit after bare, bare after
+        // explicit: all collapse to one entry holding the explicit weight.
+        writeln!(tmp, "https://a.example/ 7").unwrap();
+        writeln!(tmp, "https://a.example/ 7").unwrap();
+        writeln!(tmp, "https://b.example/").unwrap();
+        writeln!(tmp, "https://b.example/ 3").unwrap();
+        writeln!(tmp, "https://c.example/ 4").unwrap();
+        writeln!(tmp, "https://c.example/").unwrap();
+
+        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+
+        let expected = HashMap::from([
+            (
+                Url::parse("https://a.example/").unwrap(),
+                NonZeroUsize::new(7),
+            ),
+            (
+                Url::parse("https://b.example/").unwrap(),
+                NonZeroUsize::new(3),
+            ),
+            (
+                Url::parse("https://c.example/").unwrap(),
+                NonZeroUsize::new(4),
+            ),
+        ]);
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_cli_url_accepts_url_and_optional_weight() {
+        let (url, weight) = parse_cli_url("https://example.com/feed.xml 7").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/feed.xml");
+        assert_eq!(weight, NonZeroUsize::new(7));
+
+        let (_, bare) = parse_cli_url("https://example.com/feed.xml").unwrap();
+        assert_eq!(bare, None);
+    }
+
+    #[test]
+    fn parse_cli_url_rejects_malformed_values() {
+        for bad in [
+            "",
+            "not a url",
+            "https://example.com/ 0",
+            "https://example.com/ -3",
+            "https://example.com/ abc",
+            "https://example.com/ 7 9",
+        ] {
+            assert!(parse_cli_url(bad).is_err(), "accepted: {bad:?}");
+        }
+    }
+
+    // A bad -s value gets the same span-pointing diagnostic as a urls-file
+    // line: the label sits exactly on the offending token.
+    #[test]
+    fn parse_cli_url_diagnostic_points_at_the_weight_token() {
+        let err = parse_cli_url("https://luke.hsiao.dev/atom.xml X").unwrap_err();
+        let crate::error::OpenringError::FeedWeightError(e) = err else {
+            panic!("expected FeedWeightError, got {err:?}");
+        };
+        assert_eq!(e.span.offset(), "https://luke.hsiao.dev/atom.xml ".len());
+        assert_eq!(e.span.len(), 1);
+    }
+
+    // The parser must accept or reject, never panic, whatever the value holds.
+    #[hegel::test]
+    fn parse_cli_url_never_panics(tc: hegel::TestCase) {
+        let line = tc.draw(generators::text());
+        let _ = parse_cli_url(&line);
+    }
+
+    #[test]
+    fn merge_weight_lets_explicit_beat_absent_and_rejects_conflicts() {
+        let mut recorded = None;
+        merge_weight(&mut recorded, NonZeroUsize::new(3)).unwrap();
+        assert_eq!(recorded, NonZeroUsize::new(3));
+
+        // A bare duplicate has no opinion; the explicit weight stays.
+        merge_weight(&mut recorded, None).unwrap();
+        assert_eq!(recorded, NonZeroUsize::new(3));
+
+        // Repeating the same weight is fine.
+        merge_weight(&mut recorded, NonZeroUsize::new(3)).unwrap();
+        assert_eq!(recorded, NonZeroUsize::new(3));
+
+        // A different weight is a contradiction carrying both values.
+        assert_eq!(
+            merge_weight(&mut recorded, NonZeroUsize::new(7)),
+            Err((
+                NonZeroUsize::new(3).expect("non-zero"),
+                NonZeroUsize::new(7).expect("non-zero")
+            ))
+        );
+    }
+
+    #[test]
+    fn record_feed_reports_conflicting_weights_for_the_url() {
+        let mut feeds = HashMap::new();
+        record_feed(&mut feeds, feed_url(), NonZeroUsize::new(3)).unwrap();
+        record_feed(&mut feeds, feed_url(), None).unwrap();
+
+        let err = record_feed(&mut feeds, feed_url(), NonZeroUsize::new(7)).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::OpenringError::ConflictingWeightError { .. }
+        ));
+    }
+
+    #[test]
+    fn feed_set_resolve_merges_cli_and_file_sources() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://a.example/ 7").unwrap();
+        writeln!(tmp, "https://b.example/").unwrap();
+        let cli = [
+            "https://b.example/ 3".to_string(),
+            "https://c.example/".to_string(),
+        ];
+
+        let feed_set = FeedSet::resolve(&cli, Some(tmp.path())).unwrap();
+
+        assert_eq!(feed_set.urls.len(), 3);
+        let weight_of = |u: &str| feed_set.weights.get(&Url::parse(u).unwrap()).copied();
+        assert_eq!(weight_of("https://a.example/"), NonZeroUsize::new(7));
+        // The file's bare listing defers to the CLI's explicit weight.
+        assert_eq!(weight_of("https://b.example/"), NonZeroUsize::new(3));
+        assert_eq!(weight_of("https://c.example/"), None);
+    }
+
+    #[test]
+    fn feed_set_resolve_rejects_cross_source_conflicts() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "https://a.example/ 7").unwrap();
+        let cli = ["https://a.example/ 3".to_string()];
+
+        let err = FeedSet::resolve(&cli, Some(tmp.path())).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::OpenringError::ConflictingWeightError { .. }
+        ));
+    }
+
+    #[test]
+    fn feed_set_resolve_requires_at_least_one_feed() {
+        assert!(matches!(
+            FeedSet::resolve(&[], None),
+            Err(crate::error::OpenringError::FeedMissing)
         ));
     }
 
@@ -693,6 +1215,60 @@ mod tests {
             title: None,
             length: None,
         }
+    }
+
+    // Most tests exercise the unweighted path, where the weights map and RNG
+    // are inert; this keeps those call sites stable as the signature grows.
+    fn select_unweighted(
+        feeds: Vec<(Feed, Url)>,
+        per_source: usize,
+        num_articles: usize,
+        before: Option<jiff::civil::Date>,
+    ) -> crate::error::Result<Vec<Article>> {
+        select_articles(
+            feeds,
+            per_source,
+            num_articles,
+            before,
+            &HashMap::new(),
+            &mut StdRng::seed_from_u64(0),
+        )
+    }
+
+    // A feed at `url` with `k` complete entries, where entry `rank` (0-based)
+    // is the rank-th newest and is titled with its rank.
+    fn ranked_feed_at(url: &str, k: usize) -> (Feed, Url) {
+        use std::fmt::Write as _;
+
+        let mut entries = String::new();
+        for rank in 0..k {
+            let day = i64::try_from(k - rank).expect("k is small");
+            let published = jiff::Timestamp::from_second(1_600_000_000 + 86_400 * day)
+                .expect("timestamp in range");
+            write!(
+                entries,
+                r#"<entry>
+                    <title>{rank}</title>
+                    <link href="{url}/{rank}"/>
+                    <published>{published}</published>
+                    <summary>x</summary>
+                </entry>"#
+            )
+            .expect("writing to a String is infallible");
+        }
+        feed(url, &atom(&entries))
+    }
+
+    fn ranked_feed(k: usize) -> (Feed, Url) {
+        ranked_feed_at(FEED_URL, k)
+    }
+
+    fn titles(articles: &[Article]) -> Vec<String> {
+        articles.iter().map(|a| a.title.clone()).collect()
+    }
+
+    fn links(articles: &[Article]) -> Vec<String> {
+        articles.iter().map(|a| a.link.to_string()).collect()
     }
 
     #[test]
@@ -982,7 +1558,7 @@ mod tests {
             ),
         )];
 
-        let articles = select_articles(feeds, 1, 10, None).unwrap();
+        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
         assert_eq!(articles.len(), 1);
         let a = &articles[0];
         assert_eq!(a.link.as_str(), "https://example.com/first");
@@ -1044,7 +1620,7 @@ mod tests {
         )];
 
         let logs = warnings_logged(|| {
-            let articles = select_articles(feeds, 10, 10, None).unwrap();
+            let articles = select_unweighted(feeds, 10, 10, None).unwrap();
             assert!(articles.is_empty());
         });
         // One aggregated warning naming the feed and the count, not one line
@@ -1076,7 +1652,7 @@ mod tests {
         )];
 
         let logs = warnings_logged(|| {
-            let articles = select_articles(feeds, 10, 10, None).unwrap();
+            let articles = select_unweighted(feeds, 10, 10, None).unwrap();
             assert_eq!(articles.len(), 1);
         });
         // A feed that still renders something is not warn-worthy; the
@@ -1101,7 +1677,7 @@ mod tests {
         )];
 
         let logs = warnings_logged(|| {
-            let articles = select_articles(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
+            let articles = select_unweighted(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
             assert!(articles.is_empty());
         });
         // --before is the user's own setting; filtering on it is not a fault
@@ -1130,7 +1706,7 @@ mod tests {
             ),
         )];
 
-        let articles = select_articles(feeds, 10, 10, None).unwrap();
+        let articles = select_unweighted(feeds, 10, 10, None).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Good");
     }
@@ -1162,7 +1738,7 @@ mod tests {
         )];
 
         // per_source = 1 keeps only the most recent entry.
-        let articles = select_articles(feeds, 1, 10, None).unwrap();
+        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Newest");
     }
@@ -1195,7 +1771,7 @@ mod tests {
             ),
         )];
 
-        let articles = select_articles(feeds, 1, 10, None).unwrap();
+        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Newest");
     }
@@ -1224,7 +1800,7 @@ mod tests {
             ),
         )];
 
-        let articles = select_articles(feeds, 1, 10, Some(date(2022, 1, 1))).unwrap();
+        let articles = select_unweighted(feeds, 1, 10, Some(date(2022, 1, 1))).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Old");
     }
@@ -1256,7 +1832,7 @@ mod tests {
         )];
 
         // num_articles = 2 keeps the two newest, sorted newest-first.
-        let articles = select_articles(feeds, 10, 2, None).unwrap();
+        let articles = select_unweighted(feeds, 10, 2, None).unwrap();
         assert_eq!(articles.len(), 2);
         assert_eq!(articles[0].title, "Newest");
         assert_eq!(articles[1].title, "Middle");
@@ -1283,12 +1859,9 @@ mod tests {
         let feed_a = || feed("https://a.example/feed.xml", &atom(entry_a));
         let feed_b = || feed("https://b.example/feed.xml", &atom(entry_b));
 
-        let one = select_articles(vec![feed_a(), feed_b()], 10, 10, None).unwrap();
-        let two = select_articles(vec![feed_b(), feed_a()], 10, 10, None).unwrap();
+        let one = select_unweighted(vec![feed_a(), feed_b()], 10, 10, None).unwrap();
+        let two = select_unweighted(vec![feed_b(), feed_a()], 10, 10, None).unwrap();
 
-        let titles = |articles: &[super::Article]| {
-            articles.iter().map(|a| a.title.clone()).collect::<Vec<_>>()
-        };
         assert_eq!(titles(&one), titles(&two));
     }
 
@@ -1315,7 +1888,7 @@ mod tests {
             )),
         )];
 
-        let articles = select_articles(feeds, 10, 10, Some(cutoff_date)).unwrap();
+        let articles = select_unweighted(feeds, 10, 10, Some(cutoff_date)).unwrap();
         assert!(
             articles.is_empty(),
             "boundary article was kept: {articles:?}"
@@ -1345,9 +1918,271 @@ mod tests {
         )];
 
         // The two-year gap dwarfs any timezone offset, so the boundary is stable.
-        let articles = select_articles(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
+        let articles = select_unweighted(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
         assert_eq!(articles.len(), 1);
         assert_eq!(articles[0].title, "Old");
+    }
+
+    // A weighted feed only ever contributes articles among its N newest
+    // eligible ones, and never more than min(per_source, N) of them.
+    #[hegel::test]
+    fn weighted_selection_stays_within_the_n_newest(tc: hegel::TestCase) {
+        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(40));
+        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
+        // Unbounded weight: a huge pool must neither panic nor hang.
+        let weight = NonZeroUsize::new(tc.draw(generators::integers::<usize>().min_value(1)))
+            .expect("min_value is 1");
+        let mut rng = tc.draw(rand_gs::randoms());
+
+        let weights = HashMap::from([(feed_url(), weight)]);
+        let articles = select_articles(
+            vec![ranked_feed(k)],
+            per_source,
+            usize::MAX,
+            None,
+            &weights,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert!(articles.len() <= per_source.min(weight.get()));
+        let mut ranks: Vec<usize> = titles(&articles)
+            .iter()
+            .map(|t| t.parse().expect("titles are ranks"))
+            .collect();
+        ranks.sort_unstable();
+        let drawn = ranks.len();
+        ranks.dedup();
+        assert_eq!(ranks.len(), drawn, "every pick is a distinct article");
+        assert!(
+            ranks.iter().all(|&r| r < weight.get()),
+            "picks beyond the N newest: {ranks:?}"
+        );
+    }
+
+    // The slot lottery itself: distinct ranks, inside the pool, exactly
+    // min(per_source, weight) of them.
+    #[hegel::test]
+    fn draw_weighted_slots_draws_distinct_ranks_within_the_pool(tc: hegel::TestCase) {
+        let weight = NonZeroUsize::new(tc.draw(generators::integers::<usize>().min_value(1)))
+            .expect("min_value is 1");
+        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
+        let mut rng = tc.draw(rand_gs::randoms());
+
+        let mut slots = draw_weighted_slots(weight, per_source, &mut rng);
+
+        assert_eq!(slots.len(), per_source.min(weight.get()));
+        assert!(slots.iter().all(|&s| s < weight.get()));
+        slots.sort_unstable();
+        let drawn = slots.len();
+        slots.dedup();
+        assert_eq!(slots.len(), drawn, "slots must be distinct");
+    }
+
+    // Weight 1 pins the pool to the single newest article, which is exactly
+    // what the unweighted path picks at per_source = 1.
+    #[hegel::test]
+    fn weight_one_matches_unweighted_selection(tc: hegel::TestCase) {
+        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
+        let mut rng = tc.draw(rand_gs::randoms());
+
+        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(1).expect("non-zero"))]);
+        let weighted =
+            select_articles(vec![ranked_feed(k)], 1, 10, None, &weights, &mut rng).unwrap();
+        let unweighted = select_unweighted(vec![ranked_feed(k)], 1, 10, None).unwrap();
+
+        assert_eq!(titles(&weighted), titles(&unweighted));
+    }
+
+    // Without weights the RNG must be inert: any two seeds give identical
+    // output, so unweighted users keep deterministic builds.
+    #[hegel::test]
+    fn unweighted_selection_ignores_the_rng(tc: hegel::TestCase) {
+        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
+        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(3));
+        let num_articles = tc.draw(generators::integers::<usize>().min_value(0).max_value(5));
+        let seed_a = tc.draw(generators::integers::<u64>());
+        let seed_b = tc.draw(generators::integers::<u64>());
+
+        let one = select_articles(
+            vec![ranked_feed(k)],
+            per_source,
+            num_articles,
+            None,
+            &HashMap::new(),
+            &mut StdRng::seed_from_u64(seed_a),
+        )
+        .unwrap();
+        let two = select_articles(
+            vec![ranked_feed(k)],
+            per_source,
+            num_articles,
+            None,
+            &HashMap::new(),
+            &mut StdRng::seed_from_u64(seed_b),
+        )
+        .unwrap();
+
+        assert_eq!(titles(&one), titles(&two));
+    }
+
+    // The --seed contract: a fixed seed reproduces the picks even though
+    // fetches complete in arbitrary order. Fails without the URL sort in
+    // select_articles.
+    #[hegel::test]
+    fn same_seed_reproduces_selection_regardless_of_fetch_order(tc: hegel::TestCase) {
+        let seed = tc.draw(generators::integers::<u64>());
+        let hosts = ["a.example", "b.example", "c.example"];
+        let mut weights = HashMap::new();
+        let mut entry_counts = Vec::new();
+        for host in hosts {
+            entry_counts.push(tc.draw(generators::integers::<usize>().min_value(0).max_value(8)));
+            if let Some(w) = tc.draw(generators::optional(
+                generators::integers::<usize>().min_value(1).max_value(5),
+            )) {
+                weights.insert(
+                    Url::parse(&format!("https://{host}/feed.xml")).expect("static url"),
+                    NonZeroUsize::new(w).expect("min_value is 1"),
+                );
+            }
+        }
+        let build = |counts: &[usize]| -> Vec<(Feed, Url)> {
+            hosts
+                .iter()
+                .zip(counts)
+                .map(|(host, &k)| ranked_feed_at(&format!("https://{host}/feed.xml"), k))
+                .collect()
+        };
+        let mut backward = build(&entry_counts);
+        backward.reverse();
+
+        let one = select_articles(
+            build(&entry_counts),
+            1,
+            10,
+            None,
+            &weights,
+            &mut StdRng::seed_from_u64(seed),
+        )
+        .unwrap();
+        let two = select_articles(
+            backward,
+            1,
+            10,
+            None,
+            &weights,
+            &mut StdRng::seed_from_u64(seed),
+        )
+        .unwrap();
+
+        assert_eq!(links(&one), links(&two));
+    }
+
+    #[test]
+    fn sparse_weighted_feed_sits_out_some_runs_without_warning() {
+        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(5).expect("non-zero"))]);
+
+        let mut contributed = 0;
+        let mut sat_out_seed = None;
+        for seed in 0..200 {
+            let articles = select_articles(
+                vec![ranked_feed(1)],
+                1,
+                10,
+                None,
+                &weights,
+                &mut StdRng::seed_from_u64(seed),
+            )
+            .unwrap();
+            match articles.as_slice() {
+                [] => sat_out_seed = Some(seed),
+                [only] => {
+                    assert_eq!(only.title, "0", "the only eligible article is rank 0");
+                    contributed += 1;
+                }
+                more => panic!("one eligible article cannot yield {} picks", more.len()),
+            }
+        }
+        // One article in a pool of five contributes on ~1/5 of seeds; both
+        // outcomes are a statistical certainty across 200 seeds.
+        assert!(contributed > 0, "feed never contributed");
+        let sat_out_seed = sat_out_seed.expect("feed never sat out");
+
+        let logs = warnings_logged(|| {
+            let articles = select_articles(
+                vec![ranked_feed(1)],
+                1,
+                10,
+                None,
+                &weights,
+                &mut StdRng::seed_from_u64(sat_out_seed),
+            )
+            .unwrap();
+            assert!(articles.is_empty());
+        });
+        // Sitting out the lottery is the feature working, not a feed fault.
+        assert_eq!(logs, "", "sitting out must not warn");
+    }
+
+    #[test]
+    fn weight_caps_contribution_below_per_source() {
+        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(2).expect("non-zero"))]);
+        // Weight 2 with per_source 3: both slots in the pool of two are
+        // always drawn, so exactly the two newest come back on any seed.
+        for seed in 0..20 {
+            let articles = select_articles(
+                vec![ranked_feed(5)],
+                3,
+                10,
+                None,
+                &weights,
+                &mut StdRng::seed_from_u64(seed),
+            )
+            .unwrap();
+            let mut got = titles(&articles);
+            got.sort_unstable();
+            assert_eq!(got, ["0", "1"]);
+        }
+    }
+
+    #[test]
+    fn weighted_slots_count_only_qualifying_entries() {
+        use jiff::civil::date;
+
+        // The newest entry falls after --before; with weight 1 the pick must
+        // be the newest qualifying entry, exactly like the unweighted path.
+        let feeds = || {
+            vec![feed(
+                FEED_URL,
+                &atom(
+                    r#"<entry>
+                        <title>New</title>
+                        <link href="https://example.com/new"/>
+                        <published>2024-01-01T00:00:00Z</published>
+                        <summary>x</summary>
+                    </entry>
+                    <entry>
+                        <title>Old</title>
+                        <link href="https://example.com/old"/>
+                        <published>2020-01-01T00:00:00Z</published>
+                        <summary>x</summary>
+                    </entry>"#,
+                ),
+            )]
+        };
+        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(1).expect("non-zero"))]);
+        for seed in 0..20 {
+            let articles = select_articles(
+                feeds(),
+                1,
+                10,
+                Some(date(2022, 1, 1)),
+                &weights,
+                &mut StdRng::seed_from_u64(seed),
+            )
+            .unwrap();
+            assert_eq!(titles(&articles), ["Old"]);
+        }
     }
 
     #[tokio::test]
@@ -1370,12 +2205,12 @@ mod tests {
         template.write_all(b"{% for a in %}").unwrap();
 
         let args = Args {
-            url: vec![Url::parse(&server.uri()).unwrap()],
+            url: vec![server.uri()],
             template_file: template.path().to_path_buf(),
             no_cache: true,
             ..Default::default()
         };
-        assert!(run(args).await.is_err());
+        assert!(run(args, std::io::sink()).await.is_err());
 
         let received = server.received_requests().await.unwrap();
         assert!(
@@ -1418,7 +2253,7 @@ mod tests {
             .unwrap();
 
         let args = Args {
-            url: vec![Url::parse(&server.uri()).unwrap()],
+            url: vec![server.uri()],
             template_file: template.path().to_path_buf(),
             // no_cache keeps the run from touching the real on-disk cache.
             no_cache: true,
@@ -1427,6 +2262,73 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(run(args).await.is_ok());
+        let mut rendered = Vec::new();
+        assert!(run(args, &mut rendered).await.is_ok());
+        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
+        assert_eq!(rendered, "Mock Article\n\n");
+    }
+
+    #[tokio::test]
+    async fn run_accepts_weighted_urls_end_to_end() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::run;
+        use crate::args::Args;
+
+        let server = MockServer::start().await;
+        let body = r#"<?xml version="1.0"?>
+            <rss version="2.0">
+                <channel>
+                    <title>Mock Feed</title>
+                    <link>https://example.com/</link>
+                    <description>desc</description>
+                    <item>
+                        <title>Mock Article</title>
+                        <link>https://example.com/mock</link>
+                        <description>summary</description>
+                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                    </item>
+                </channel>
+            </rss>"#;
+        Mock::given(method("GET"))
+            .and(path("/feed.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        // One healthy weighted feed plus one weighted feed that 404s: the
+        // whole pipeline must accept the `URL WEIGHT` syntax and a broken
+        // weighted feed must not take down the run.
+        let mut urls = tempfile::NamedTempFile::new().unwrap();
+        writeln!(urls, "{}/feed.xml 3", server.uri()).unwrap();
+        writeln!(urls, "{}/missing.xml 2", server.uri()).unwrap();
+
+        let mut template = tempfile::NamedTempFile::new().unwrap();
+        template
+            .write_all(b"{% for a in articles %}{{ a.title }}\n{% endfor %}")
+            .unwrap();
+
+        let make_args = || Args {
+            // The same feed also arrives via -s with the same weight: the
+            // CLI value and the file line must merge instead of conflicting.
+            url: vec![format!("{}/feed.xml 3", server.uri())],
+            url_file: Some(urls.path().to_path_buf()),
+            template_file: template.path().to_path_buf(),
+            no_cache: true,
+            num_articles: 3,
+            per_source: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut first = Vec::new();
+        assert!(run(make_args(), &mut first).await.is_ok());
+
+        // The --seed contract holds through the whole pipeline, argv to
+        // rendered bytes, not just inside select_articles.
+        let mut second = Vec::new();
+        assert!(run(make_args(), &mut second).await.is_ok());
+        assert_eq!(first, second);
     }
 }

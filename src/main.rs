@@ -20,6 +20,6 @@ async fn main() -> Result<()> {
     // `?` converts `OpenringError` into a `miette::Report` via its `Diagnostic`
     // impl, so the `#[diagnostic(code(..))]` codes render (unlike `into_diagnostic`,
     // which discards them).
-    openring::run(args).await?;
+    openring::run(args, std::io::stdout()).await?;
     Ok(())
 }

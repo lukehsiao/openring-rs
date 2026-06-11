@@ -20,6 +20,15 @@ pub enum OpenringError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     FeedUrlError(#[from] FeedUrlError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    FeedWeightError(#[from] FeedWeightError),
+    #[error("The feed `{url}` is listed with conflicting weights ({a} and {b}).")]
+    #[diagnostic(
+        code(openring::conflicting_weight_error),
+        help("each feed takes a single weight; keep one of the two")
+    )]
+    ConflictingWeightError { url: String, a: usize, b: usize },
     #[error("The feed at `{0}` was empty.")]
     #[diagnostic(code(openring::empty_feed_error))]
     EmptyFeedError(String),
@@ -53,6 +62,18 @@ pub struct FeedUrlError {
     #[source_code]
     pub src: NamedSource<String>,
     #[label("this url is invalid")]
+    pub span: SourceSpan,
+    #[help]
+    pub help: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("Invalid feed weight.")]
+#[diagnostic(code(openring::feed_weight_error))]
+pub struct FeedWeightError {
+    #[source_code]
+    pub src: NamedSource<String>,
+    #[label("this weight is invalid")]
     pub span: SourceSpan,
     #[help]
     pub help: String,
