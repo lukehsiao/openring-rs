@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.17
+
+### Patch Changes
+
+- [`5118cac`](https://github.com/lukehsiao/openring-rs/commit/5118cac2d841906d2c766aa2c972af4ca73dabe4) - **perf**: shrink release binaries from 20M to 15M
+
+  The release profile now strips the symbol table and enables fat LTO with a single codegen unit. No behavior change, and prebuilt binaries from GitHub releases get the reduction automatically.
+
+<pre>
+$ git-stats v0.5.16..v0.5.17
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        1              2         +15          0    +15
+Total             1              2         +15          0    +15
+</pre>
+
 ## 0.5.16
 
 ### Patch Changes
