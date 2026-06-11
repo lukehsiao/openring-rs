@@ -12,6 +12,14 @@ categories = ["command-line-utilities"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Strip symbols and maximize LTO to keep release binaries small. Fat LTO
+# makes release builds slower, but those only happen in CI and on
+# `cargo install`.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
 [dependencies]
 ammonia = "4.1.2"
 base64 = "0.22.1"
