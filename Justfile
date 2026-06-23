@@ -3,10 +3,11 @@
 _default:
     @just --list
 
-# Runs clippy on the sources
+# Runs linters on the sources
 [group('dev')]
 check:
     cargo clippy --all-targets --all-features --locked -- -W clippy::pedantic -D warnings
+    zizmor .
 
 # Runs the test suite
 [group('dev')]
