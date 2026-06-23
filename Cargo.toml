@@ -31,7 +31,7 @@ feed-rs = "2.3.1"
 html-escape = "0.2.13"
 humantime = "2.3.0"
 indicatif = "0.18.4"
-jiff = { version = "0.2.28", features = ["serde"] }
+jiff = { version = "0.2.29", features = ["serde"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 rand = "0.10.1"
 reqwest = { version = "0.13.4", features = ["gzip", "brotli", "zstd", "deflate"] }
@@ -47,7 +47,7 @@ url = { version = "2.5.8", features = ["serde"] }
 yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 
 [dev-dependencies]
-hegeltest = { version = "0.17.1", features = ["jiff", "rand"] }
+hegeltest = { version = "0.22.0", features = ["jiff", "rand"] }
 http = "1.4.2"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
