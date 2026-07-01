@@ -409,10 +409,7 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
 
     // Read and parse the template before anything else: a wrong path or a
     // syntax error should fail in milliseconds, not after fetching every feed.
-    // The name's .html suffix is what turns on Tera's autoescaping.
-    let template_name = "template.html";
-    let mut tera = Tera::default();
-    tera.add_raw_template(template_name, &fs::read_to_string(&args.template_file)?)?;
+    let tera = template_engine(&fs::read_to_string(&args.template_file)?)?;
 
     let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
@@ -443,8 +440,38 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
-    let output = tera.render(template_name, &context)?;
+    let output = tera.render(TEMPLATE_NAME, &context)?;
     write_output(out, &output)
+}
+
+/// The name's .html suffix is what turns on Tera's autoescaping.
+const TEMPLATE_NAME: &str = "template.html";
+
+/// Build the Tera instance that renders `template`.
+///
+/// # Errors
+///
+/// Returns an error if the template has a syntax error or references a
+/// filter that does not exist.
+fn template_engine(template: &str) -> Result<Tera> {
+    let mut tera = Tera::default();
+    // Tera 2.0 moved several 1.x built-ins out of core into tera-contrib.
+    // Register the ones webring templates use: `date` and `striptags` (the
+    // bundled template needs both to format timestamps and flatten summary
+    // HTML), plus `urlencode`/`urlencode_strict` and `now()` for share
+    // links and "generated on" footers. This must happen before the
+    // template is parsed, since tera rejects templates referencing unknown
+    // filters at parse time.
+    tera.register_filter("date", tera_contrib::dates::date);
+    tera.register_filter("striptags", tera_contrib::regex::striptags);
+    tera.register_filter("urlencode", tera_contrib::urlencode::urlencode);
+    tera.register_filter(
+        "urlencode_strict",
+        tera_contrib::urlencode::urlencode_strict,
+    );
+    tera.register_function("now", tera_contrib::dates::now);
+    tera.add_raw_template(TEMPLATE_NAME, template)?;
+    Ok(tera)
 }
 
 /// Write the rendered output to `w`, followed by a newline.
@@ -1313,7 +1340,7 @@ mod tests {
         use hegel::generators::Generator;
         let host = tc.draw(hegel::one_of!(
             generators::domains(),
-            generators::ip_addresses().v4(),
+            generators::ip_addresses().v4().map(|ip| ip.to_string()),
             // IPv6 hosts go in brackets inside a URL.
             generators::ip_addresses().v6().map(|ip| format!("[{ip}]")),
         ));
@@ -2266,6 +2293,63 @@ mod tests {
         assert!(run(args, &mut rendered).await.is_ok());
         let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
         assert_eq!(rendered, "Mock Article\n\n");
+    }
+
+    // The example template exercises every filter the docs promise (the
+    // tera-contrib `date` and `striptags` we register plus tera's own
+    // built-ins), so it parsing and rendering is what pins template
+    // compatibility across tera upgrades.
+    #[test]
+    fn bundled_template_renders_an_article() {
+        use super::{TEMPLATE_NAME, template_engine};
+
+        let tera = template_engine(include_str!("../in.html")).expect("bundled template parses");
+        let articles = vec![Article {
+            link: Url::parse("https://example.com/post").unwrap(),
+            title: "Hello World".to_string(),
+            // Sanitized summaries keep safe tags and escaped entities,
+            // exactly what the template's summary pipeline must flatten.
+            summary: "<p>First line</p>\n<p>Second &amp; last</p>".to_string(),
+            source_link: Url::parse("https://example.com/").unwrap(),
+            source_title: "Example Blog".to_string(),
+            timestamp: "2003-06-10T04:00:00Z".parse().unwrap(),
+        }];
+        let mut context = tera::Context::new();
+        context.insert("articles", &articles);
+        let out = tera
+            .render(TEMPLATE_NAME, &context)
+            .expect("bundled template renders");
+        assert!(out.contains("Hello World"), "{out}");
+        assert!(out.contains("June 10, 2003"), "{out}");
+        // newlines_to_br and replace turn the newline into a space, and
+        // striptags drops the <p> wrappers.
+        assert!(out.contains("First line Second &amp; last"), "{out}");
+    }
+
+    // The bundled template doesn't use urlencode or now(), so their
+    // registration needs its own coverage.
+    #[test]
+    fn templates_can_use_urlencode_and_now() {
+        use super::{TEMPLATE_NAME, template_engine};
+
+        let tera = template_engine(
+            r#"{{ link | urlencode_strict }} {{ link | urlencode }} {{ now() | date(format="%Y") }}"#,
+        )
+        .expect("template parses");
+        let mut context = tera::Context::new();
+        context.insert("link", "https://example.com/a b");
+        let out = tera.render(TEMPLATE_NAME, &context).expect("renders");
+
+        let mut parts = out.split(' ');
+        // urlencode_strict encodes every non-alphanumeric byte, `.` included.
+        assert_eq!(parts.next(), Some("https%3A%2F%2Fexample%2Ecom%2Fa%20b"));
+        // urlencode keeps `/` literal, matching Python's urllib quote.
+        assert_eq!(parts.next(), Some("https%3A//example.com/a%20b"));
+        let year = parts.next().expect("now() renders a year");
+        assert!(
+            year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()),
+            "{year}"
+        );
     }
 
     #[tokio::test]

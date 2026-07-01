@@ -6,7 +6,7 @@
       <h4 class="title" dir="auto">
         <a href="{{ article.link | safe }}" target="_blank" rel="noopener">{{ article.title | safe }}</a>
       </h4>
-      <p class="summary" dir="auto">{{ article.summary | linebreaksbr | replace(from="<br>", to=" ") | striptags | trim
+      <p class="summary" dir="auto">{{ article.summary | newlines_to_br | replace(from="<br>", to=" ") | striptags | trim
         | truncate(length=256) | safe }}</p>
       <small class="source"> via <a href="{{ article.source_link | safe }}">{{ article.source_title | safe
           }}</a></small>

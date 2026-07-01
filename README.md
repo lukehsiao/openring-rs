@@ -109,8 +109,13 @@ Details worth knowing:
 - Selection re-rolls on every run. Use `--seed` to make it reproducible, e.g. `--seed "$(date +%Y%m%d)"` rotates daily while keeping rebuilds within the same day stable.
 
 ## Using Tera templates
-The templates supported by `openring-rs` are written using [Tera](https://keats.github.io/tera/).
+The templates supported by `openring-rs` are written using [Tera](https://keats.github.io/tera/) 2.x.
 Please refer to the Tera documentation for details.
+Templates written for older `openring-rs` releases (Tera 1.x) may need updating; see the [Tera migration guide](https://github.com/Keats/tera/blob/master/MIGRATION.md).
+Notably, `linebreaksbr` is now `newlines_to_br`.
+
+On top of Tera's built-ins, `openring-rs` registers the `date`, `striptags`, `urlencode`, and `urlencode_strict` filters and the `now()` function from [tera-contrib](https://crates.io/crates/tera-contrib), since Tera 2.0 moved them out of core.
+`date` takes a strftime `format` (default `%Y-%m-%d`) and an IANA `timezone` (default UTC), e.g. `{{ article.timestamp | date(format="%B %d, %Y") }}`.
 
 ## Caching
 We use OS-standard locations for caching.
