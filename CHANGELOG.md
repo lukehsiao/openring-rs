@@ -6,7 +6,7 @@
 
 - [`3cd1e5a`](https://github.com/lukehsiao/openring-rs/commit/3cd1e5a6360f804fd48b42d918b598e5b9bb2b5e) - **BREAKING CHANGE**: upgrade to tera 2.0, which changes the template language
 
-  Templates written for tera 1.x may need updating, since tera 2.0 removed or renamed several filters (`linebreaksbr` is now `newlines_to_br`, `filesizeformat` and `json_encode` are gone, and more; see the [tera migration guide](https://github.com/Keats/tera/blob/master/MIGRATION.md)). The `date`, `striptags`, `urlencode`, and `urlencode_strict` filters and the `now()` function moved out of tera core into tera-contrib, and openring registers all of them, so those keep working unchanged. The bundled example template is updated to the new syntax.
+  Templates written for tera 1.x may need updating, since tera 2.0 removed or renamed several filters (`linebreaksbr` is now `newlines_to_br`, `filesizeformat` and `json_encode` are gone, and more; see the [tera migration guide](https://github.com/Keats/tera/blob/master/MIGRATION.md)). The `date`, `striptags`, `urlencode`, and `urlencode_strict` filters and the `now()` function moved out of tera core into tera-contrib, and `openring-rs` registers all of them, so those keep working unchanged. The bundled example template is updated to the new syntax.
 
 <pre>
 $ git-stats v0.5.17..v0.6.0
@@ -322,9 +322,9 @@ Total                 11             20        +467       -423    +44
 
 <pre>
 $ git-stats v0.5.5..v0.5.6
- Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
- Luke Hsiao        2              4         +27        -14    +13 
- Total             2              4         +27        -14    +13 
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+ Luke Hsiao        2              4         +27        -14    +13
+ Total             2              4         +27        -14    +13
 </pre>
 
 ## 0.5.5
@@ -335,9 +335,9 @@ $ git-stats v0.5.5..v0.5.6
 
 <pre>
 $ git-stats v0.5.4..v0.5.5
- Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
- Luke Hsiao        2              7        +226         -5   +221 
- Total             2              7        +226         -5   +221 
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+ Luke Hsiao        2              7        +226         -5   +221
+ Total             2              7        +226         -5   +221
 </pre>
 
 ## 0.5.4
@@ -348,9 +348,9 @@ $ git-stats v0.5.4..v0.5.5
 
 <pre>
 $ git-stats v0.5.3..v0.5.4
- Author      Commits  Changed Files  Insertions  Deletions  Net Δ 
- Luke Hsiao        2             11       +1332       -243  +1089 
- Total             2             11       +1332       -243  +1089 
+ Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+ Luke Hsiao        2             11       +1332       -243  +1089
+ Total             2             11       +1332       -243  +1089
 </pre>
 
 ## [0.5.3](https://github.com/lukehsiao/openring-rs/compare/v0.5.2..v0.5.3) - 2026-02-27
