@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0
+
+### Minor Changes
+
+- [`3cd1e5a`](https://github.com/lukehsiao/openring-rs/commit/3cd1e5a6360f804fd48b42d918b598e5b9bb2b5e) - **BREAKING CHANGE**: upgrade to tera 2.0, which changes the template language
+
+  Templates written for tera 1.x may need updating, since tera 2.0 removed or renamed several filters (`linebreaksbr` is now `newlines_to_br`, `filesizeformat` and `json_encode` are gone, and more; see the [tera migration guide](https://github.com/Keats/tera/blob/master/MIGRATION.md)). The `date`, `striptags`, `urlencode`, and `urlencode_strict` filters and the `now()` function moved out of tera core into tera-contrib, and openring registers all of them, so those keep working unchanged. The bundled example template is updated to the new syntax.
+
+<pre>
+$ git-stats v0.5.17..v0.6.0
+Author           Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao             3             18        +557       -735   -178
+dependabot[bot]        1              4          +8         -8      0
+Total                  4             22        +565       -743   -178
+</pre>
+
 ## 0.5.17
 
 ### Patch Changes
