@@ -47,7 +47,7 @@ url = { version = "2.5.8", features = ["serde"] }
 yansi = { version = "1.0.1", features = ["detect-tty", "detect-env"] }
 
 [dev-dependencies]
-hegeltest = { version = "0.22.0", features = ["jiff", "rand"] }
+hegeltest = { version = "0.23.0", features = ["jiff", "rand"] }
 http = "1.4.2"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
