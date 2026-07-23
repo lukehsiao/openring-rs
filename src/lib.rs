@@ -3,6 +3,7 @@ pub mod cache;
 pub mod error;
 pub mod feedfetcher;
 pub mod progress;
+pub mod summarize;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use miette::NamedSource;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use reqwest::Client;
 use serde::Serialize;
 use tera::Tera;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -307,26 +309,25 @@ fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>
 /// saturated while staying well below that floor.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
-// Get all feeds from URLs concurrently.
+/// Set the progress bar's message to the list of URLs still in flight.
+fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
+    pb.set_message(
+        pending
+            .iter()
+            .map(|u| u.as_str())
+            .collect::<Vec<&str>>()
+            .join(", "),
+    );
+}
+
+// Get all feeds from URLs concurrently, sharing one `client`.
 //
-// Skips feeds if there are errors. Shows progress. Errors only when the
-// shared HTTP client cannot be built at all.
-async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Feed, Url)>> {
-    // The progress bar's message lists the fetches still in flight.
-    fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
-        pb.set_message(
-            pending
-                .iter()
-                .map(|u| u.as_str())
-                .collect::<Vec<&str>>()
-                .join(", "),
-        );
-    }
-
-    // One client for the whole run, so every fetch shares a connection pool
-    // instead of paying for TLS setup per feed.
-    let client = feedfetcher::build_client()?;
-
+// Skips feeds if there are errors, and shows progress as fetches finish.
+async fn get_feeds_from_urls(
+    client: &Client,
+    urls: &[Url],
+    cache: &Arc<Cache>,
+) -> Vec<(Feed, Url)> {
     // Registered with the shared progress area so tracing output suspends
     // the bar instead of splicing into it.
     let pb = progress::add(
@@ -391,7 +392,77 @@ async fn get_feeds_from_urls(urls: &[Url], cache: &Arc<Cache>) -> Result<Vec<(Fe
     }
 
     pb.finish_and_clear();
-    Ok(feeds)
+    feeds
+}
+
+/// Derive summaries for the chosen `articles` whose feeds provided none, by
+/// fetching each article's own page (see [`summarize::fetch_summary`]).
+///
+/// Runs after selection so only the articles that will render trigger a page
+/// fetch, and mutates `articles` in place. An article whose page yields
+/// nothing keeps its empty summary, exactly as if the feed had one that was
+/// blank, so nothing here can fail the run.
+async fn fill_missing_summaries(client: &Client, articles: &mut [Article]) {
+    // Owned links so the pending set below borrows from `missing`, leaving
+    // `articles` free to take the derived summaries by index afterward.
+    let missing: Vec<(usize, Url)> = articles
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.summary.is_empty())
+        .map(|(i, a)| (i, a.link.clone()))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    let pb = progress::add(
+        ProgressBar::new(missing.len() as u64).with_style(
+            ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
+                .unwrap(),
+        ),
+    );
+    pb.set_prefix("Summarizing".bold().to_string());
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let mut pending_urls: HashSet<&Url> = missing.iter().map(|(_, url)| url).collect();
+    show_pending(&pb, &pending_urls);
+
+    let mut join_set = JoinSet::new();
+    for (idx, url) in &missing {
+        let client_clone = client.clone();
+        let semaphore_clone = Arc::clone(&semaphore);
+        let idx = *idx;
+        let url = url.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore_clone
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            let summary = summarize::fetch_summary(&client_clone, &url).await;
+            (idx, url, summary)
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        pb.inc(1);
+        match result {
+            Ok((idx, url, summary)) => {
+                pending_urls.remove(&url);
+                show_pending(&pb, &pending_urls);
+                if let Some(summary) = summary {
+                    pb.println(format!("{:>8} {url}", "Summary".bold().green()));
+                    articles[idx].summary = summary;
+                }
+            }
+            Err(e) => {
+                // A task that panicked or was aborted; its article keeps the
+                // empty summary, but the failure must not be silent.
+                warn!(error = %e, "summary fetch task failed");
+            }
+        }
+    }
+
+    pb.finish_and_clear();
 }
 
 /// Fetch every configured feed, render the most recent articles through the
@@ -418,7 +489,11 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
     // duplicate listings collapse and contradictory weights fail fast.
     let feed_set = FeedSet::resolve(&args.url, args.url_file.as_deref())?;
 
-    let feeds = get_feeds_from_urls(&feed_set.urls, &cache).await?;
+    // One client for the whole run, so every fetch shares a connection pool
+    // instead of paying for TLS setup per request, feeds and summary pages alike.
+    let client = feedfetcher::build_client()?;
+
+    let feeds = get_feeds_from_urls(&client, &feed_set.urls, &cache).await;
 
     cache::store_cache(&cache, args.no_cache, CachePath::Default);
 
@@ -429,7 +504,7 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_rng(&mut rand::rng()),
     };
-    let articles = select_articles(
+    let mut articles = select_articles(
         feeds,
         args.per_source,
         args.num_articles,
@@ -437,6 +512,11 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
         &feed_set.weights,
         &mut rng,
     )?;
+
+    // Feeds that ship no summary get one derived from the article page
+    // itself. Deferred until here so only the articles that will render
+    // trigger a page fetch.
+    fill_missing_summaries(&client, &mut articles).await;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
@@ -2414,5 +2494,185 @@ mod tests {
         let mut second = Vec::new();
         assert!(run(make_args(), &mut second).await.is_ok());
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn run_derives_summary_from_page_for_rss_feed_without_summary() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::run;
+        use crate::args::Args;
+
+        let server = MockServer::start().await;
+        // The item carries no <description>, so its summary can only come
+        // from the page its link points at.
+        let feed = format!(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0">
+                <channel>
+                    <title>Mock Feed</title>
+                    <link>{uri}/</link>
+                    <description>desc</description>
+                    <item>
+                        <title>No Summary Article</title>
+                        <link>{uri}/post</link>
+                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                    </item>
+                </channel>
+            </rss>"#,
+            uri = server.uri()
+        );
+        let page = r#"<!DOCTYPE html><html><head>
+            <meta name="description" content="Derived from the page itself.">
+            </head><body><p>Body</p></body></html>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/feed.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&feed))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page.as_bytes(), "text/html"))
+            .mount(&server)
+            .await;
+
+        let mut template = tempfile::NamedTempFile::new().unwrap();
+        template
+            .write_all(b"{% for a in articles %}{{ a.summary }}{% endfor %}")
+            .unwrap();
+
+        let args = Args {
+            url: vec![format!("{}/feed.xml", server.uri())],
+            template_file: template.path().to_path_buf(),
+            no_cache: true,
+            num_articles: 3,
+            per_source: 1,
+            ..Default::default()
+        };
+
+        let mut rendered = Vec::new();
+        assert!(run(args, &mut rendered).await.is_ok());
+        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
+        assert_eq!(rendered, "Derived from the page itself.\n");
+    }
+
+    #[tokio::test]
+    async fn run_derives_summary_from_page_for_atom_feed_without_summary() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::run;
+        use crate::args::Args;
+
+        let server = MockServer::start().await;
+        // The entry carries neither <summary> nor <content>, so its summary
+        // can only come from the page its link points at. This mirrors real
+        // Atom feeds like mitchellh.com/feed.xml.
+        let feed = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title>Mock Atom Feed</title>
+                <link href="{uri}/"/>
+                <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+                <updated>2003-12-13T18:30:02Z</updated>
+                <entry>
+                    <title>No Summary Entry</title>
+                    <link href="{uri}/post"/>
+                    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+                    <updated>2003-12-13T18:30:02Z</updated>
+                </entry>
+            </feed>"#,
+            uri = server.uri()
+        );
+        let page = r#"<!DOCTYPE html><html><head>
+            <meta property="og:description" content="Derived for the Atom entry.">
+            </head><body><p>Body</p></body></html>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/feed.xml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(feed.as_bytes(), "application/atom+xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page.as_bytes(), "text/html"))
+            .mount(&server)
+            .await;
+
+        let mut template = tempfile::NamedTempFile::new().unwrap();
+        template
+            .write_all(b"{% for a in articles %}{{ a.summary }}{% endfor %}")
+            .unwrap();
+
+        let args = Args {
+            url: vec![format!("{}/feed.xml", server.uri())],
+            template_file: template.path().to_path_buf(),
+            no_cache: true,
+            num_articles: 3,
+            per_source: 1,
+            ..Default::default()
+        };
+
+        let mut rendered = Vec::new();
+        assert!(run(args, &mut rendered).await.is_ok());
+        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
+        assert_eq!(rendered, "Derived for the Atom entry.\n");
+    }
+
+    #[tokio::test]
+    async fn run_leaves_summary_empty_when_page_fetch_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::run;
+        use crate::args::Args;
+
+        let server = MockServer::start().await;
+        // The item's link 404s (only /feed.xml is mocked), so no summary can
+        // be derived and the run must still succeed with an empty one.
+        let feed = format!(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0">
+                <channel>
+                    <title>Mock Feed</title>
+                    <link>{uri}/</link>
+                    <description>desc</description>
+                    <item>
+                        <title>No Summary Article</title>
+                        <link>{uri}/missing</link>
+                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                    </item>
+                </channel>
+            </rss>"#,
+            uri = server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/feed.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&feed))
+            .mount(&server)
+            .await;
+
+        let mut template = tempfile::NamedTempFile::new().unwrap();
+        template
+            .write_all(b"{% for a in articles %}[{{ a.summary }}]{% endfor %}")
+            .unwrap();
+
+        let args = Args {
+            url: vec![format!("{}/feed.xml", server.uri())],
+            template_file: template.path().to_path_buf(),
+            no_cache: true,
+            num_articles: 3,
+            per_source: 1,
+            ..Default::default()
+        };
+
+        let mut rendered = Vec::new();
+        assert!(run(args, &mut rendered).await.is_ok());
+        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
+        assert_eq!(rendered, "[]\n");
     }
 }
