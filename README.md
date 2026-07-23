@@ -30,6 +30,7 @@ This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/ope
 - we provide better error messages (via [miette](https://github.com/zkat/miette))
 - we allow filtering feeds with `--before`
 - we support per-feed weighting, so prolific feeds don't dominate the ring
+- we generate a summary from the source if one is missing in the feed
 
 ## Demo
 To see this in action, you can look at the footer of this blog post.
