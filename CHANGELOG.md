@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.1
+
+### Patch Changes
+
+- [`d4d53eb`](https://github.com/lukehsiao/openring-rs/commit/d4d53eb8eeea6077e94cec5ee9a8f85dd97e0309) - **Feature**: derive a summary from the article's page when the feed provides none.
+
+  Some feeds ship entries with no `<summary>` or `<content>`, which left the webring entry blank. `openring` now fetches such an article's own page and derives a summary from it: the page's `<meta name="description">` (or the `og:`/`twitter:` variants), falling back to the article's leading paragraphs. The text is whitespace-normalized, capped at 500 characters, and HTML-escaped so it renders safely through the template's `| safe` filter. Pages are fetched only for the articles that will actually render, after selection, and a fetch that fails or returns non-HTML leaves the summary empty rather than failing the run.
+
+<pre>
+$ git-stats v0.6.0..v0.6.1
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        7             17       +1126       -561   +565
+Total             7             17       +1126       -561   +565
+</pre>
+
 ## 0.6.0
 
 ### Minor Changes
