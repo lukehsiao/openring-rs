@@ -138,9 +138,19 @@ version *args:
 publish:
     #!/usr/bin/env bash
     set -euo pipefail
-    output=$(pnpm changeset publish 2>&1)
-    echo "$output"
-    if echo "$output" | grep -q "New tag:"; then
+
+    # changesets/action passes a path here so it can push tags and cut releases.
+    # Standalone runs get a scratch file so the check below still has input.
+    if [ -z "${CHANGESETS_OUTPUT:-}" ]; then
+        CHANGESETS_OUTPUT=$(mktemp)
+        export CHANGESETS_OUTPUT
+        trap 'rm -f "$CHANGESETS_OUTPUT"' EXIT
+    fi
+
+    pnpm changeset publish
+
+    # The NDJSON output only gets a git-tag event when a release actually happened.
+    if [ -s "$CHANGESETS_OUTPUT" ] && jaq -se 'any(.type == "git-tag")' "$CHANGESETS_OUTPUT" > /dev/null; then
         cargo publish
     else
         echo "No new version published by changesets, skipping cargo publish."

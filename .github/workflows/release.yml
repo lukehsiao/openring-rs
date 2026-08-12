@@ -19,14 +19,14 @@ jobs:
       pull-requests: write
     outputs:
       published: ${{ steps.changesets.outputs.published }}
-      publishedPackages: ${{ steps.changesets.outputs.publishedPackages }}
+      published-packages: ${{ steps.changesets.outputs.published-packages }}
     steps:
-      # changesets/action pushes the release branch over HTTPS using the token
-      # that checkout persists, so credentials must stay available on this job.
+      # changesets/action pushes the release branch and tags through the GitHub
+      # API, so the checkout credentials are dead weight.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: latest
@@ -40,22 +40,21 @@ jobs:
       - run: just install
       - name: Create Release Pull Request or Tag
         id: changesets
-        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        uses: changesets/action@22ccf9aa43179fe9e27dc62e575971d28cce197c # v2.0.0
         with:
-          version: just version
-          publish: just publish
-          commit: "chore(release): bump version"
-          title: "chore(release): bump version"
+          version-script: just version
+          publish-script: just publish
+          commit-message: "chore(release): bump version"
+          pr-title: "chore(release): bump version"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   binaries:
     needs: release
     if: needs.release.outputs.published == 'true'
     uses: ./.github/workflows/binaries.yml
     with:
-      tag: v${{ fromJSON(needs.release.outputs.publishedPackages)[0].version }}
+      tag: v${{ fromJSON(needs.release.outputs.published-packages)[0].version }}
     permissions:
       contents: write
 
@@ -71,7 +70,7 @@ jobs:
       matrix:
         pkgname: [openring-rs, openring-rs-bin]
     env:
-      TAG: v${{ fromJSON(needs.release.outputs.publishedPackages)[0].version }}
+      TAG: v${{ fromJSON(needs.release.outputs.published-packages)[0].version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
