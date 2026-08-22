@@ -97,15 +97,19 @@ jobs:
         if: matrix.ext == 'tar.gz'
         shell: bash
         run: |
+          mkdir stage
+          cp target/${{ matrix.target }}/release/openring LICENSE.md README.md stage/
           tar czf openring-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release openring
+            -C stage openring LICENSE.md README.md
 
       - name: Create archive (zip, Windows)
         if: matrix.ext == 'zip' && runner.os == 'Windows'
         shell: bash
         run: |
-          7z a openring-${{ matrix.target }}.zip \
-            ./target/${{ matrix.target }}/release/openring.exe
+          mkdir stage
+          cp target/${{ matrix.target }}/release/openring.exe LICENSE.md README.md stage/
+          cd stage
+          7z a ../openring-${{ matrix.target }}.zip openring.exe LICENSE.md README.md
 
       - name: Generate checksums
         shell: bash
