@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.2
+
+### Patch Changes
+
+- [`4fc9bdd`](https://github.com/lukehsiao/openring-rs/commit/4fc9bdd20da80987c4a8dbd059f1aa89af275a31) - **fix**: stop pinning the AUR `openring-rs-bin` package to GitHub's auto-generated `archive/` tarball.
+  
+  Release archives now carry `LICENSE.md` and `README.md` alongside the binary, so the `-bin` PKGBUILD no longer needs the `archive/` tarball, whose bytes are not stable over time and could have started failing checksum validation without any release changing.
+
+- [`1ef1ac1`](https://github.com/lukehsiao/openring-rs/commit/1ef1ac1e7f9586ba54681fc82811fe7cea21416b) - **fix**: download AUR `openring-rs-bin` release tarballs to version-suffixed filenames.
+  
+  The release assets are named without a version, so makepkg's source cache collided across releases: a tarball cached from an older install shadowed the new download and failed checksum validation, breaking `paru -S openring-rs-bin` on upgrade.
+
+<pre>
+$ git-stats v0.6.1..v0.6.2
+Author           Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao             7             23        +504      -1026   -522
+dependabot[bot]        3             10         +19        -19      0
+Total                 10             33        +523      -1045   -522
+</pre>
+
 ## 0.6.1
 
 ### Patch Changes
