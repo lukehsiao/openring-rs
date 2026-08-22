@@ -443,14 +443,14 @@ mod tests {
     // so we generate seconds rather than jiff_gs::spans(), whose calendar-unit spans
     // are outside this domain and would trip cache::spans_equal.
     #[hegel::composite]
-    fn retry_spans(tc: hegel::TestCase) -> Span {
+    fn retry_spans(tc: &hegel::TestCase) -> Span {
         let secs = tc.draw(generators::integers::<i64>());
         // Clamp to the span jiff can represent (see cache::MAX_SPAN_SEC).
         Span::new().seconds(secs.clamp(0, MAX_SPAN_SEC))
     }
 
     #[hegel::composite]
-    fn cache_values(tc: hegel::TestCase) -> CacheValue {
+    fn cache_values(tc: &hegel::TestCase) -> CacheValue {
         CacheValue {
             timestamp: tc.draw(jiff_gs::timestamps()),
             retry_after: tc.draw(generators::optional(retry_spans())),

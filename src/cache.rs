@@ -270,7 +270,7 @@ mod tests {
 
     // A well-formed URL, enough to act as a distinct cache key.
     #[hegel::composite]
-    fn urls(tc: hegel::TestCase) -> Url {
+    fn urls(tc: &hegel::TestCase) -> Url {
         let s = tc.draw(generators::urls());
         Url::parse(&s).expect("generated string is a valid URL")
     }
@@ -278,7 +278,7 @@ mod tests {
     // A `CacheValue` with arbitrary fields. All are optional except `timestamp`,
     // and the retry span is kept within what jiff can represent.
     #[hegel::composite]
-    fn cache_values(tc: hegel::TestCase) -> CacheValue {
+    fn cache_values(tc: &hegel::TestCase) -> CacheValue {
         // retry_after only ever holds a time-only span in production, so we
         // generate seconds rather than jiff_gs::spans(): its calendar-unit spans
         // are out of domain and would trip the time-only `spans_equal`.
