@@ -59,6 +59,15 @@ paru -S openring-rs-bin   # prebuilt binary
 
 Both packages provide the `openring` binary and conflict with the original Go-based [`openring`](https://aur.archlinux.org/packages/openring) AUR package, so only one may be installed at a time.
 
+### mise
+[mise](https://mise.jdx.dev/) can install a prebuilt binary directly from the GitHub release, verifying its checksum and SLSA provenance:
+
+```
+mise use -g github:lukehsiao/openring-rs
+```
+
+This puts the `openring` binary on your `PATH`.
+
 ## Usage
 ```
 A webring for static site generators written in Rust
