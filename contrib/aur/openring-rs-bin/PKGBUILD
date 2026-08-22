@@ -12,9 +12,9 @@ conflicts=('openring' 'openring-rs')
 
 _relurl="https://github.com/lukehsiao/openring-rs/releases/download/v$pkgver"
 source=("openring-rs-$pkgver.tar.gz::https://github.com/lukehsiao/openring-rs/archive/v$pkgver.tar.gz")
-source_x86_64=("$_relurl/openring-x86_64-unknown-linux-gnu.tar.gz")
-source_aarch64=("$_relurl/openring-aarch64-unknown-linux-gnu.tar.gz")
-source_armv7h=("$_relurl/openring-armv7-unknown-linux-gnueabihf.tar.gz")
+source_x86_64=("openring-$pkgver-x86_64-unknown-linux-gnu.tar.gz::$_relurl/openring-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("openring-$pkgver-aarch64-unknown-linux-gnu.tar.gz::$_relurl/openring-aarch64-unknown-linux-gnu.tar.gz")
+source_armv7h=("openring-$pkgver-armv7-unknown-linux-gnueabihf.tar.gz::$_relurl/openring-armv7-unknown-linux-gnueabihf.tar.gz")
 
 sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
