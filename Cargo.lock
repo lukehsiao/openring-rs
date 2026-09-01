@@ -903,9 +903,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hegeltest"
-version = "0.31.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afbd26d7e72f9cbaa4aa91c66238b719648304eccfb575ecaa6249c06c871744"
+checksum = "ccacd7cde89f39f70c351c7cabf6d29945e9f2a270450ea9a7c0dd7050ba051e"
 dependencies = [
  "crc32fast",
  "dashu-int",
@@ -914,7 +914,6 @@ dependencies = [
  "jiff",
  "miniz_oxide",
  "parking_lot",
- "paste",
  "rand",
  "rustc-hash",
  "tempfile",
@@ -939,9 +938,9 @@ dependencies = [
 
 [[package]]
 name = "hegeltest-macros"
-version = "0.31.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2cdbd830ec7a11d770fdf1ceacf7c42b2ee697f05583f6e5480c0b58fb963d8"
+checksum = "bf945acd55fceba416b0cf1f25106ed34834f478ceb7f2eea619f0f153f88bf9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1687,12 +1686,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "percent-encoding"
