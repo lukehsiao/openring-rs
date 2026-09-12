@@ -22,7 +22,7 @@
 `openring-rs` is a tool for generating a webring from Atom/RSS feeds, so you can populate a template with articles from those feeds and embed them in your own blog.
 An example template is provided in `in.html`.
 
-This is a Rust-port of Drew DeVault's [openring](https://git.sr.ht/~sircmpwn/openring), with the primary differences being:
+This is a Rust-port of [openring](https://git.sr.ht/~sircmpwn/openring), with the primary improvements being:
 - we respect throttling and send conditional requests by default via caching (disable with `--no-cache`)
 - the template is written using [Tera](https://keats.github.io/tera/) and is provided as an argument, not read from stdin
 - we show a little progress bar
