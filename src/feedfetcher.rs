@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use clap::{crate_name, crate_version};
 use feed_rs::{model::Feed, parser};
 use jiff::Timestamp;
 use reqwest::{
@@ -25,6 +24,9 @@ pub(crate) trait FeedFetcher {
 /// balloon memory and the on-disk cache.
 const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How openring identifies itself to feed servers.
+pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Build the HTTP client shared by every feed fetch: one connection pool and
 /// one TLS setup for the whole run, and the openring user agent.
 ///
@@ -40,7 +42,7 @@ pub(crate) fn build_client() -> Result<Client, OpenringError> {
         .read_timeout(Duration::from_secs(30))
         // Ceiling so a trickling server cannot pin a fetch slot forever.
         .timeout(Duration::from_mins(5))
-        .user_agent(concat!(crate_name!(), '/', crate_version!()))
+        .user_agent(USER_AGENT)
         .build()?)
 }
 
@@ -405,7 +407,7 @@ mod tests {
     use crate::cache::{Cache, CacheValue, MAX_SPAN_SEC};
     use crate::error::OpenringError;
 
-    use super::{FeedFetcher, build_client, logic, normalize_etag};
+    use super::{FeedFetcher, USER_AGENT, build_client, logic, normalize_etag};
 
     // Bounds for gate timestamps/spans. 50e9 seconds is ~1585 years past the
     // epoch; a timestamp plus a span stays under jiff's Timestamp::MAX, while
@@ -1061,8 +1063,6 @@ mod tests {
 
     #[tokio::test]
     async fn sends_openring_user_agent() {
-        use clap::{crate_name, crate_version};
-
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/"))
@@ -1077,10 +1077,7 @@ mod tests {
             .expect("fetched");
 
         let received = server.received_requests().await.unwrap();
-        assert_eq!(
-            received[0].headers.get("user-agent").unwrap(),
-            concat!(crate_name!(), '/', crate_version!())
-        );
+        assert_eq!(received[0].headers.get("user-agent").unwrap(), USER_AGENT);
     }
 
     #[tokio::test]
