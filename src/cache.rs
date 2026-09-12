@@ -28,6 +28,8 @@ pub(crate) enum CachePath<'a> {
 
 /// Describes a feed fetch result that can be serialized to disk
 #[derive(Serialize, Deserialize, Clone, Debug)]
+// Lets property tests draw whole values and report them as pastable Rust.
+#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 pub(crate) struct CacheValue {
     pub(crate) timestamp: Timestamp,
     pub(crate) retry_after: Option<Span>,
@@ -252,9 +254,9 @@ mod tests {
     use tempfile::TempDir;
     use url::Url;
 
-    use hegel::TestCase;
     use hegel::extras::jiff as jiff_gs;
-    use hegel::generators;
+    use hegel::generators::{self, Generator};
+    use hegel::{PrintableGenerator, TestCase};
 
     use super::*;
 
@@ -268,11 +270,15 @@ mod tests {
     // a larger cap mostly inflates per-case entropy and runtime.
     const MAX_TEST_ENTRIES: usize = 50;
 
-    // A well-formed URL, enough to act as a distinct cache key.
-    #[hegel::composite]
-    fn urls(tc: &hegel::TestCase) -> Url {
-        let s = tc.draw(generators::urls());
-        Url::parse(&s).expect("generated string is a valid URL")
+    // A well-formed URL, enough to act as a distinct cache key. `Url` is a
+    // foreign type without a `PrettyPrintable` impl, so the failure report
+    // prints the constructor expression rather than `Url`'s field-by-field Debug.
+    fn urls() -> impl PrintableGenerator<Url> {
+        generators::urls()
+            .map(|s| Url::parse(&s).expect("generated string is a valid URL"))
+            .print_with(|url, printer| {
+                printer.text(&format!("Url::parse({:?}).unwrap()", url.as_str()));
+            })
     }
 
     // A `CacheValue` with arbitrary fields. All are optional except `timestamp`,
@@ -506,7 +512,7 @@ mod tests {
             model: HashMap::new(),
             urls,
         };
-        hegel::stateful::run(machine, tc);
+        hegel::stateful::machine(machine).run(tc);
     }
 
     #[test]
