@@ -10,9 +10,17 @@ updates:
         default-days: 7
       commit-message:
         prefix: "ci(deps)"
+      groups:
+        github-actions:
+          patterns:
+            - "*"
     - package-ecosystem: "cargo"
       directory: "/"
       schedule:
           interval: "monthly"
       cooldown:
         default-days: 7
+      groups:
+        cargo:
+          patterns:
+            - "*"
