@@ -734,11 +734,18 @@ fn resolve_source_link(feed: &Feed, feed_url: &Url) -> Result<Url> {
 /// The best link for an entry, resolved against the feed URL.
 ///
 /// Prefers an `alternate` link, falling back to the first link present.
-/// `None` when the entry has no links or the href cannot be parsed; the
-/// caller skips such entries like any other incomplete entry.
+/// Comment links are never chosen: they point at discussion of the post, not
+/// the post itself. `None` when the entry has no other links or the href
+/// cannot be parsed; the caller skips such entries like any other incomplete
+/// entry.
 fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Option<Url> {
-    let href = find_alternate_link(&entry.links)
-        .or_else(|| entry.links.first().map(|link| link.href.as_str()))?;
+    let href = find_alternate_link(&entry.links).or_else(|| {
+        entry
+            .links
+            .iter()
+            .find(|link| link.target.is_none())
+            .map(|link| link.href.as_str())
+    })?;
     resolve_href(feed_url, href).ok()
 }
 
@@ -1316,6 +1323,7 @@ mod tests {
     fn link(href: &str, rel: Option<&str>) -> Link {
         Link {
             href: href.to_owned(),
+            target: None,
             rel: rel.map(str::to_owned),
             media_type: None,
             href_lang: None,
@@ -1522,6 +1530,38 @@ mod tests {
             </entry>",
         );
         assert_eq!(resolve_entry_link(&none, &feed_url()), None);
+    }
+
+    #[test]
+    fn resolve_entry_link_ignores_comment_links() {
+        // feed-rs lists RSS `<comments>` and `wfw:commentRss` as entry links,
+        // in document order, so a comments link can come first. The article
+        // must point at the post itself.
+        let feed = parse_feed(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0" xmlns:wfw="http://wellformedweb.org/CommentAPI/">
+                <channel>
+                    <title>t</title>
+                    <link>https://example.com/</link>
+                    <item>
+                        <title>a</title>
+                        <comments>https://example.com/a#comments</comments>
+                        <wfw:commentRss>https://example.com/a/feed</wfw:commentRss>
+                        <link>https://example.com/a</link>
+                    </item>
+                    <item>
+                        <title>b</title>
+                        <comments>https://example.com/b#comments</comments>
+                    </item>
+                </channel>
+            </rss>"#,
+        );
+        let links: Vec<_> = feed
+            .entries
+            .iter()
+            .map(|entry| resolve_entry_link(entry, &feed_url()).map(String::from))
+            .collect();
+        assert_eq!(links, [Some("https://example.com/a".to_owned()), None]);
     }
 
     #[test]
