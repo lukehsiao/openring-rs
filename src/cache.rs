@@ -28,8 +28,6 @@ pub(crate) enum CachePath<'a> {
 
 /// Describes a feed fetch result that can be serialized to disk
 #[derive(Serialize, Deserialize, Clone, Debug)]
-// Lets property tests draw whole values and report them as pastable Rust.
-#[cfg_attr(test, derive(hegel::PrettyPrintable))]
 pub(crate) struct CacheValue {
     pub(crate) timestamp: Timestamp,
     pub(crate) retry_after: Option<Span>,
@@ -270,9 +268,9 @@ mod tests {
     // a larger cap mostly inflates per-case entropy and runtime.
     const MAX_TEST_ENTRIES: usize = 50;
 
-    // A well-formed URL, enough to act as a distinct cache key. `Url` is a
-    // foreign type without a `PrettyPrintable` impl, so the failure report
-    // prints the constructor expression rather than `Url`'s field-by-field Debug.
+    // A well-formed URL, enough to act as a distinct cache key. `Url`'s Debug
+    // prints every parsed field, so the failure report prints the constructor
+    // expression instead.
     fn urls() -> impl PrintableGenerator<Url> {
         generators::urls()
             .map(|s| Url::parse(&s).expect("generated string is a valid URL"))
