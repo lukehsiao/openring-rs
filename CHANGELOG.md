@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.4
+
+### Patch Changes
+
+- [`8b821ff`](https://github.com/lukehsiao/openring-rs/commit/8b821ff906645195ff1d8070c46e5924a1b8fe65) - **fix**: a `304 Not Modified` now ends a stored `429` retry window, as a `2xx` already did.
+  
+  Before, a feed that answered `304` after its retry window expired restarted that window on every run, so openring stopped asking the server and kept serving the cached feed.
+
+- [`11aaedf`](https://github.com/lukehsiao/openring-rs/commit/11aaedfbad98b03aa3dd8508f87d6c27f12df6b0) - **fix**: report a feed that fails to fetch as a warning when stderr is not a terminal.
+  
+  Before, the failure only appeared as an `Error` line on the progress bar. The bar is hidden outside a terminal, so cron jobs and CI site builds dropped failed feeds without a word, even with `-vvv`. They now get a warning at the default verbosity, which `-q` silences. In a terminal, the progress bar's `Error` line is unchanged.
+
+<pre>
+$ git-stats v0.6.3..v0.6.4
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        3              7        +160         -6   +154
+Total             3              7        +160         -6   +154
+</pre>
+
 ## 0.6.3
 
 ### Patch Changes
