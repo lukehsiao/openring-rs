@@ -29,7 +29,7 @@ use crate::{
     args::Args,
     cache::Cache,
     clock::Clock,
-    error::Result,
+    error::{OpenringError, Result},
     fan_out::{Outcome, Words, fan_out},
     feed_list::{Feed, UrlsFile},
     feedfetcher::{Fetched, fetch_feed},
@@ -164,7 +164,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
 
     // Read and parse the template before anything else: a wrong path or a
     // syntax error should fail in milliseconds, not after fetching every feed.
-    let tera = template_engine(&deps.fs.read_to_string(&args.template_file)?)?;
+    let tera = template_engine(&read_file(&deps.fs, &args.template_file)?)?;
 
     // One instant for the whole run, so cache pruning and every fetch agree
     // on which entries are too old and which retry windows are open.
@@ -176,10 +176,11 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
 
     // The Feed list from -s values and the urls file. Repeated listings
     // collapse and contradictory weights fail fast, before any fetch.
-    let urls_text = match &args.url_file {
-        Some(path) => Some(deps.fs.read_to_string(path)?),
-        None => None,
-    };
+    let urls_text = args
+        .url_file
+        .as_deref()
+        .map(|path| read_file(&deps.fs, path))
+        .transpose()?;
     let feed_list = feed_list::parse(
         &args.url,
         args.url_file
@@ -260,8 +261,17 @@ fn template_engine(template: &str) -> Result<Tera> {
 fn write_output(mut w: impl Write, output: &str) -> Result<()> {
     match writeln!(w, "{output}").and_then(|()| w.flush()) {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        result => Ok(result?),
+        result => result.map_err(OpenringError::OutputError),
     }
+}
+
+/// Read a file the user named, with the path in the error if it fails.
+fn read_file(fs: &Fs, path: &std::path::Path) -> Result<String> {
+    fs.read_to_string(path)
+        .map_err(|source| OpenringError::ReadFileError {
+            path: path.display().to_string(),
+            source,
+        })
 }
 
 #[cfg(test)]
@@ -300,7 +310,7 @@ mod tests {
     fn write_output_propagates_other_io_errors() {
         assert!(matches!(
             write_output(FailingWriter(std::io::ErrorKind::PermissionDenied), "x"),
-            Err(crate::error::OpenringError::IoError(_))
+            Err(crate::error::OpenringError::OutputError(_))
         ));
     }
 
@@ -398,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_fails_when_the_template_file_is_missing() {
+    async fn run_names_the_template_file_it_cannot_read() {
         let outcome = run_nulled(
             run_args(&["https://feed.example/feed.xml"]),
             None,
@@ -406,11 +416,23 @@ mod tests {
             vec![],
         )
         .await;
-        assert!(matches!(
-            outcome.result,
-            Err(crate::error::OpenringError::IoError(_))
-        ));
+        let err = outcome.result.expect_err("no template to read");
+        assert_eq!(
+            err.to_string(),
+            format!("Failed to read `{TEMPLATE_PATH}`.")
+        );
         assert_eq!(outcome.requests, []);
+    }
+
+    #[tokio::test]
+    async fn run_names_the_urls_file_it_cannot_read() {
+        let args = crate::args::Args {
+            url_file: Some(URLS_PATH.into()),
+            ..run_args(&[])
+        };
+        let outcome = run_nulled(args, Some(TITLES_TEMPLATE), None, vec![]).await;
+        let err = outcome.result.expect_err("no urls file to read");
+        assert_eq!(err.to_string(), format!("Failed to read `{URLS_PATH}`."));
     }
 
     #[tokio::test]

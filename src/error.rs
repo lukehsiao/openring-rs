@@ -35,9 +35,16 @@ pub enum OpenringError {
     #[error(transparent)]
     #[diagnostic(code(openring::parse_feed_error))]
     ParseFeedError(#[from] feed_rs::parser::ParseFeedError),
-    #[error("Failed to open file.")]
-    #[diagnostic(code(openring::io_error))]
-    IoError(#[from] std::io::Error),
+    #[error("Failed to read `{path}`.")]
+    #[diagnostic(code(openring::read_file_error))]
+    ReadFileError {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to write the output.")]
+    #[diagnostic(code(openring::output_error))]
+    OutputError(#[source] std::io::Error),
     #[error("Failed to parse tera template.")]
     #[diagnostic(code(openring::template_error))]
     TemplateError(#[from] tera::Error),
