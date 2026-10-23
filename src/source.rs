@@ -24,7 +24,7 @@ pub(crate) struct Source {
 /// Warns once when the document lists Entries but none of them is complete,
 /// so a feed that yields nothing usable does not vanish silently.
 pub(crate) fn project(document: &Document, feed: Feed) -> Source {
-    let title = sanitize_text(&resolve_source_title(document, &feed.url));
+    let title = resolve_source_title(document, &feed.url);
     let link = resolve_source_link(document, &feed.url);
     let mut articles: Vec<Article> = document
         .entries
@@ -101,18 +101,25 @@ fn attribute_safe(url: &Url) -> Option<Url> {
     (!url.as_str().contains(['\'', '"'])).then_some(url)
 }
 
-/// The display title for a feed: its declared title, or the fetch URL's host
-/// (domain or IP address) when the feed omits the title or leaves it blank.
+/// The display title for a feed, sanitized: its declared title, or the
+/// fetch URL's host (domain or IP address) when the feed omits the title or
+/// it holds nothing to show.
 fn resolve_source_title(document: &Document, feed_url: &Url) -> String {
-    match &document.title {
-        Some(t) if !t.content.is_empty() => t.content.clone(),
-        // Hostless URLs (e.g. file:) can't be fetched anyway, so the full URL
-        // is an adequate last resort.
-        _ => feed_url
-            .host_str()
-            .unwrap_or_else(|| feed_url.as_str())
-            .to_owned(),
-    }
+    document
+        .title
+        .as_ref()
+        .and_then(|t| visible_text(&t.content))
+        // Hostless URLs (e.g. file:) can't be fetched anyway, so the full
+        // URL is an adequate last resort.
+        .unwrap_or_else(|| sanitize_text(feed_url.host_str().unwrap_or(feed_url.as_str())))
+}
+
+/// `raw` sanitized (see [`sanitize_text`]), or `None` when nothing a reader
+/// could see is left: only whitespace, no-break spaces, or markup.
+fn visible_text(raw: &str) -> Option<String> {
+    let text = sanitize_text(raw);
+    let shown = html_escape::decode_html_entities(&text);
+    (!shown.trim().is_empty()).then_some(text)
 }
 
 /// The canonical homepage link for a feed.
@@ -186,9 +193,8 @@ fn sanitize_text(raw: &str) -> String {
 /// already be sanitized.
 ///
 /// Returns `None` exactly when the entry is incomplete: missing a usable
-/// link, title, or date, or carrying a date outside the representable
-/// range. Selection policy (date cutoff, per-source caps) belongs to
-/// [`crate::select`].
+/// link, a title a reader can see, or a date jiff can represent. Selection
+/// policy (date cutoff, per-source caps) belongs to [`crate::select`].
 fn build_article(
     entry: &Entry,
     feed_url: &Url,
@@ -197,11 +203,13 @@ fn build_article(
 ) -> Option<Article> {
     let (Some(link), Some(title), Some(timestamp)) = (
         resolve_entry_link(entry, feed_url),
-        entry.title.as_ref().map(|t| &t.content),
-        entry
-            .published
-            .or(entry.updated)
-            .and_then(|date| Timestamp::from_second(date.timestamp()).ok()),
+        entry.title.as_ref().and_then(|t| visible_text(&t.content)),
+        // The first date jiff can represent, so an out-of-range published
+        // date does not hide a usable updated one.
+        [entry.published, entry.updated]
+            .into_iter()
+            .flatten()
+            .find_map(|date| Timestamp::from_second(date.timestamp()).ok()),
     ) else {
         // Routine for third-party feeds and recurring every run, so the
         // per-entry detail stays at debug; project warns once per feed
@@ -227,9 +235,9 @@ fn build_article(
 
     Some(Article {
         link,
-        // Titles are feed-controlled and the default template embeds them
-        // with `| safe`, so they get the same boundary treatment as summaries.
-        title: sanitize_text(title),
+        // Already sanitized: titles are feed-controlled and the default
+        // template embeds them with `| safe`.
+        title,
         summary,
         source_link: source_link.clone(),
         source_title: source_title.to_owned(),
@@ -500,6 +508,69 @@ mod tests {
             </feed>"#,
         );
         assert_eq!(resolve_source_title(&blank, &feed_url()), "example.com");
+    }
+
+    // A title a reader could not see falls back to the host for a feed,
+    // and makes an entry incomplete.
+    #[test]
+    fn invisible_titles_count_as_missing() {
+        for title in [
+            "   ",
+            "&lt;b&gt;&lt;/b&gt;",
+            "&lt;script&gt;x&lt;/script&gt;",
+            "&amp;nbsp;",
+        ] {
+            let feed = parse_feed(&format!(
+                r#"<?xml version="1.0"?>
+                <feed xmlns="http://www.w3.org/2005/Atom">
+                    <title>{title}</title>
+                    <updated>2020-01-01T00:00:00Z</updated>
+                    <entry>
+                        <title>{title}</title>
+                        <link href="https://example.com/post"/>
+                        <published>2020-01-01T00:00:00Z</published>
+                    </entry>
+                </feed>"#
+            ));
+            assert_eq!(
+                resolve_source_title(&feed, &feed_url()),
+                "example.com",
+                "{title:?}"
+            );
+            assert!(
+                build_article(&feed.entries[0], &feed_url(), "Src", &feed_url()).is_none(),
+                "{title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_published_date_falls_back_to_updated() {
+        // The RSS date parser accepts a five-digit year, past the end of
+        // jiff's range in year 9999.
+        let far = parse_feed(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>t</title><link>https://example.com/</link>
+                <item>
+                    <title>t</title>
+                    <link>https://example.com/post</link>
+                    <pubDate>01 Jan 10000 00:00:00 GMT</pubDate>
+                </item>
+            </channel></rss>"#,
+        );
+        let mut entry = far.entries[0].clone();
+        assert!(
+            entry.published.is_some(),
+            "fixture must carry a parsed date"
+        );
+        entry.updated = Some("2020-01-01T00:00:00Z".parse().unwrap());
+
+        let source_link = Url::parse("https://example.com/").unwrap();
+        let article = build_article(&entry, &feed_url(), "Src", &source_link);
+        assert_eq!(
+            article.map(|a| a.timestamp.to_string()).as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
     }
 
     // A titleless feed must get a fallback title for any URL a feed can be
