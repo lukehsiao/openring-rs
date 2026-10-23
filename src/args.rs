@@ -42,7 +42,7 @@ pub struct Args {
     ///
     /// Accepts the same `URL [WEIGHT]` syntax as the urls file; see --url-file for what
     /// weights do.
-    // Raw strings on purpose: parsing happens in FeedSet::resolve, where errors carry
+    // Raw strings on purpose: parsing happens in feed_list::parse, where errors carry
     // span diagnostics pointing at the offending token. clap's error channel cannot
     // transport a miette report.
     #[arg(short = 's', long, value_hint=ValueHint::Url)]
