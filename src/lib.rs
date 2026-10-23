@@ -8,13 +8,15 @@ mod http;
 mod nullable;
 mod summarize;
 pub mod terminal;
+#[cfg(test)]
+mod test_logs;
 
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
     num::NonZeroUsize,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -30,7 +32,7 @@ use url::Url;
 
 use crate::{
     args::Args,
-    cache::{Cache, CachePath},
+    cache::Cache,
     clock::Clock,
     error::{FeedUrlError, FeedWeightError, OpenringError, Result},
     feedfetcher::fetch_feed,
@@ -320,7 +322,7 @@ async fn get_feeds_from_urls(
     http: &Http,
     terminal: &Terminal,
     urls: &[Url],
-    cache: &Arc<Cache>,
+    cache: &Cache,
     now: Timestamp,
 ) -> Vec<(Feed, Url)> {
     let bar = terminal.bar("Fetching", urls.len());
@@ -333,7 +335,8 @@ async fn get_feeds_from_urls(
     show_pending(&bar, &pending_urls);
 
     for url in urls {
-        let cache_clone = Arc::clone(cache);
+        // Cache is a cheap handle to the shared entries.
+        let cache_clone = cache.clone();
         // Http is a cheap handle to the shared pool.
         let http = http.clone();
         let semaphore_clone = Arc::clone(&semaphore);
@@ -457,6 +460,8 @@ struct Deps {
     http: Http,
     fs: Fs,
     clock: Clock,
+    /// Where the cache lives, if anywhere.
+    cache_path: Option<PathBuf>,
 }
 
 /// Fetch every configured feed, render the most recent articles through the
@@ -478,6 +483,7 @@ pub async fn run(args: Args, terminal: &Terminal, out: impl Write) -> Result<()>
         http: Http::create()?,
         fs: Fs::create(),
         clock: Clock::create(),
+        cache_path: Cache::default_path(),
     };
     run_with(&deps, terminal, args, out).await
 }
@@ -489,8 +495,13 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
     // syntax error should fail in milliseconds, not after fetching every feed.
     let tera = template_engine(&deps.fs.read_to_string(&args.template_file)?)?;
 
-    let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
-    let cache = Arc::new(cache);
+    // One instant for the whole run, so cache pruning and every fetch agree
+    // on which entries are too old and which retry windows are open.
+    let now = deps.clock.now();
+    let cache_path = deps.cache_path.as_deref().filter(|_| !args.no_cache);
+    let cache = cache_path.map_or_else(Cache::default, |path| {
+        Cache::load(&deps.fs, path, args.max_cache_age, now)
+    });
 
     // Merge -s urls and the urls file into one weight-per-feed view, so
     // duplicate listings collapse and contradictory weights fail fast.
@@ -503,12 +514,11 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         url_file.as_ref().map(|(path, text)| (*path, text.as_str())),
     )?;
 
-    // One instant for every fetch, so they all agree on which retry windows
-    // are open and stamp their cache entries alike.
-    let now = deps.clock.now();
     let feeds = get_feeds_from_urls(&deps.http, terminal, &feed_set.urls, &cache, now).await;
 
-    cache::store_cache(&cache, args.no_cache, CachePath::Default);
+    if let Some(path) = cache_path {
+        cache.save(&deps.fs, path);
+    }
 
     // Entropy by default: rotating the weighted picks between runs is the
     // point. A fixed seed reproduces the same picks for tests and stable
@@ -859,6 +869,7 @@ mod tests {
         parse_cli_url, parse_urls_from_file, raw_summary, record_feed, resolve_entry_link,
         resolve_source_link, resolve_source_title, sanitize_html, select_articles, write_output,
     };
+    use crate::test_logs::warnings_logged;
 
     // A writer that always fails with the given kind, standing in for a stdout
     // that has gone away.
@@ -1627,41 +1638,6 @@ mod tests {
         assert_eq!(a.source_link.as_str(), "https://example.com/");
     }
 
-    // Capture everything openring logs at warn level and above while `f`
-    // runs, through tracing's own subscriber machinery rather than a mock.
-    fn warnings_logged(f: impl FnOnce()) -> String {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone)]
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Buffer {
-            type Writer = Buffer;
-            fn make_writer(&'a self) -> Buffer {
-                self.clone()
-            }
-        }
-
-        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(buffer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buffer.0.lock().unwrap().clone();
-        String::from_utf8(bytes).expect("log output is UTF-8")
-    }
-
     #[test]
     fn select_articles_warns_once_when_a_feed_yields_nothing() {
         let feeds = vec![feed(
@@ -2307,6 +2283,7 @@ mod tests {
                     .filter_map(|(path, text)| Some((path, text?))),
             ),
             clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+            cache_path: Some("/cache/cache.json".into()),
         };
         let mut rendered = Vec::new();
         let result = run_with(&deps, &Terminal::create_null(false), args, &mut rendered).await;
@@ -2364,6 +2341,63 @@ mod tests {
         .await;
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
         assert_eq!(outcome.rendered, "Mock Article\n\n");
+    }
+
+    // The cache carries Validators from one run to the next through the
+    // file system, so the second run asks "has it changed?" and renders the
+    // cached feed when the server says no.
+    #[tokio::test]
+    async fn a_second_run_revalidates_with_what_the_first_run_cached() {
+        use super::{Deps, run_with};
+        use crate::{
+            clock::Clock,
+            fs::Fs,
+            http::{Answer, Http, Request},
+            terminal::Terminal,
+        };
+
+        let url = Url::parse("https://feed.example/feed.xml").unwrap();
+        let http = Http::create_null([(
+            url.clone(),
+            vec![
+                Answer::ok(MOCK_RSS).header("etag", "\"v1\""),
+                Answer::status(304),
+            ],
+        )]);
+        let requests = http.track_requests();
+        let deps = Deps {
+            http,
+            fs: Fs::create_null([(TEMPLATE_PATH, TITLES_TEMPLATE)]),
+            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+            cache_path: Some("/cache/cache.json".into()),
+        };
+        let args = || crate::args::Args {
+            no_cache: false,
+            // `Args::default()` keeps nothing; the binary defaults to 30 days.
+            max_cache_age: std::time::Duration::from_hours(30 * 24),
+            ..run_args(&[url.as_str()])
+        };
+
+        for run in ["first", "second"] {
+            let mut rendered = Vec::new();
+            run_with(&deps, &Terminal::create_null(false), args(), &mut rendered)
+                .await
+                .unwrap_or_else(|e| panic!("{run} run failed: {e}"));
+            assert_eq!(String::from_utf8(rendered).unwrap(), "Mock Article\n\n");
+        }
+        assert_eq!(
+            requests.data(),
+            [
+                Request {
+                    url: url.clone(),
+                    headers: vec![],
+                },
+                Request {
+                    url,
+                    headers: vec![("if-none-match", "\"v1\"".to_string())],
+                },
+            ]
+        );
     }
 
     // The example template exercises every filter the docs promise (the
