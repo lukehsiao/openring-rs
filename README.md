@@ -109,6 +109,7 @@ https://daily.example/feed.xml 7
 ```
 
 A feed with weight N contributes a random pick from its N newest articles instead of always its newest.
+With `--before`, those are the N newest articles before that date.
 A daily blog with weight 7 offers, on average, a several-day-old article to the recency sort, so it competes like a weekly blog instead of always winning.
 Choose N as roughly the number of posts the feed publishes in the time your other feeds publish one.
 
@@ -118,6 +119,7 @@ Details worth knowing:
 - With `--per-source p`, a weighted feed contributes at most `min(p, N)` distinct picks from the same pool of N.
 - Listing the same feed twice with different weights is an error.
 - Selection re-rolls on every run. Use `--seed` to make it reproducible, e.g. `--seed "$(date +%Y%m%d)"` rotates daily while keeping rebuilds within the same day stable.
+  Each weighted feed draws from its own stream, derived from the seed and its URL, so a feed that is down for one build does not change the picks of the others.
 
 ## Using Tera templates
 The templates supported by `openring-rs` are written using [Tera](https://keats.github.io/tera/) 2.x.
