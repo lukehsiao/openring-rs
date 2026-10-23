@@ -35,7 +35,7 @@ jiff = { version = "0.2.38", features = ["serde"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", features = ["gzip", "brotli", "zstd", "deflate"] }
-scraper = "0.27.0"
+scraper = "0.29.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tera = "2.4.0"
@@ -44,7 +44,7 @@ tera = "2.4.0"
 # percent-encoding).
 tera-contrib = { version = "0.3.0", default-features = false, features = ["date", "regex", "urlencode"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
