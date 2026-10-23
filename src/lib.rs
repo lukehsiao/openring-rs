@@ -7,26 +7,26 @@ mod feedfetcher;
 mod fs;
 mod http;
 mod nullable;
+mod select;
+mod source;
 mod summarize;
 pub mod terminal;
 #[cfg(test)]
 mod test_logs;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, Write},
-    num::NonZeroUsize,
     path::PathBuf,
     sync::Arc,
 };
 
-use feed_rs::model::{Entry, Feed, Link};
-use jiff::{Timestamp, civil::Date, tz::TimeZone};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use jiff::{Timestamp, tz::TimeZone};
+use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use tera::Tera;
 use tokio::{sync::Semaphore, task::JoinSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
@@ -34,10 +34,11 @@ use crate::{
     cache::Cache,
     clock::Clock,
     error::Result,
-    feed_list::UrlsFile,
+    feed_list::{Feed, UrlsFile},
     feedfetcher::fetch_feed,
     fs::Fs,
     http::Http,
+    source::Source,
     terminal::{Bar, Terminal, Tone},
 };
 
@@ -67,33 +68,33 @@ fn show_pending(bar: &Bar, pending: &HashSet<&Url>) {
     );
 }
 
-// Get all feeds from URLs concurrently, sharing one `http` client, as of
-// `now`.
+// Get all feeds concurrently, sharing one `http` client, as of `now`, and
+// project each fetched document onto its Source.
 //
 // Skips feeds if there are errors, and shows progress as fetches finish.
 async fn get_feeds_from_urls(
     http: &Http,
     terminal: &Terminal,
-    urls: &[Url],
+    feeds: &[Feed],
     cache: &Cache,
     now: Timestamp,
-) -> Vec<(Feed, Url)> {
-    let bar = terminal.bar("Fetching", urls.len());
+) -> Vec<Source> {
+    let bar = terminal.bar("Fetching", feeds.len());
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
 
     let mut join_set = JoinSet::new();
-    let mut pending_urls: HashSet<&Url> = HashSet::from_iter(urls);
+    let mut pending_urls: HashSet<&Url> = feeds.iter().map(|f| &f.url).collect();
 
     show_pending(&bar, &pending_urls);
 
-    for url in urls {
+    for feed in feeds {
         // Cache is a cheap handle to the shared entries.
         let cache_clone = cache.clone();
         // Http is a cheap handle to the shared pool.
         let http = http.clone();
         let semaphore_clone = Arc::clone(&semaphore);
-        let url_clone = url.clone();
+        let feed = feed.clone();
         join_set.spawn(async move {
             // acquire_owned errors only when the semaphore is closed, and
             // this one never is.
@@ -101,20 +102,21 @@ async fn get_feeds_from_urls(
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
-            let fetch_result = fetch_feed(&url_clone, &http, &cache_clone, now).await;
-            (url_clone, fetch_result)
+            let fetch_result = fetch_feed(&feed.url, &http, &cache_clone, now).await;
+            (feed, fetch_result)
         });
     }
-    let mut feeds = Vec::new();
+    let mut sources = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         bar.inc();
         match result {
-            Ok((url, Ok(fetched))) => {
-                pending_urls.remove(&url);
+            Ok((feed, Ok(fetched))) => {
+                let url = &feed.url;
+                pending_urls.remove(url);
                 show_pending(&bar, &pending_urls);
                 match &fetched.stale_because {
-                    None => bar.status("Fetched", Tone::Good, &url),
+                    None => bar.status("Fetched", Tone::Good, url),
                     // The bar is hidden when stderr is not a terminal, and
                     // its lines vanish with it. Only then does the problem
                     // go to the log, so a terminal shows one styled line and
@@ -126,10 +128,11 @@ async fn get_feeds_from_urls(
                         warn!(source = url.as_str(), error = %e, "serving cached feed: fetch failed");
                     }
                 }
-                feeds.push((fetched.document, url));
+                sources.push(source::project(&fetched.document, feed));
             }
-            Ok((url, Err(e))) => {
-                pending_urls.remove(&url);
+            Ok((feed, Err(e))) => {
+                let url = &feed.url;
+                pending_urls.remove(url);
                 show_pending(&bar, &pending_urls);
                 // Hidden bars lose their lines, as above.
                 if terminal.is_visible() {
@@ -149,7 +152,7 @@ async fn get_feeds_from_urls(
     }
 
     bar.finish_and_clear();
-    feeds
+    sources
 }
 
 /// Derive summaries for the chosen `articles` whose feeds provided none, by
@@ -278,13 +281,14 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
             .zip(urls_text.as_deref())
             .map(|(path, text)| UrlsFile { path, text }),
     )?;
-    let urls: Vec<Url> = feed_list.iter().map(|f| f.url.clone()).collect();
-    let weights: HashMap<Url, NonZeroUsize> = feed_list
-        .into_iter()
-        .filter_map(|f| Some((f.url, f.weight?)))
-        .collect();
+    // The cutoff as an instant, computed once: midnight at the start of
+    // `before` in the system timezone.
+    let cutoff = args
+        .before
+        .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
+        .transpose()?;
 
-    let feeds = get_feeds_from_urls(&deps.http, terminal, &urls, &cache, now).await;
+    let sources = get_feeds_from_urls(&deps.http, terminal, &feed_list, &cache, now).await;
 
     if let Some(path) = cache_path {
         cache.save(&deps.fs, path);
@@ -297,14 +301,12 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_rng(&mut rand::rng()),
     };
-    let mut articles = select_articles(
-        feeds,
-        args.per_source,
-        args.num_articles,
-        args.before,
-        &weights,
-        &mut rng,
-    )?;
+    let policy = select::Policy {
+        per_source: args.per_source,
+        num_articles: args.num_articles,
+        cutoff,
+    };
+    let mut articles = select::select(sources, &policy, &mut rng);
 
     // Feeds that ship no summary get one derived from the article page
     // itself. Deferred until here so only the articles that will render
@@ -359,286 +361,11 @@ fn write_output(mut w: impl Write, output: &str) -> Result<()> {
     }
 }
 
-/// Build the sorted, truncated list of articles to render from the fetched feeds.
-///
-/// Each feed contributes its `per_source` most recent qualifying entries,
-/// judged by publication date rather than the order the feed lists them in.
-/// A feed with weight N in `weights` instead fills min(`per_source`, N)
-/// slots drawn at random from its N most recent qualifying entries, so a
-/// prolific feed stops monopolizing the output; slots drawn past the end of
-/// what the feed actually has contribute nothing (see
-/// [`draw_weighted_slots`]). `before` drops anything published after that
-/// date (interpreted in the system timezone) before the caps apply, and
-/// `num_articles` caps the final newest-first list.
-///
-/// Output is a function of the arguments alone: feeds are processed in URL
-/// order, so a fixed `rng` reproduces the same picks no matter what order
-/// the fetches finished in.
-fn select_articles(
-    mut feeds: Vec<(Feed, Url)>,
-    per_source: usize,
-    num_articles: usize,
-    before: Option<Date>,
-    weights: &HashMap<Url, NonZeroUsize>,
-    rng: &mut impl Rng,
-) -> Result<Vec<Article>> {
-    // Convert the cutoff to an instant once: midnight at the start of
-    // `before` in the system timezone.
-    let cutoff = before
-        .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
-        .transpose()?;
-
-    // Fetches finish in nondeterministic order, and every weighted feed
-    // consumes RNG draws, so a fixed iteration order is what makes a fixed
-    // seed actually reproduce the output.
-    feeds.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
-
-    let mut articles = Vec::new();
-    for (feed, url) in feeds {
-        let source_title = resolve_source_title(&feed, &url);
-        let source_link = resolve_source_link(&feed, &url)?;
-        let mut from_feed = Vec::new();
-        let mut incomplete = 0_usize;
-        for entry in &feed.entries {
-            match build_article(entry, &url, &source_title, &source_link)? {
-                Some(article) => {
-                    if cutoff.is_none_or(|c| article.timestamp < c) {
-                        from_feed.push(article);
-                    }
-                }
-                None => incomplete += 1,
-            }
-        }
-        // One actionable signal instead of a warning per malformed entry: a
-        // feed that yields nothing usable would otherwise vanish silently
-        // from the output. Entries the user filtered out via --before do not
-        // count against the feed.
-        if from_feed.is_empty() && incomplete > 0 {
-            warn!(
-                source = url.as_str(),
-                skipped = incomplete,
-                "feed contributed no articles: its entries are missing a link, title, or date"
-            );
-        }
-        from_feed.sort_unstable_by(article_order);
-        match weights.get(&url) {
-            None => from_feed.truncate(per_source),
-            Some(&weight) => {
-                let eligible = from_feed.len();
-                apply_weight(&mut from_feed, weight, per_source, rng);
-                if eligible > 0 && from_feed.is_empty() {
-                    debug!(
-                        source = url.as_str(),
-                        weight = weight.get(),
-                        eligible,
-                        "weighted feed drew only empty slots and sits out this run"
-                    );
-                }
-            }
-        }
-        articles.append(&mut from_feed);
-    }
-
-    articles.sort_unstable_by(article_order);
-    articles.truncate(num_articles);
-    Ok(articles)
-}
-
-/// The 0-based ranks a feed with this weight fills on one run:
-/// min(`per_source`, `weight`) distinct ranks drawn uniformly from
-/// 0..weight, where rank i means "the feed's i-th newest eligible article".
-///
-/// Ranks come from the full 0..weight range on purpose. A rank the feed has
-/// no article for is an empty slot, so a feed with E < N eligible articles
-/// participates in roughly E/N of runs instead of concentrating its odds on
-/// the few articles it has.
-fn draw_weighted_slots(weight: NonZeroUsize, per_source: usize, rng: &mut impl Rng) -> Vec<usize> {
-    rand::seq::index::sample(rng, weight.get(), per_source.min(weight.get())).into_vec()
-}
-
-/// Reduce a weighted feed's newest-first eligible articles to the drawn slots.
-fn apply_weight(
-    from_feed: &mut Vec<Article>,
-    weight: NonZeroUsize,
-    per_source: usize,
-    rng: &mut impl Rng,
-) {
-    let slots = draw_weighted_slots(weight, per_source, rng);
-    let mut rank = 0;
-    from_feed.retain(|_| {
-        let keep = slots.contains(&rank);
-        rank += 1;
-        keep
-    });
-}
-
-/// Newest first, with ties broken by link so the output is identical no
-/// matter what order the feeds finished fetching in.
-fn article_order(a: &Article, b: &Article) -> std::cmp::Ordering {
-    b.timestamp
-        .cmp(&a.timestamp)
-        .then_with(|| a.link.cmp(&b.link))
-}
-
-/// The href of the first link explicitly tagged `rel="alternate"`, if any.
-fn find_alternate_link(links: &[Link]) -> Option<&str> {
-    links
-        .iter()
-        .find(|l| l.rel.as_deref() == Some("alternate"))
-        .map(|l| l.href.as_str())
-}
-
-/// The display title for a feed: its declared title, or the fetch URL's host
-/// (domain or IP address) when the feed omits the title or leaves it blank.
-fn resolve_source_title(feed: &Feed, feed_url: &Url) -> String {
-    match &feed.title {
-        Some(t) if !t.content.is_empty() => t.content.clone(),
-        // Hostless URLs (e.g. file:) can't be fetched anyway, so the full URL
-        // is an adequate last resort.
-        _ => feed_url
-            .host_str()
-            .unwrap_or_else(|| feed_url.as_str())
-            .to_owned(),
-    }
-}
-
-/// The canonical homepage link for a feed.
-///
-/// Prefers the title's `src`, then an `alternate` link, then any link that is
-/// not the feed's own `self` link, and finally falls back to the feed URL.
-fn resolve_source_link(feed: &Feed, feed_url: &Url) -> Result<Url> {
-    if let Some(src) = feed.title.as_ref().and_then(|t| t.src.as_ref()) {
-        return Ok(feed_url.join(src)?);
-    }
-    if let Some(href) = find_alternate_link(&feed.links) {
-        return Ok(feed_url.join(href)?);
-    }
-    // Ignore "self" rels, which usually link back to the feed itself.
-    if let Some(link) = feed.links.iter().find(|l| l.rel.as_deref() != Some("self")) {
-        return Ok(feed_url.join(&link.href)?);
-    }
-    warn!(
-        source = feed_url.as_str(),
-        "feed is missing root link: falling back to rss feed url."
-    );
-    Ok(feed_url.clone())
-}
-
-/// The best link for an entry, resolved against the feed URL.
-///
-/// Prefers an `alternate` link, falling back to the first link present.
-/// Comment links are never chosen: they point at discussion of the post, not
-/// the post itself. `None` when the entry has no other links or the href
-/// cannot be parsed; the caller skips such entries like any other incomplete
-/// entry.
-fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Option<Url> {
-    let href = find_alternate_link(&entry.links).or_else(|| {
-        entry
-            .links
-            .iter()
-            .find(|link| link.target.is_none())
-            .map(|link| link.href.as_str())
-    })?;
-    feed_url.join(href).ok()
-}
-
-/// The entry's summary text, preferring an explicit `<summary>` and falling back
-/// to the content body. `None` when the entry carries neither.
-fn raw_summary(entry: &Entry) -> Option<&str> {
-    entry
-        .summary
-        .as_ref()
-        .map(|s| s.content.as_str())
-        .or_else(|| entry.content.as_ref().and_then(|c| c.body.as_deref()))
-}
-
-/// Decode HTML entities, then strip unsafe markup, returning trimmed HTML
-/// that is safe to embed even through the template's `| safe` filter.
-///
-/// Decoding must come first: cleaning and then decoding would turn harmless
-/// entity-encoded text like `&lt;script&gt;` back into live markup.
-fn sanitize_html(raw: &str) -> String {
-    let decoded = html_escape::decode_html_entities(raw);
-    ammonia::clean(&decoded).trim().to_string()
-}
-
-/// Reduce feed-supplied text like titles to plain text: entities decoded,
-/// every tag stripped, script/style bodies dropped, and the remaining text
-/// kept entity-escaped so it is safe to embed in HTML.
-fn sanitize_text(raw: &str) -> String {
-    let decoded = html_escape::decode_html_entities(raw);
-    let mut builder = ammonia::Builder::empty();
-    builder.clean_content_tags(["script", "style"].into_iter().collect());
-    builder.clean(&decoded).to_string().trim().to_string()
-}
-
-/// Build a renderable [`Article`] from a feed entry.
-///
-/// Returns `Ok(None)` exactly when the entry is incomplete: missing a usable
-/// link, title, or date. Errors only when the entry's date is out of
-/// representable range. Selection policy (date cutoff, per-source caps)
-/// belongs to the caller.
-fn build_article(
-    entry: &Entry,
-    feed_url: &Url,
-    source_title: &str,
-    source_link: &Url,
-) -> Result<Option<Article>> {
-    let (Some(link), Some(title), Some(date)) = (
-        resolve_entry_link(entry, feed_url),
-        entry.title.as_ref().map(|t| &t.content),
-        entry.published.or(entry.updated),
-    ) else {
-        // Routine for third-party feeds and recurring every run, so the
-        // per-entry detail stays at debug; select_articles warns once per
-        // feed when nothing at all is usable.
-        debug!(
-            entry_links = ?entry.links,
-            entry_title = ?entry.title,
-            entry_published = ?entry.published,
-            entry_updated = ?entry.updated,
-            source = feed_url.as_str(),
-            "skipping entry: must have link, title, and a date."
-        );
-        return Ok(None);
-    };
-
-    let timestamp = Timestamp::from_second(date.timestamp())?;
-
-    let summary = raw_summary(entry).map_or_else(
-        || {
-            info!(?link, ?source_link, "no summary or content provided.");
-            String::new()
-        },
-        sanitize_html,
-    );
-
-    Ok(Some(Article {
-        link,
-        // Titles are feed-controlled and the default template embeds them
-        // with `| safe`, so they get the same boundary treatment as summaries.
-        title: sanitize_text(title),
-        summary,
-        source_link: source_link.clone(),
-        source_title: sanitize_text(source_title),
-        timestamp,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, num::NonZeroUsize};
     use url::Url;
 
-    use feed_rs::model::{Entry, Feed, Link};
-    use hegel::{extras::rand as rand_gs, generators};
-    use rand::{SeedableRng, rngs::StdRng};
-
-    use super::{
-        Article, build_article, draw_weighted_slots, find_alternate_link, raw_summary,
-        resolve_entry_link, resolve_source_link, resolve_source_title, sanitize_html,
-        select_articles, write_output,
-    };
+    use super::{Article, write_output};
     use crate::test_logs::warnings_logged;
 
     // A writer that always fails with the given kind, standing in for a stdout
@@ -672,1021 +399,6 @@ mod tests {
             write_output(FailingWriter(std::io::ErrorKind::PermissionDenied), "x"),
             Err(crate::error::OpenringError::IoError(_))
         ));
-    }
-
-    const FEED_URL: &str = "https://example.com/feed.xml";
-
-    fn feed_url() -> Url {
-        Url::parse(FEED_URL).unwrap()
-    }
-
-    // Parse a feed fixture the same way production does.
-    fn parse_feed(xml: &str) -> Feed {
-        feed_rs::parser::parse(xml.as_bytes()).unwrap()
-    }
-
-    // Pair a parsed feed with the URL it was "fetched" from.
-    fn feed(url: &str, xml: &str) -> (Feed, Url) {
-        (parse_feed(xml), Url::parse(url).unwrap())
-    }
-
-    // Wrap entry XML in a minimal Atom feed (title + homepage link present).
-    fn atom(entries: &str) -> String {
-        format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title>Example Blog</title>
-                <link href="https://example.com/"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-                {entries}
-            </feed>"#
-        )
-    }
-
-    // The first entry of a single-entry Atom fixture, for entry-level helpers.
-    fn first_entry(entry_xml: &str) -> Entry {
-        parse_feed(&atom(entry_xml))
-            .entries
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    fn link(href: &str, rel: Option<&str>) -> Link {
-        Link {
-            href: href.to_owned(),
-            target: None,
-            rel: rel.map(str::to_owned),
-            media_type: None,
-            href_lang: None,
-            title: None,
-            length: None,
-        }
-    }
-
-    // Most tests exercise the unweighted path, where the weights map and RNG
-    // are inert; this keeps those call sites stable as the signature grows.
-    fn select_unweighted(
-        feeds: Vec<(Feed, Url)>,
-        per_source: usize,
-        num_articles: usize,
-        before: Option<jiff::civil::Date>,
-    ) -> crate::error::Result<Vec<Article>> {
-        select_articles(
-            feeds,
-            per_source,
-            num_articles,
-            before,
-            &HashMap::new(),
-            &mut StdRng::seed_from_u64(0),
-        )
-    }
-
-    // A feed at `url` with `k` complete entries, where entry `rank` (0-based)
-    // is the rank-th newest and is titled with its rank.
-    fn ranked_feed_at(url: &str, k: usize) -> (Feed, Url) {
-        use std::fmt::Write as _;
-
-        let mut entries = String::new();
-        for rank in 0..k {
-            let day = i64::try_from(k - rank).expect("k is small");
-            let published = jiff::Timestamp::from_second(1_600_000_000 + 86_400 * day)
-                .expect("timestamp in range");
-            write!(
-                entries,
-                r#"<entry>
-                    <title>{rank}</title>
-                    <link href="{url}/{rank}"/>
-                    <published>{published}</published>
-                    <summary>x</summary>
-                </entry>"#
-            )
-            .expect("writing to a String is infallible");
-        }
-        feed(url, &atom(&entries))
-    }
-
-    fn ranked_feed(k: usize) -> (Feed, Url) {
-        ranked_feed_at(FEED_URL, k)
-    }
-
-    fn titles(articles: &[Article]) -> Vec<String> {
-        articles.iter().map(|a| a.title.clone()).collect()
-    }
-
-    fn links(articles: &[Article]) -> Vec<String> {
-        articles.iter().map(|a| a.link.to_string()).collect()
-    }
-
-    #[test]
-    fn find_alternate_link_picks_the_alternate_rel() {
-        let links = vec![
-            link("https://example.com/feed.xml", Some("self")),
-            link("https://example.com/home", Some("alternate")),
-        ];
-        assert_eq!(
-            find_alternate_link(&links),
-            Some("https://example.com/home")
-        );
-        assert_eq!(find_alternate_link(&links[..1]), None);
-    }
-
-    #[test]
-    fn resolve_source_title_prefers_title_then_domain() {
-        // A declared, non-empty title is used verbatim.
-        assert_eq!(
-            resolve_source_title(&parse_feed(&atom("")), &feed_url()),
-            "Example Blog"
-        );
-
-        // An empty or absent title falls back to the fetch URL's domain. Both an
-        // empty <title> and a missing one resolve the same way, so this holds
-        // however feed-rs chooses to represent the blank case.
-        let blank = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title></title>
-                <link href="https://example.com/"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(resolve_source_title(&blank, &feed_url()), "example.com");
-    }
-
-    // A titleless feed must get a fallback title for any URL a feed can be
-    // fetched from, including IP-address hosts where `Url::domain()` is None.
-    #[hegel::test]
-    fn resolve_source_title_falls_back_for_any_http_host(tc: hegel::TestCase) {
-        use hegel::generators::Generator;
-        let host = tc.draw(hegel::one_of!(
-            generators::domains(),
-            generators::ip_addresses().v4().map(|ip| ip.to_string()),
-            // IPv6 hosts go in brackets inside a URL.
-            generators::ip_addresses().v6().map(|ip| format!("[{ip}]")),
-        ));
-        let url = Url::parse(&format!("http://{host}/feed.xml")).expect("generated host is valid");
-
-        let blank = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title></title>
-                <link href="https://example.com/"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        let title = resolve_source_title(&blank, &url);
-        assert_eq!(title, url.host_str().unwrap());
-    }
-
-    #[test]
-    fn resolve_source_link_prefers_alternate_then_other_then_feed_url() {
-        // An explicit alternate link wins over a self link.
-        let alt = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title>t</title>
-                <link rel="self" href="https://example.com/feed.xml"/>
-                <link rel="alternate" href="https://example.com/home"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(
-            resolve_source_link(&alt, &feed_url()).unwrap().as_str(),
-            "https://example.com/home"
-        );
-
-        // With no alternate, any link that is not the feed's own `self` is used.
-        let other = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title>t</title>
-                <link rel="self" href="https://example.com/feed.xml"/>
-                <link rel="related" href="https://example.com/related"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(
-            resolve_source_link(&other, &feed_url()).unwrap().as_str(),
-            "https://example.com/related"
-        );
-    }
-
-    #[test]
-    fn resolve_source_link_falls_back_to_feed_url_without_usable_links() {
-        // A titleless feed whose only link is `self` has nothing else to point
-        // at, so the feed URL itself is used. This also guards the old panic on
-        // a missing <title> (it used to `unwrap`).
-        let bare = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <link rel="self" href="https://example.com/feed.xml"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(resolve_source_link(&bare, &feed_url()).unwrap(), feed_url());
-    }
-
-    #[test]
-    fn resolve_entry_link_resolves_relative_and_skips_linkless() {
-        // An absolute link is returned unchanged.
-        let abs = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://other.example/abs"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>"#,
-        );
-        assert_eq!(
-            resolve_entry_link(&abs, &feed_url()).unwrap().as_str(),
-            "https://other.example/abs"
-        );
-
-        // A relative link is resolved against the feed origin.
-        let rel = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="/rel-path"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>"#,
-        );
-        assert_eq!(
-            resolve_entry_link(&rel, &feed_url()).unwrap().as_str(),
-            "https://example.com/rel-path"
-        );
-
-        // An entry with no links has no resolvable link; the caller skips it.
-        let none = first_entry(
-            r"<entry>
-                <title>t</title>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>",
-        );
-        assert_eq!(resolve_entry_link(&none, &feed_url()), None);
-    }
-
-    #[test]
-    fn resolve_entry_link_ignores_comment_links() {
-        // feed-rs lists RSS `<comments>` and `wfw:commentRss` as entry links,
-        // in document order, so a comments link can come first. The article
-        // must point at the post itself.
-        let feed = parse_feed(
-            r#"<?xml version="1.0"?>
-            <rss version="2.0" xmlns:wfw="http://wellformedweb.org/CommentAPI/">
-                <channel>
-                    <title>t</title>
-                    <link>https://example.com/</link>
-                    <item>
-                        <title>a</title>
-                        <comments>https://example.com/a#comments</comments>
-                        <wfw:commentRss>https://example.com/a/feed</wfw:commentRss>
-                        <link>https://example.com/a</link>
-                    </item>
-                    <item>
-                        <title>b</title>
-                        <comments>https://example.com/b#comments</comments>
-                    </item>
-                </channel>
-            </rss>"#,
-        );
-        let links: Vec<_> = feed
-            .entries
-            .iter()
-            .map(|entry| resolve_entry_link(entry, &feed_url()).map(String::from))
-            .collect();
-        assert_eq!(links, [Some("https://example.com/a".to_owned()), None]);
-    }
-
-    #[test]
-    fn raw_summary_prefers_summary_then_content_then_none() {
-        let summary = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
-                <published>2020-01-01T00:00:00Z</published>
-                <summary>the summary</summary>
-            </entry>"#,
-        );
-        assert_eq!(raw_summary(&summary), Some("the summary"));
-
-        let content_only = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
-                <published>2020-01-01T00:00:00Z</published>
-                <content type="html">&lt;p&gt;body&lt;/p&gt;</content>
-            </entry>"#,
-        );
-        assert!(raw_summary(&content_only).unwrap().contains("body"));
-
-        let neither = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>"#,
-        );
-        assert_eq!(raw_summary(&neither), None);
-    }
-
-    #[test]
-    fn sanitize_html_strips_scripts_keeps_text_and_trims() {
-        let out = sanitize_html("  <p>Safe</p><script>alert(1)</script> Tom &amp; Jerry  ");
-        // ammonia removes the <script> and keeps text entity-escaped, so the
-        // result stays safe even through the template's `| safe` filter.
-        assert!(!out.contains("script"));
-        assert!(out.contains("Safe"));
-        assert!(out.contains("Tom &amp; Jerry"));
-        assert_eq!(out, out.trim());
-    }
-
-    // No input, however it encodes its markup, may come out of sanitization
-    // with a live <script> tag. Decoding entities after cleaning used to turn
-    // harmless text like "&lt;script&gt;" back into real markup, which the
-    // default template then embedded raw via `| safe`.
-    #[hegel::test]
-    fn sanitize_html_never_emits_live_markup(tc: hegel::TestCase) {
-        let payload = tc.draw(hegel::one_of!(
-            generators::just("<script>alert(1)</script>".to_string()),
-            generators::just("&lt;script&gt;alert(1)&lt;/script&gt;".to_string()),
-            generators::just("&amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt;".to_string()),
-            generators::text(),
-        ));
-        let prefix = tc.draw(generators::text().max_size(16));
-        let suffix = tc.draw(generators::text().max_size(16));
-        let out = sanitize_html(&format!("{prefix}{payload}{suffix}"));
-        assert!(
-            !out.to_lowercase().contains("<script"),
-            "live script tag in sanitized output: {out:?}"
-        );
-    }
-
-    #[test]
-    fn build_article_sanitizes_title_and_source_title() {
-        let source_link = Url::parse("https://example.com/").unwrap();
-        // The XML parser decodes the entities, so the in-memory title holds
-        // real <script> markup, exactly as a hostile feed would deliver it.
-        let entry = first_entry(
-            r#"<entry>
-                <title>&lt;script&gt;alert(1)&lt;/script&gt;Hello</title>
-                <link href="https://example.com/x"/>
-                <published>2020-01-01T00:00:00Z</published>
-                <summary>s</summary>
-            </entry>"#,
-        );
-        let article = build_article(
-            &entry,
-            &feed_url(),
-            "<script>evil()</script>Src",
-            &source_link,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(article.title, "Hello");
-        assert_eq!(article.source_title, "Src");
-    }
-
-    #[test]
-    fn build_article_assembles_fields_and_skips_incomplete() {
-        let source_link = Url::parse("https://example.com/").unwrap();
-        let complete = first_entry(
-            r#"<entry>
-                <title>Complete Post</title>
-                <link href="https://example.com/complete"/>
-                <published>2024-01-01T00:00:00Z</published>
-                <summary>hello</summary>
-            </entry>"#,
-        );
-
-        // Every field of a complete entry flows through, source info included.
-        // The date cutoff is select_articles' concern, exercised there.
-        let built = build_article(&complete, &feed_url(), "Src", &source_link)
-            .unwrap()
-            .unwrap();
-        assert_eq!(built.title, "Complete Post");
-        assert_eq!(built.link.as_str(), "https://example.com/complete");
-        assert_eq!(built.summary, "hello");
-        assert_eq!(built.source_title, "Src");
-        assert_eq!(built.source_link, source_link);
-
-        // An entry missing its date is skipped rather than erroring.
-        let dateless = first_entry(
-            r#"<entry>
-                <title>Dateless</title>
-                <link href="https://example.com/x"/>
-                <summary>s</summary>
-            </entry>"#,
-        );
-        assert!(
-            build_article(&dateless, &feed_url(), "Src", &source_link)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn select_articles_extracts_basic_fields() {
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>First Post</title>
-                    <link href="https://example.com/first"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>Hello world</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
-        assert_eq!(articles.len(), 1);
-        let a = &articles[0];
-        assert_eq!(a.link.as_str(), "https://example.com/first");
-        assert_eq!(a.title, "First Post");
-        assert_eq!(a.summary, "Hello world");
-        assert_eq!(a.source_title, "Example Blog");
-        assert_eq!(a.source_link.as_str(), "https://example.com/");
-    }
-
-    #[test]
-    fn select_articles_warns_once_when_a_feed_yields_nothing() {
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r"<entry>
-                    <title>No Link A</title>
-                    <published>2021-01-01T00:00:00Z</published>
-                </entry>
-                <entry>
-                    <title>No Link B</title>
-                    <published>2021-01-02T00:00:00Z</published>
-                </entry>",
-            ),
-        )];
-
-        let logs = warnings_logged(|| {
-            let articles = select_unweighted(feeds, 10, 10, None).unwrap();
-            assert!(articles.is_empty());
-        });
-        // One aggregated warning naming the feed and the count, not one line
-        // per malformed entry.
-        assert_eq!(
-            logs.matches("contributed no articles").count(),
-            1,
-            "logs: {logs}"
-        );
-        assert!(logs.contains("skipped=2"), "logs: {logs}");
-    }
-
-    #[test]
-    fn select_articles_is_quiet_about_partial_skips() {
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>No Link</title>
-                    <published>2021-01-01T00:00:00Z</published>
-                </entry>
-                <entry>
-                    <title>Good</title>
-                    <link href="https://example.com/g"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let logs = warnings_logged(|| {
-            let articles = select_unweighted(feeds, 10, 10, None).unwrap();
-            assert_eq!(articles.len(), 1);
-        });
-        // A feed that still renders something is not warn-worthy; the
-        // per-entry detail lives at debug level.
-        assert_eq!(logs, "", "expected no warnings for a partially usable feed");
-    }
-
-    #[test]
-    fn select_articles_is_quiet_when_only_the_cutoff_filters() {
-        use jiff::civil::date;
-
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>New</title>
-                    <link href="https://example.com/new"/>
-                    <published>2024-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let logs = warnings_logged(|| {
-            let articles = select_unweighted(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
-            assert!(articles.is_empty());
-        });
-        // --before is the user's own setting; filtering on it is not a fault
-        // of the feed and must not warn.
-        assert_eq!(logs, "", "expected no warnings for cutoff-only filtering");
-    }
-
-    #[test]
-    fn select_articles_skips_malformed_entries_instead_of_aborting() {
-        // One linkless entry in one feed must not take down the whole run;
-        // it is skipped exactly like entries missing a title or date.
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>No Link</title>
-                    <published>2021-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Good</title>
-                    <link href="https://example.com/good"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let articles = select_unweighted(feeds, 10, 10, None).unwrap();
-        assert_eq!(articles.len(), 1);
-        assert_eq!(articles[0].title, "Good");
-    }
-
-    #[test]
-    fn select_articles_caps_entries_per_source() {
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>Newest</title>
-                    <link href="https://example.com/3"/>
-                    <published>2022-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Middle</title>
-                    <link href="https://example.com/2"/>
-                    <published>2021-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Oldest</title>
-                    <link href="https://example.com/1"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        // per_source = 1 keeps only the most recent entry.
-        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
-        assert_eq!(articles.len(), 1);
-        assert_eq!(articles[0].title, "Newest");
-    }
-
-    #[test]
-    fn select_articles_picks_most_recent_per_source_regardless_of_feed_order() {
-        // Entries listed oldest-first: per_source must still pick by date,
-        // not document order. Nothing in RSS/Atom promises newest-first.
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>Oldest</title>
-                    <link href="https://example.com/1"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Middle</title>
-                    <link href="https://example.com/2"/>
-                    <published>2021-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Newest</title>
-                    <link href="https://example.com/3"/>
-                    <published>2022-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let articles = select_unweighted(feeds, 1, 10, None).unwrap();
-        assert_eq!(articles.len(), 1);
-        assert_eq!(articles[0].title, "Newest");
-    }
-
-    #[test]
-    fn select_articles_per_source_counts_only_qualifying_entries() {
-        use jiff::civil::date;
-
-        // The newest entry falls after --before; it must not use up the
-        // per-source budget and shadow the older entry that qualifies.
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>New</title>
-                    <link href="https://example.com/new"/>
-                    <published>2024-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Old</title>
-                    <link href="https://example.com/old"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        let articles = select_unweighted(feeds, 1, 10, Some(date(2022, 1, 1))).unwrap();
-        assert_eq!(articles.len(), 1);
-        assert_eq!(articles[0].title, "Old");
-    }
-
-    #[test]
-    fn select_articles_sorts_newest_first_and_caps_total() {
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>Oldest</title>
-                    <link href="https://example.com/1"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Newest</title>
-                    <link href="https://example.com/3"/>
-                    <published>2022-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>Middle</title>
-                    <link href="https://example.com/2"/>
-                    <published>2021-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        // num_articles = 2 keeps the two newest, sorted newest-first.
-        let articles = select_unweighted(feeds, 10, 2, None).unwrap();
-        assert_eq!(articles.len(), 2);
-        assert_eq!(articles[0].title, "Newest");
-        assert_eq!(articles[1].title, "Middle");
-        assert!(articles[0].timestamp > articles[1].timestamp);
-    }
-
-    #[test]
-    fn select_articles_orders_ties_deterministically() {
-        // Feeds arrive in fetch-completion order, which varies run to run.
-        // Articles with identical timestamps must still come out in the same
-        // order, or downstream static sites churn on every regeneration.
-        let entry_a = r#"<entry>
-            <title>A</title>
-            <link href="https://a.example/post"/>
-            <published>2022-01-01T00:00:00Z</published>
-            <summary>x</summary>
-        </entry>"#;
-        let entry_b = r#"<entry>
-            <title>B</title>
-            <link href="https://b.example/post"/>
-            <published>2022-01-01T00:00:00Z</published>
-            <summary>x</summary>
-        </entry>"#;
-        let feed_a = || feed("https://a.example/feed.xml", &atom(entry_a));
-        let feed_b = || feed("https://b.example/feed.xml", &atom(entry_b));
-
-        let one = select_unweighted(vec![feed_a(), feed_b()], 10, 10, None).unwrap();
-        let two = select_unweighted(vec![feed_b(), feed_a()], 10, 10, None).unwrap();
-
-        assert_eq!(titles(&one), titles(&two));
-    }
-
-    #[test]
-    fn select_articles_drops_entry_published_exactly_at_the_cutoff() {
-        use jiff::{civil::date, tz::TimeZone};
-
-        // An article published at the very instant `before` begins is not
-        // "before" that date and must be excluded.
-        let cutoff_date = date(2022, 1, 1);
-        let cutoff = cutoff_date
-            .to_zoned(TimeZone::system())
-            .unwrap()
-            .timestamp();
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(&format!(
-                r#"<entry>
-                    <title>At Cutoff</title>
-                    <link href="https://example.com/at"/>
-                    <published>{cutoff}</published>
-                    <summary>x</summary>
-                </entry>"#
-            )),
-        )];
-
-        let articles = select_unweighted(feeds, 10, 10, Some(cutoff_date)).unwrap();
-        assert!(
-            articles.is_empty(),
-            "boundary article was kept: {articles:?}"
-        );
-    }
-
-    #[test]
-    fn select_articles_drops_entries_at_or_after_before_date() {
-        use jiff::civil::date;
-
-        let feeds = vec![feed(
-            FEED_URL,
-            &atom(
-                r#"<entry>
-                    <title>Old</title>
-                    <link href="https://example.com/old"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>
-                <entry>
-                    <title>New</title>
-                    <link href="https://example.com/new"/>
-                    <published>2024-01-01T00:00:00Z</published>
-                    <summary>x</summary>
-                </entry>"#,
-            ),
-        )];
-
-        // The two-year gap dwarfs any timezone offset, so the boundary is stable.
-        let articles = select_unweighted(feeds, 10, 10, Some(date(2022, 1, 1))).unwrap();
-        assert_eq!(articles.len(), 1);
-        assert_eq!(articles[0].title, "Old");
-    }
-
-    // A weighted feed only ever contributes articles among its N newest
-    // eligible ones, and never more than min(per_source, N) of them.
-    #[hegel::test]
-    fn weighted_selection_stays_within_the_n_newest(tc: hegel::TestCase) {
-        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(40));
-        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
-        // Unbounded weight: a huge pool must neither panic nor hang.
-        let weight = NonZeroUsize::new(tc.draw(generators::integers::<usize>().min_value(1)))
-            .expect("min_value is 1");
-        let mut rng = tc.draw(rand_gs::randoms());
-
-        let weights = HashMap::from([(feed_url(), weight)]);
-        let articles = select_articles(
-            vec![ranked_feed(k)],
-            per_source,
-            usize::MAX,
-            None,
-            &weights,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert!(articles.len() <= per_source.min(weight.get()));
-        let mut ranks: Vec<usize> = titles(&articles)
-            .iter()
-            .map(|t| t.parse().expect("titles are ranks"))
-            .collect();
-        ranks.sort_unstable();
-        let drawn = ranks.len();
-        ranks.dedup();
-        assert_eq!(ranks.len(), drawn, "every pick is a distinct article");
-        assert!(
-            ranks.iter().all(|&r| r < weight.get()),
-            "picks beyond the N newest: {ranks:?}"
-        );
-    }
-
-    // The slot lottery itself: distinct ranks, inside the pool, exactly
-    // min(per_source, weight) of them.
-    #[hegel::test]
-    fn draw_weighted_slots_draws_distinct_ranks_within_the_pool(tc: hegel::TestCase) {
-        let weight = NonZeroUsize::new(tc.draw(generators::integers::<usize>().min_value(1)))
-            .expect("min_value is 1");
-        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
-        let mut rng = tc.draw(rand_gs::randoms());
-
-        let mut slots = draw_weighted_slots(weight, per_source, &mut rng);
-
-        assert_eq!(slots.len(), per_source.min(weight.get()));
-        assert!(slots.iter().all(|&s| s < weight.get()));
-        slots.sort_unstable();
-        let drawn = slots.len();
-        slots.dedup();
-        assert_eq!(slots.len(), drawn, "slots must be distinct");
-    }
-
-    // Weight 1 pins the pool to the single newest article, which is exactly
-    // what the unweighted path picks at per_source = 1.
-    #[hegel::test]
-    fn weight_one_matches_unweighted_selection(tc: hegel::TestCase) {
-        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
-        let mut rng = tc.draw(rand_gs::randoms());
-
-        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(1).expect("non-zero"))]);
-        let weighted =
-            select_articles(vec![ranked_feed(k)], 1, 10, None, &weights, &mut rng).unwrap();
-        let unweighted = select_unweighted(vec![ranked_feed(k)], 1, 10, None).unwrap();
-
-        assert_eq!(titles(&weighted), titles(&unweighted));
-    }
-
-    // Without weights the RNG must be inert: any two seeds give identical
-    // output, so unweighted users keep deterministic builds.
-    #[hegel::test]
-    fn unweighted_selection_ignores_the_rng(tc: hegel::TestCase) {
-        let k = tc.draw(generators::integers::<usize>().min_value(0).max_value(10));
-        let per_source = tc.draw(generators::integers::<usize>().min_value(0).max_value(3));
-        let num_articles = tc.draw(generators::integers::<usize>().min_value(0).max_value(5));
-        let seed_a = tc.draw(generators::integers::<u64>());
-        let seed_b = tc.draw(generators::integers::<u64>());
-
-        let one = select_articles(
-            vec![ranked_feed(k)],
-            per_source,
-            num_articles,
-            None,
-            &HashMap::new(),
-            &mut StdRng::seed_from_u64(seed_a),
-        )
-        .unwrap();
-        let two = select_articles(
-            vec![ranked_feed(k)],
-            per_source,
-            num_articles,
-            None,
-            &HashMap::new(),
-            &mut StdRng::seed_from_u64(seed_b),
-        )
-        .unwrap();
-
-        assert_eq!(titles(&one), titles(&two));
-    }
-
-    // The --seed contract: a fixed seed reproduces the picks even though
-    // fetches complete in arbitrary order. Fails without the URL sort in
-    // select_articles.
-    #[hegel::test]
-    fn same_seed_reproduces_selection_regardless_of_fetch_order(tc: hegel::TestCase) {
-        let seed = tc.draw(generators::integers::<u64>());
-        let hosts = ["a.example", "b.example", "c.example"];
-        let mut weights = HashMap::new();
-        let mut entry_counts = Vec::new();
-        for host in hosts {
-            entry_counts.push(tc.draw(generators::integers::<usize>().min_value(0).max_value(8)));
-            if let Some(w) = tc.draw(generators::optional(
-                generators::integers::<usize>().min_value(1).max_value(5),
-            )) {
-                weights.insert(
-                    Url::parse(&format!("https://{host}/feed.xml")).expect("static url"),
-                    NonZeroUsize::new(w).expect("min_value is 1"),
-                );
-            }
-        }
-        let build = |counts: &[usize]| -> Vec<(Feed, Url)> {
-            hosts
-                .iter()
-                .zip(counts)
-                .map(|(host, &k)| ranked_feed_at(&format!("https://{host}/feed.xml"), k))
-                .collect()
-        };
-        let mut backward = build(&entry_counts);
-        backward.reverse();
-
-        let one = select_articles(
-            build(&entry_counts),
-            1,
-            10,
-            None,
-            &weights,
-            &mut StdRng::seed_from_u64(seed),
-        )
-        .unwrap();
-        let two = select_articles(
-            backward,
-            1,
-            10,
-            None,
-            &weights,
-            &mut StdRng::seed_from_u64(seed),
-        )
-        .unwrap();
-
-        assert_eq!(links(&one), links(&two));
-    }
-
-    #[test]
-    fn sparse_weighted_feed_sits_out_some_runs_without_warning() {
-        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(5).expect("non-zero"))]);
-
-        let mut contributed = 0;
-        let mut sat_out_seed = None;
-        for seed in 0..200 {
-            let articles = select_articles(
-                vec![ranked_feed(1)],
-                1,
-                10,
-                None,
-                &weights,
-                &mut StdRng::seed_from_u64(seed),
-            )
-            .unwrap();
-            match articles.as_slice() {
-                [] => sat_out_seed = Some(seed),
-                [only] => {
-                    assert_eq!(only.title, "0", "the only eligible article is rank 0");
-                    contributed += 1;
-                }
-                more => panic!("one eligible article cannot yield {} picks", more.len()),
-            }
-        }
-        // One article in a pool of five contributes on ~1/5 of seeds; both
-        // outcomes are a statistical certainty across 200 seeds.
-        assert!(contributed > 0, "feed never contributed");
-        let sat_out_seed = sat_out_seed.expect("feed never sat out");
-
-        let logs = warnings_logged(|| {
-            let articles = select_articles(
-                vec![ranked_feed(1)],
-                1,
-                10,
-                None,
-                &weights,
-                &mut StdRng::seed_from_u64(sat_out_seed),
-            )
-            .unwrap();
-            assert!(articles.is_empty());
-        });
-        // Sitting out the lottery is the feature working, not a feed fault.
-        assert_eq!(logs, "", "sitting out must not warn");
-    }
-
-    #[test]
-    fn weight_caps_contribution_below_per_source() {
-        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(2).expect("non-zero"))]);
-        // Weight 2 with per_source 3: both slots in the pool of two are
-        // always drawn, so exactly the two newest come back on any seed.
-        for seed in 0..20 {
-            let articles = select_articles(
-                vec![ranked_feed(5)],
-                3,
-                10,
-                None,
-                &weights,
-                &mut StdRng::seed_from_u64(seed),
-            )
-            .unwrap();
-            let mut got = titles(&articles);
-            got.sort_unstable();
-            assert_eq!(got, ["0", "1"]);
-        }
-    }
-
-    #[test]
-    fn weighted_slots_count_only_qualifying_entries() {
-        use jiff::civil::date;
-
-        // The newest entry falls after --before; with weight 1 the pick must
-        // be the newest qualifying entry, exactly like the unweighted path.
-        let feeds = || {
-            vec![feed(
-                FEED_URL,
-                &atom(
-                    r#"<entry>
-                        <title>New</title>
-                        <link href="https://example.com/new"/>
-                        <published>2024-01-01T00:00:00Z</published>
-                        <summary>x</summary>
-                    </entry>
-                    <entry>
-                        <title>Old</title>
-                        <link href="https://example.com/old"/>
-                        <published>2020-01-01T00:00:00Z</published>
-                        <summary>x</summary>
-                    </entry>"#,
-                ),
-            )]
-        };
-        let weights = HashMap::from([(feed_url(), NonZeroUsize::new(1).expect("non-zero"))]);
-        for seed in 0..20 {
-            let articles = select_articles(
-                feeds(),
-                1,
-                10,
-                Some(date(2022, 1, 1)),
-                &weights,
-                &mut StdRng::seed_from_u64(seed),
-            )
-            .unwrap();
-            assert_eq!(titles(&articles), ["Old"]);
-        }
     }
 
     // A whole run against nulled edges: files in memory, canned HTTP
@@ -1810,6 +522,35 @@ mod tests {
         .await;
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
         assert_eq!(outcome.rendered, "Mock Article\n\n");
+    }
+
+    // --before reaches selection: only articles dated before that day
+    // render. The dates sit years apart, so the system timezone that sets
+    // midnight cannot move either across the cutoff.
+    #[tokio::test]
+    async fn run_renders_only_articles_before_the_before_date() {
+        let url = "https://feed.example/feed.xml";
+        let feed = r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>t</title><link>https://feed.example/</link>
+                <item><title>Old</title><link>https://feed.example/old</link>
+                    <pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate></item>
+                <item><title>New</title><link>https://feed.example/new</link>
+                    <pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        let args = crate::args::Args {
+            before: Some(jiff::civil::date(2022, 1, 1)),
+            per_source: 10,
+            ..run_args(&[url])
+        };
+        let outcome = run_nulled(
+            args,
+            Some(TITLES_TEMPLATE),
+            None,
+            vec![(url, crate::http::Answer::ok(feed))],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(outcome.rendered, "Old\n\n");
     }
 
     // The cache carries Validators from one run to the next through the
@@ -2049,7 +790,7 @@ mod tests {
         let first = run().await;
         assert!(first.result.is_ok(), "{:?}", first.result);
         // The --seed contract holds through the whole pipeline, argv to
-        // rendered bytes, not just inside select_articles.
+        // rendered bytes, not just inside select::select.
         let second = run().await;
         assert_eq!(first.rendered, second.rendered);
     }

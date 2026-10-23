@@ -38,9 +38,6 @@ pub enum OpenringError {
     #[error("Failed to open file.")]
     #[diagnostic(code(openring::io_error))]
     IoError(#[from] std::io::Error),
-    #[error("Failed to parse URL.")]
-    #[diagnostic(code(openring::url_parse_error))]
-    UrlParseError(#[from] url::ParseError),
     #[error("Failed to parse tera template.")]
     #[diagnostic(code(openring::template_error))]
     TemplateError(#[from] tera::Error),
