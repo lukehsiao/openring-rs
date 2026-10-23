@@ -14,7 +14,7 @@ use url::Url;
 use crate::error::{FeedUrlError, FeedWeightError, OpenringError, Result};
 
 /// A web feed the user configured, with its optional Weight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Feed {
     pub(crate) url: Url,
     pub(crate) weight: Option<NonZeroUsize>,
