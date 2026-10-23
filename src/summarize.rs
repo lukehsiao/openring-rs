@@ -100,7 +100,7 @@ async fn read_page_capped(url: &Url, mut resp: reqwest::Response) -> Option<Vec<
 /// Output is whitespace-normalized plain text, cut to [`MAX_SUMMARY_CHARS`],
 /// with HTML special characters escaped so it is safe to embed even through
 /// the template's `| safe` filter.
-pub(crate) fn extract_summary(html: &str) -> Option<String> {
+fn extract_summary(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
     let text = meta_description(&doc).or_else(|| leading_paragraphs(&doc))?;
     Some(html_escape::encode_text(&truncate_chars(text, MAX_SUMMARY_CHARS)).into_owned())

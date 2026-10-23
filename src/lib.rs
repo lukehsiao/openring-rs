@@ -1,9 +1,9 @@
 pub mod args;
-pub mod cache;
+mod cache;
 pub mod error;
-pub mod feedfetcher;
+mod feedfetcher;
 pub mod progress;
-pub mod summarize;
+mod summarize;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,28 +32,17 @@ use crate::{
     args::Args,
     cache::{Cache, CachePath},
     error::{FeedUrlError, FeedWeightError, OpenringError, Result},
-    feedfetcher::FeedFetcher,
+    feedfetcher::fetch_feed,
 };
 
 #[derive(Serialize, Debug)]
-pub struct Article {
+pub(crate) struct Article {
     link: Url,
     title: String,
     summary: String,
     source_link: Url,
     source_title: String,
     timestamp: Timestamp,
-}
-
-/// Resolve a possibly-relative URL `href` against the URL of the feed it came
-/// from, following RFC 3986: absolute hrefs stand alone, root-relative hrefs
-/// resolve against the feed's origin, and path-relative or protocol-relative
-/// hrefs resolve against the feed URL itself.
-pub(crate) fn resolve_href(
-    feed_url: &Url,
-    href: &str,
-) -> std::result::Result<Url, url::ParseError> {
-    feed_url.join(href)
 }
 
 /// Whitespace-separated tokens of `line`, each with the byte offset it
@@ -358,7 +347,7 @@ async fn get_feeds_from_urls(
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
-            let fetch_result = url_clone.fetch_feed(&client_clone, &cache_clone).await;
+            let fetch_result = fetch_feed(&url_clone, &client_clone, &cache_clone).await;
             (url_clone, fetch_result)
         });
     }
@@ -723,14 +712,14 @@ fn resolve_source_title(feed: &Feed, feed_url: &Url) -> String {
 /// not the feed's own `self` link, and finally falls back to the feed URL.
 fn resolve_source_link(feed: &Feed, feed_url: &Url) -> Result<Url> {
     if let Some(src) = feed.title.as_ref().and_then(|t| t.src.as_ref()) {
-        return Ok(resolve_href(feed_url, src)?);
+        return Ok(feed_url.join(src)?);
     }
     if let Some(href) = find_alternate_link(&feed.links) {
-        return Ok(resolve_href(feed_url, href)?);
+        return Ok(feed_url.join(href)?);
     }
     // Ignore "self" rels, which usually link back to the feed itself.
     if let Some(link) = feed.links.iter().find(|l| l.rel.as_deref() != Some("self")) {
-        return Ok(resolve_href(feed_url, &link.href)?);
+        return Ok(feed_url.join(&link.href)?);
     }
     warn!(
         source = feed_url.as_str(),
@@ -754,7 +743,7 @@ fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Option<Url> {
             .find(|link| link.target.is_none())
             .map(|link| link.href.as_str())
     })?;
-    resolve_href(feed_url, href).ok()
+    feed_url.join(href).ok()
 }
 
 /// The entry's summary text, preferring an explicit `<summary>` and falling back
@@ -852,8 +841,7 @@ mod tests {
     use super::{
         Article, FeedSet, build_article, draw_weighted_slots, find_alternate_link, merge_weight,
         parse_cli_url, parse_urls_from_file, raw_summary, record_feed, resolve_entry_link,
-        resolve_href, resolve_source_link, resolve_source_title, sanitize_html, select_articles,
-        write_output,
+        resolve_source_link, resolve_source_title, sanitize_html, select_articles, write_output,
     };
 
     // A writer that always fails with the given kind, standing in for a stdout
@@ -887,38 +875,6 @@ mod tests {
             write_output(FailingWriter(std::io::ErrorKind::PermissionDenied), "x"),
             Err(crate::error::OpenringError::IoError(_))
         ));
-    }
-
-    // Generates a base URL and a random path fragment. The property asserts that:
-    // * If `href` is already absolute, the result equals `Url::parse(href)`.
-    // * If `href` is relative, the result's origin matches the base URL's origin.
-    #[hegel::test]
-    fn resolve_href_preserves_origin(tc: hegel::TestCase) {
-        let scheme = tc.draw(hegel::one_of!(
-            generators::just("http".to_string()),
-            generators::just("https".to_string())
-        ));
-        let host = tc.draw(generators::domains());
-        let port = tc.draw(generators::integers::<u16>().min_value(80).max_value(65535));
-        // A second leading '/' would make the href protocol-relative, which
-        // names its own host and is covered by its own test below.
-        let rel_path =
-            tc.draw(generators::from_regex(r"/[a-zA-Z0-9_-][a-zA-Z0-9_/-]{0,29}").fullmatch(true));
-
-        let base_str = format!("{scheme}://{host}:{port}");
-        let base_url = Url::parse(&base_str).expect("generated domain is a valid host");
-
-        let absolute = format!("{base_str}/{rel_path}");
-        let resolved_abs = resolve_href(&base_url, &absolute).unwrap();
-        // Parse the generated string so we compare canonical `Url`s, not raw strings.
-        let expected_abs = Url::parse(&absolute).unwrap();
-        assert_eq!(resolved_abs, expected_abs);
-
-        let resolved_rel = resolve_href(&base_url, &rel_path).unwrap();
-        // Origin (scheme + host + port) must be identical.
-        assert_eq!(resolved_rel.origin(), base_url.origin());
-        // Path component should be exactly the relative fragment prefixed with '/'.
-        assert_eq!(resolved_rel.path(), rel_path);
     }
 
     #[test]
@@ -1255,39 +1211,6 @@ mod tests {
             FeedSet::resolve(&[], None),
             Err(crate::error::OpenringError::FeedMissing)
         ));
-    }
-
-    // Path-relative hrefs (no leading '/') resolve against the feed URL's
-    // directory, never by string-concatenating onto the origin, which used to
-    // produce mangled hosts like `https://example.compage.html`.
-    #[hegel::test]
-    fn resolve_href_resolves_path_relative_hrefs(tc: hegel::TestCase) {
-        let dir = tc.draw(generators::from_regex(r"(/[a-z0-9]{1,8}){0,3}/").fullmatch(true));
-        let rel =
-            tc.draw(generators::from_regex(r"[a-z0-9]{1,8}(/[a-z0-9]{1,8}){0,2}").fullmatch(true));
-        let base = Url::parse(&format!("https://example.com{dir}feed.xml")).unwrap();
-        let resolved = resolve_href(&base, &rel).unwrap();
-        assert_eq!(resolved.origin(), base.origin());
-        assert_eq!(resolved.path(), format!("{dir}{rel}"));
-    }
-
-    #[test]
-    fn resolve_href_handles_protocol_relative_hrefs() {
-        let base = Url::parse("https://example.com/feed.xml").unwrap();
-        // A protocol-relative href names its own host; only the scheme comes
-        // from the feed URL.
-        assert_eq!(
-            resolve_href(&base, "//other.example/x").unwrap().as_str(),
-            "https://other.example/x"
-        );
-    }
-
-    #[test]
-    fn resolve_href_propagates_non_relative_parse_errors() {
-        let base = Url::parse("https://example.com/").unwrap();
-        // A scheme with an empty host is a hard parse error, not a relative
-        // reference, so it should propagate instead of being prepended.
-        assert!(resolve_href(&base, "http://").is_err());
     }
 
     const FEED_URL: &str = "https://example.com/feed.xml";

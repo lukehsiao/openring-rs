@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use feed_rs::{model::Feed, parser};
 use jiff::Timestamp;
@@ -12,11 +12,6 @@ use crate::{
     cache::{Cache, CacheValue},
     error::OpenringError,
 };
-
-pub(crate) trait FeedFetcher {
-    /// Fetch a feed using the shared HTTP `client`.
-    async fn fetch_feed(&self, client: &Client, cache: &Arc<Cache>) -> Result<Feed, OpenringError>;
-}
 
 /// The largest response body accepted as a feed. Even full-content,
 /// full-history feeds run single-digit MiB; anything bigger is almost
@@ -47,8 +42,7 @@ pub(crate) fn build_client() -> Result<Client, OpenringError> {
 }
 
 /// Normalize an etag so it carries the literal double quotes HTTP requires.
-#[must_use]
-pub fn normalize_etag(s: &str) -> String {
+fn normalize_etag(s: &str) -> String {
     if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with("W/\"") && s.ends_with('"')) {
         s.to_string()
     } else {
@@ -295,103 +289,105 @@ fn apply_disposition(
     }
 }
 
-impl FeedFetcher for Url {
-    /// Fetch a feed for a URL
-    async fn fetch_feed(&self, client: &Client, cache: &Arc<Cache>) -> Result<Feed, OpenringError> {
-        // Capture the clock once so every timestamp written during this call agrees
-        // and so the decision logic can be exercised deterministically.
-        let now = Timestamp::now();
+/// Fetch the feed at `url`, using the shared HTTP `client` and the `cache`.
+pub(crate) async fn fetch_feed(
+    url: &Url,
+    client: &Client,
+    cache: &Cache,
+) -> Result<Feed, OpenringError> {
+    // Capture the clock once so every timestamp written during this call agrees
+    // and so the decision logic can be exercised deterministically.
+    let now = Timestamp::now();
 
-        // Snapshot the entry by value so no DashMap guard is held across an await
-        // point; concurrent fetches share the map through a JoinSet.
-        let cached: Option<CacheValue> = cache.get(self).map(|e| e.value().clone());
+    // Snapshot the entry by value so no DashMap guard is held across an await
+    // point; concurrent fetches share the map through a JoinSet.
+    let cached: Option<CacheValue> = cache.get(url).map(|e| e.value().clone());
 
-        // While a 429 retry window is open, serve the cached feed without a request.
-        // An open window with no cached body falls through and fetches.
-        if let Some(cv) = &cached
-            && logic::retry_after_gate_open(cv, now)
-        {
-            debug!(timestamp=%cv.timestamp, retry_after=?cv.retry_after, "skipping request due to 429, using feed from cache");
-            if let Some(feed_str) = &cv.body {
-                return Ok(parser::parse(feed_str.as_slice())?);
-            }
-            debug!(url=%self.as_str(), "retry window open but nothing cached; fetching anyway");
+    // While a 429 retry window is open, serve the cached feed without a request.
+    // An open window with no cached body falls through and fetches.
+    if let Some(cv) = &cached
+        && logic::retry_after_gate_open(cv, now)
+    {
+        debug!(timestamp=%cv.timestamp, retry_after=?cv.retry_after, "skipping request due to 429, using feed from cache");
+        if let Some(feed_str) = &cv.body {
+            return Ok(parser::parse(feed_str.as_slice())?);
         }
-
-        let mut req = client.get(self.as_str());
-        let headers = logic::conditional_headers(cached.as_ref());
-        if let Some(last_modified) = &headers.if_modified_since {
-            req = req.header("If-Modified-Since", last_modified);
-        }
-        if let Some(etag) = &headers.if_none_match {
-            req = req.header("If-None-Match", etag);
-        }
-        debug!(url=%self, request=?req, "sending request");
-
-        let resp = req.send().await?;
-        debug!(url=%self, response=?resp, "received response");
-
-        // reqwest follows redirects silently, so a moved feed keeps working
-        // and the user never learns they should update their urls file.
-        if resp.url() != self {
-            warn!(
-                from=%self.as_str(),
-                to=%resp.url().as_str(),
-                "feed URL redirects; consider updating it"
-            );
-        }
-
-        // Reject grossly oversized responses before buffering them. Responses
-        // that arrive compressed or chunked report no length and are bounded
-        // by the request timeout instead.
-        if let Some(bytes) = resp.content_length()
-            && bytes > MAX_FEED_BYTES
-        {
-            return Err(OpenringError::FeedTooLargeError {
-                url: self.as_str().to_string(),
-                bytes,
-            });
-        }
-
-        // Pull the plain values the decision logic needs out of the response before
-        // `text()` consumes it. The etag is normalized at this boundary.
-        let status = resp.status();
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(normalize_etag);
-        let last_modified = resp
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        // Keep the raw bytes: pre-decoding to text re-encodes the transfer
-        // as UTF-8 while the XML prolog still declares the original charset,
-        // so the parser would decode non-UTF-8 feeds twice into mojibake.
-        let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            Some(read_body_capped(self, resp, MAX_FEED_BYTES).await?)
-        } else {
-            None
-        };
-
-        let disposition = logic::disposition(
-            status,
-            etag.as_deref(),
-            last_modified.as_deref(),
-            body,
-            cached.is_some(),
-            retry_after.as_deref(),
-            now,
-        );
-        let feed_str = apply_disposition(self, cache, now, disposition)?;
-        Ok(parser::parse(feed_str.as_slice())?)
+        debug!(url=%url.as_str(), "retry window open but nothing cached; fetching anyway");
     }
+
+    let mut req = client.get(url.as_str());
+    let headers = logic::conditional_headers(cached.as_ref());
+    if let Some(last_modified) = &headers.if_modified_since {
+        req = req.header("If-Modified-Since", last_modified);
+    }
+    if let Some(etag) = &headers.if_none_match {
+        req = req.header("If-None-Match", etag);
+    }
+    debug!(url=%url, request=?req, "sending request");
+
+    let resp = req.send().await?;
+    debug!(url=%url, response=?resp, "received response");
+
+    // reqwest follows redirects silently, so a moved feed keeps working
+    // and the user never learns they should update their urls file.
+    if resp.url() != url {
+        warn!(
+            from=%url.as_str(),
+            to=%resp.url().as_str(),
+            "feed URL redirects; consider updating it"
+        );
+    }
+
+    // Reject grossly oversized responses before buffering them. Responses
+    // that arrive compressed or chunked report no length and are bounded
+    // by the request timeout instead.
+    if let Some(bytes) = resp.content_length()
+        && bytes > MAX_FEED_BYTES
+    {
+        return Err(OpenringError::FeedTooLargeError {
+            url: url.as_str().to_string(),
+            bytes,
+        });
+    }
+
+    // Pull the plain values the decision logic needs out of the response before
+    // `text()` consumes it. The etag is normalized at this boundary.
+    let status = resp.status();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_etag);
+    let last_modified = resp
+        .headers()
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Keep the raw bytes: pre-decoding to text re-encodes the transfer
+    // as UTF-8 while the XML prolog still declares the original charset,
+    // so the parser would decode non-UTF-8 feeds twice into mojibake.
+    let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
+        Some(read_body_capped(url, resp, MAX_FEED_BYTES).await?)
+    } else {
+        None
+    };
+
+    let disposition = logic::disposition(
+        status,
+        etag.as_deref(),
+        last_modified.as_deref(),
+        body,
+        cached.is_some(),
+        retry_after.as_deref(),
+        now,
+    );
+    let feed_str = apply_disposition(url, cache, now, disposition)?;
+    Ok(parser::parse(feed_str.as_slice())?)
 }
 
 #[cfg(test)]
@@ -410,7 +406,7 @@ mod tests {
     use crate::cache::{Cache, CacheValue, MAX_SPAN_SEC};
     use crate::error::OpenringError;
 
-    use super::{FeedFetcher, USER_AGENT, build_client, logic, normalize_etag};
+    use super::{USER_AGENT, build_client, fetch_feed, logic, normalize_etag};
 
     // Bounds for gate timestamps/spans. 50e9 seconds is ~1585 years past the
     // epoch; a timestamp plus a span stays under jiff's Timestamp::MAX, while
@@ -772,8 +768,7 @@ mod tests {
             },
         );
 
-        let feed = url
-            .fetch_feed(&build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("served cache on 304");
         assert!(
@@ -826,7 +821,7 @@ mod tests {
             },
         );
 
-        url.fetch_feed(&build_client().unwrap(), &cache)
+        fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("served cache on 304");
         // The next run must validate against the rotated etag, or the server
@@ -866,7 +861,7 @@ mod tests {
 
         let client = build_client().unwrap();
         for run in ["first", "second"] {
-            url.fetch_feed(&client, &cache)
+            fetch_feed(&url, &client, &cache)
                 .await
                 .unwrap_or_else(|e| panic!("{run} run served cache on 304: {e}"));
         }
@@ -891,8 +886,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
 
-        let feed = url
-            .fetch_feed(&build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("fetched fresh feed");
         assert!(
@@ -931,8 +925,7 @@ mod tests {
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
         let client = build_client().unwrap();
-        let feed = url
-            .fetch_feed(&client, &cache)
+        let feed = fetch_feed(&url, &client, &cache)
             .await
             .expect("parsed latin-1 feed");
         assert_eq!(feed.title.unwrap().content, "caf\u{e9}");
@@ -974,7 +967,7 @@ mod tests {
 
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
-        let res = url.fetch_feed(&build_client().unwrap(), &cache).await;
+        let res = fetch_feed(&url, &build_client().unwrap(), &cache).await;
         assert!(matches!(res, Err(OpenringError::FeedTooLargeError { .. })));
         // Nothing that big belongs in the cache either.
         assert!(!cache.contains_key(&url));
@@ -998,14 +991,14 @@ mod tests {
         let cache = Arc::new(Cache::new());
         let client = build_client().unwrap();
 
-        let first = url.fetch_feed(&client, &cache).await;
+        let first = fetch_feed(&url, &client, &cache).await;
         assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
 
         // The cached entry must not pretend to have something to serve. If it
         // did, the next fetch would send If-None-Match, the server would say
         // 304, and the run would serve the empty body until the entry aged
         // out of the cache.
-        let second = url.fetch_feed(&client, &cache).await;
+        let second = fetch_feed(&url, &client, &cache).await;
         assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
 
         let received = server.received_requests().await.unwrap();
@@ -1051,8 +1044,7 @@ mod tests {
             },
         );
 
-        let feed = url
-            .fetch_feed(&build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("refetched the feed instead of erroring on 304");
         assert!(
@@ -1086,8 +1078,7 @@ mod tests {
             },
         );
 
-        let feed = url
-            .fetch_feed(&build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("served cache on 429");
         assert!(
@@ -1110,7 +1101,7 @@ mod tests {
 
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
-        url.fetch_feed(&build_client().unwrap(), &cache)
+        fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("fetched");
 
@@ -1134,8 +1125,7 @@ mod tests {
 
         let url = Url::parse(&format!("{}/old", server.uri())).unwrap();
         let cache = Arc::new(Cache::new());
-        let feed = url
-            .fetch_feed(&build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("followed the redirect");
         assert!(
@@ -1173,7 +1163,7 @@ mod tests {
             },
         );
 
-        url.fetch_feed(&build_client().unwrap(), &cache)
+        fetch_feed(&url, &build_client().unwrap(), &cache)
             .await
             .expect("served cache on 429");
         // The recorded window is the time until the given date, allowing for
@@ -1198,7 +1188,7 @@ mod tests {
 
         let url = Url::parse(&server.uri()).unwrap();
         let cache = Arc::new(Cache::new());
-        let res = url.fetch_feed(&build_client().unwrap(), &cache).await;
+        let res = fetch_feed(&url, &build_client().unwrap(), &cache).await;
         assert!(matches!(
             res,
             Err(OpenringError::UnexpectedStatusError { .. })
