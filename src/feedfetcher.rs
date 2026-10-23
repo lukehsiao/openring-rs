@@ -235,15 +235,13 @@ fn apply_disposition(
 }
 
 /// Fetch the feed at `url` through `http`, using and updating the `cache`.
+/// Every cache decision and every timestamp written uses `now`.
 pub(crate) async fn fetch_feed(
     url: &Url,
     http: &Http,
     cache: &Cache,
+    now: Timestamp,
 ) -> Result<Feed, OpenringError> {
-    // Capture the clock once so every timestamp written during this call agrees
-    // and so the decision logic can be exercised deterministically.
-    let now = Timestamp::now();
-
     // Snapshot the entry by value so no DashMap guard is held across an await
     // point; concurrent fetches share the map through a JoinSet.
     let cached: Option<CacheValue> = cache.get(url).map(|e| e.value().clone());
@@ -721,7 +719,7 @@ mod tests {
             },
         );
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("served cache on 304");
         assert_eq!(title(&feed), "cached");
@@ -753,7 +751,7 @@ mod tests {
             },
         );
 
-        fetch_feed(&url, &http, &cache)
+        fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("served cache on 304");
         // The next run must validate against the rotated etag, or the server
@@ -783,7 +781,7 @@ mod tests {
         );
 
         for run in ["first", "second"] {
-            fetch_feed(&url, &http, &cache)
+            fetch_feed(&url, &http, &cache, Timestamp::now())
                 .await
                 .unwrap_or_else(|e| panic!("{run} run served cache on 304: {e}"));
         }
@@ -804,7 +802,7 @@ mod tests {
         )]);
         let cache = Arc::new(Cache::new());
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("fetched fresh feed");
         assert_eq!(title(&feed), "fresh");
@@ -830,7 +828,7 @@ mod tests {
         let http = Http::create_null([(url.clone(), Answer::ok(body))]);
         let cache = Arc::new(Cache::new());
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("parsed latin-1 feed");
         assert_eq!(title(&feed), "caf\u{e9}");
@@ -854,7 +852,7 @@ mod tests {
         )]);
         let cache = Arc::new(Cache::new());
 
-        let res = fetch_feed(&url, &http, &cache).await;
+        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::FeedTooLargeError { bytes, .. })
@@ -874,7 +872,7 @@ mod tests {
         )]);
         let cache = Arc::new(Cache::new());
 
-        let res = fetch_feed(&url, &http, &cache).await;
+        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::FeedTooLargeError { bytes, .. }) if bytes == announced
@@ -891,7 +889,7 @@ mod tests {
         cache.insert(url.clone(), cached_entry(Some("cached")));
         let before = cache.get(&url).unwrap().clone();
 
-        let res = fetch_feed(&url, &http, &cache).await;
+        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(
             matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection refused"),
             "{res:?}"
@@ -910,7 +908,7 @@ mod tests {
         cache.insert(url.clone(), cached_entry(Some("cached")));
         let before = cache.get(&url).unwrap().clone();
 
-        let res = fetch_feed(&url, &http, &cache).await;
+        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(
             matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection reset"),
             "{res:?}"
@@ -926,14 +924,14 @@ mod tests {
         let requests = http.track_requests();
         let cache = Arc::new(Cache::new());
 
-        let first = fetch_feed(&url, &http, &cache).await;
+        let first = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
 
         // The cached entry must not pretend to have something to serve. If it
         // did, the next fetch would send If-None-Match, the server would say
         // 304, and the run would serve the empty body until the entry aged
         // out of the cache.
-        let second = fetch_feed(&url, &http, &cache).await;
+        let second = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
         let unconditional = Request {
             url,
@@ -962,7 +960,7 @@ mod tests {
             },
         );
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("refetched the feed");
         assert_eq!(title(&feed), "fresh");
@@ -987,7 +985,7 @@ mod tests {
         let cache = Arc::new(Cache::new());
         cache.insert(url.clone(), cached_entry(Some("rate-limited")));
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("served cache on 429");
         assert_eq!(title(&feed), "rate-limited");
@@ -1005,7 +1003,7 @@ mod tests {
         )]);
         let cache = Arc::new(Cache::new());
 
-        let feed = fetch_feed(&url, &http, &cache)
+        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("followed the redirect");
         assert_eq!(title(&feed), "moved");
@@ -1028,7 +1026,7 @@ mod tests {
         let cache = Arc::new(Cache::new());
         cache.insert(url.clone(), cached_entry(Some("rate-limited")));
 
-        fetch_feed(&url, &http, &cache)
+        fetch_feed(&url, &http, &cache, Timestamp::now())
             .await
             .expect("served cache on 429");
         // The recorded window is the time until the given date, allowing for
@@ -1047,7 +1045,7 @@ mod tests {
         let url = feed_url();
         let http = Http::create_null([(url.clone(), Answer::status(500))]);
         let cache = Arc::new(Cache::new());
-        let res = fetch_feed(&url, &http, &cache).await;
+        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::UnexpectedStatusError { status, .. })

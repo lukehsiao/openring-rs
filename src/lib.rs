@@ -1,15 +1,16 @@
 pub mod args;
 mod cache;
+mod clock;
 pub mod error;
 mod feedfetcher;
+mod fs;
 mod http;
 mod nullable;
-pub mod progress;
 mod summarize;
+pub mod terminal;
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     io::{self, Write},
     num::NonZeroUsize,
     ops::Range,
@@ -18,7 +19,6 @@ use std::{
 };
 
 use feed_rs::model::{Entry, Feed, Link};
-use indicatif::{ProgressBar, ProgressStyle};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use miette::NamedSource;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -27,14 +27,16 @@ use tera::Tera;
 use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::{debug, info, warn};
 use url::Url;
-use yansi::Paint;
 
 use crate::{
     args::Args,
     cache::{Cache, CachePath},
+    clock::Clock,
     error::{FeedUrlError, FeedWeightError, OpenringError, Result},
     feedfetcher::fetch_feed,
+    fs::Fs,
     http::Http,
+    terminal::{Bar, Terminal, Tone},
 };
 
 #[derive(Serialize, Debug)]
@@ -216,21 +218,21 @@ struct FeedSet {
 
 impl FeedSet {
     /// Parse and merge the configured feeds from `-s` values and the urls
-    /// file, rejecting contradictory weights for the same URL.
+    /// file, given as its path and text, rejecting contradictory weights for
+    /// the same URL.
     ///
     /// # Errors
     ///
     /// Returns an error when no feeds are configured at all, a `-s` value or
-    /// file line fails to parse, the file cannot be read, or one feed is
-    /// given two different weights.
-    fn resolve(cli_urls: &[String], url_file: Option<&Path>) -> Result<Self> {
+    /// file line fails to parse, or one feed is given two different weights.
+    fn resolve(cli_urls: &[String], url_file: Option<(&Path, &str)>) -> Result<Self> {
         let mut configured: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
         for raw in cli_urls {
             let (url, weight) = parse_cli_url(raw)?;
             record_feed(&mut configured, url, weight)?;
         }
-        if let Some(path) = url_file {
-            for (url, weight) in parse_urls_from_file(path)? {
+        if let Some((path, text)) = url_file {
+            for (url, weight) in parse_urls_from_file(path, text)? {
                 record_feed(&mut configured, url, weight)?;
             }
         }
@@ -247,15 +249,14 @@ impl FeedSet {
     }
 }
 
-/// Parse the file into feed URLs, each with its optional weight.
+/// Parse the urls file, read from `path`, into feed URLs, each with its
+/// optional weight.
 ///
 /// Each line is `URL [WEIGHT]`. Blank lines and lines starting with `#` or
 /// `//` are ignored, and duplicate URLs merge per [`merge_weight`]. The first
 /// invalid line fails the parse with a diagnostic spanning the offending
 /// tokens.
-fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>>> {
-    let file_src = fs::read_to_string(path)?;
-
+fn parse_urls_from_file(path: &Path, file_src: &str) -> Result<HashMap<Url, Option<NonZeroUsize>>> {
     let mut feeds: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
     let mut offset = 0;
     for raw_line in file_src.split_inclusive('\n') {
@@ -264,7 +265,7 @@ fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>
             let (url, weight) = parse_feed_line(raw_line).map_err(|issue| {
                 diagnostic_for(
                     issue,
-                    NamedSource::new(path.to_string_lossy(), file_src.clone()),
+                    NamedSource::new(path.to_string_lossy(), file_src.to_string()),
                     offset,
                 )
             })?;
@@ -274,7 +275,7 @@ fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>
                         merge_weight(feeds.entry(url).or_insert(None), Some(w))
                     {
                         return Err(FeedWeightError {
-                            src: NamedSource::new(path.to_string_lossy(), file_src.clone()),
+                            src: NamedSource::new(path.to_string_lossy(), file_src.to_string()),
                             span: (offset + w_span.start..offset + w_span.end).into(),
                             help: format!(
                                 "this feed is already listed with weight {existing}; each feed takes a single weight"
@@ -301,8 +302,8 @@ fn parse_urls_from_file(path: &Path) -> Result<HashMap<Url, Option<NonZeroUsize>
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
 /// Set the progress bar's message to the list of URLs still in flight.
-fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
-    pb.set_message(
+fn show_pending(bar: &Bar, pending: &HashSet<&Url>) {
+    bar.set_message(
         pending
             .iter()
             .map(|u| u.as_str())
@@ -311,26 +312,25 @@ fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
     );
 }
 
-// Get all feeds from URLs concurrently, sharing one `http` client.
+// Get all feeds from URLs concurrently, sharing one `http` client, as of
+// `now`.
 //
 // Skips feeds if there are errors, and shows progress as fetches finish.
-async fn get_feeds_from_urls(http: &Http, urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
-    // Registered with the shared progress area so tracing output suspends
-    // the bar instead of splicing into it.
-    let pb = progress::add(
-        ProgressBar::new(urls.len() as u64).with_style(
-            ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
-                .unwrap(),
-        ),
-    );
-    pb.set_prefix("Fetching".bold().to_string());
+async fn get_feeds_from_urls(
+    http: &Http,
+    terminal: &Terminal,
+    urls: &[Url],
+    cache: &Arc<Cache>,
+    now: Timestamp,
+) -> Vec<(Feed, Url)> {
+    let bar = terminal.bar("Fetching", urls.len());
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
 
     let mut join_set = JoinSet::new();
     let mut pending_urls: HashSet<&Url> = HashSet::from_iter(urls);
 
-    show_pending(&pb, &pending_urls);
+    show_pending(&bar, &pending_urls);
 
     for url in urls {
         let cache_clone = Arc::clone(cache);
@@ -345,32 +345,32 @@ async fn get_feeds_from_urls(http: &Http, urls: &[Url], cache: &Arc<Cache>) -> V
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
-            let fetch_result = fetch_feed(&url_clone, &http, &cache_clone).await;
+            let fetch_result = fetch_feed(&url_clone, &http, &cache_clone, now).await;
             (url_clone, fetch_result)
         });
     }
     let mut feeds = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
-        pb.inc(1);
+        bar.inc();
         match result {
             Ok((url, Ok(feed))) => {
                 pending_urls.remove(&url);
-                show_pending(&pb, &pending_urls);
-                pb.println(format!("{:>8} {url}", "Fetched".bold().green()));
+                show_pending(&bar, &pending_urls);
+                bar.status("Fetched", Tone::Good, &url);
                 feeds.push((feed, url));
             }
             Ok((url, Err(e))) => {
                 pending_urls.remove(&url);
-                show_pending(&pb, &pending_urls);
+                show_pending(&bar, &pending_urls);
                 // The bar is hidden when stderr is not a terminal, and its
                 // lines vanish with it. Only then does the failure go to the
                 // log, so a terminal shows one styled line and a cron job
                 // still gets a warning.
-                if pb.is_hidden() {
-                    warn!(source = url.as_str(), error = %e, "skipping feed: fetch failed");
+                if terminal.is_visible() {
+                    bar.status("Error", Tone::Bad, format!("{url} ({e})"));
                 } else {
-                    pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
+                    warn!(source = url.as_str(), error = %e, "skipping feed: fetch failed");
                 }
             }
             Err(e) => {
@@ -378,15 +378,12 @@ async fn get_feeds_from_urls(http: &Http, urls: &[Url], cache: &Arc<Cache>) -> V
                 // with the task, so it cannot be removed from the pending
                 // list, but the failure must not be silent.
                 warn!(error=%e, "feed fetch task failed");
-                pb.println(format!(
-                    "{:>8} fetch task failed ({e})",
-                    "Error".bold().red()
-                ));
+                bar.status("Error", Tone::Bad, format!("fetch task failed ({e})"));
             }
         }
     }
 
-    pb.finish_and_clear();
+    bar.finish_and_clear();
     feeds
 }
 
@@ -397,7 +394,7 @@ async fn get_feeds_from_urls(http: &Http, urls: &[Url], cache: &Arc<Cache>) -> V
 /// fetch, and mutates `articles` in place. An article whose page yields
 /// nothing keeps its empty summary, exactly as if the feed had one that was
 /// blank, so nothing here can fail the run.
-async fn fill_missing_summaries(http: &Http, articles: &mut [Article]) {
+async fn fill_missing_summaries(http: &Http, terminal: &Terminal, articles: &mut [Article]) {
     // Owned links so the pending set below borrows from `missing`, leaving
     // `articles` free to take the derived summaries by index afterward.
     let missing: Vec<(usize, Url)> = articles
@@ -410,17 +407,11 @@ async fn fill_missing_summaries(http: &Http, articles: &mut [Article]) {
         return;
     }
 
-    let pb = progress::add(
-        ProgressBar::new(missing.len() as u64).with_style(
-            ProgressStyle::with_template("{prefix:>8} [{bar}] {human_pos}/{human_len}: {wide_msg}")
-                .unwrap(),
-        ),
-    );
-    pb.set_prefix("Summarizing".bold().to_string());
+    let bar = terminal.bar("Summarizing", missing.len());
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
     let mut pending_urls: HashSet<&Url> = missing.iter().map(|(_, url)| url).collect();
-    show_pending(&pb, &pending_urls);
+    show_pending(&bar, &pending_urls);
 
     let mut join_set = JoinSet::new();
     for (idx, url) in &missing {
@@ -439,13 +430,13 @@ async fn fill_missing_summaries(http: &Http, articles: &mut [Article]) {
     }
 
     while let Some(result) = join_set.join_next().await {
-        pb.inc(1);
+        bar.inc();
         match result {
             Ok((idx, url, summary)) => {
                 pending_urls.remove(&url);
-                show_pending(&pb, &pending_urls);
+                show_pending(&bar, &pending_urls);
                 if let Some(summary) = summary {
-                    pb.println(format!("{:>8} {url}", "Summary".bold().green()));
+                    bar.status("Summary", Tone::Good, &url);
                     articles[idx].summary = summary;
                 }
             }
@@ -457,38 +448,65 @@ async fn fill_missing_summaries(http: &Http, articles: &mut [Article]) {
         }
     }
 
-    pb.finish_and_clear();
+    bar.finish_and_clear();
+}
+
+/// The edges a run talks to the outside world through. Tests build them
+/// nulled, so a whole run executes without network, disk, or clock.
+struct Deps {
+    http: Http,
+    fs: Fs,
+    clock: Clock,
 }
 
 /// Fetch every configured feed, render the most recent articles through the
-/// template, and write the result to `out`, followed by a newline. `main`
-/// passes stdout; tests pass a buffer so they can assert the rendered bytes.
+/// template, and write the result to `out`, followed by a newline. Progress
+/// shows on `terminal`. `main` passes stdout; tests pass a buffer so they can
+/// assert the rendered bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if no feed URLs are given, a `-s/--url` value or url-file
 /// line holds an invalid URL or weight, one feed is listed with two different
 /// weights, the url file cannot be read, the template file cannot be read or
-/// parsed, or the template fails to render.
-pub async fn run(args: Args, out: impl Write) -> Result<()> {
+/// parsed, the template fails to render, or the HTTP client cannot start.
+pub async fn run(args: Args, terminal: &Terminal, out: impl Write) -> Result<()> {
+    let deps = Deps {
+        // One client for the whole run, so every fetch shares a connection
+        // pool instead of paying for TLS setup per request, feeds and
+        // summary pages alike.
+        http: Http::create()?,
+        fs: Fs::create(),
+        clock: Clock::create(),
+    };
+    run_with(&deps, terminal, args, out).await
+}
+
+async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write) -> Result<()> {
     debug!(?args);
 
     // Read and parse the template before anything else: a wrong path or a
     // syntax error should fail in milliseconds, not after fetching every feed.
-    let tera = template_engine(&fs::read_to_string(&args.template_file)?)?;
+    let tera = template_engine(&deps.fs.read_to_string(&args.template_file)?)?;
 
     let cache = cache::load_cache(&args, CachePath::Default).unwrap_or_default();
     let cache = Arc::new(cache);
 
     // Merge -s urls and the urls file into one weight-per-feed view, so
     // duplicate listings collapse and contradictory weights fail fast.
-    let feed_set = FeedSet::resolve(&args.url, args.url_file.as_deref())?;
+    let url_file = match &args.url_file {
+        Some(path) => Some((path.as_path(), deps.fs.read_to_string(path)?)),
+        None => None,
+    };
+    let feed_set = FeedSet::resolve(
+        &args.url,
+        url_file.as_ref().map(|(path, text)| (*path, text.as_str())),
+    )?;
 
-    // One client for the whole run, so every fetch shares a connection pool
-    // instead of paying for TLS setup per request, feeds and summary pages alike.
-    let http = Http::create()?;
-
-    let feeds = get_feeds_from_urls(&http, &feed_set.urls, &cache).await;
+    // One instant for every fetch, so they all agree on which retry windows
+    // are open and stamp their cache entries alike.
+    let now = deps.clock.now();
+    let feeds = get_feeds_from_urls(&deps.http, terminal, &feed_set.urls, &cache, now).await;
 
     cache::store_cache(&cache, args.no_cache, CachePath::Default);
 
@@ -511,7 +529,7 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
     // Feeds that ship no summary get one derived from the article page
     // itself. Deferred until here so only the articles that will render
     // trigger a page fetch.
-    fill_missing_summaries(&http, &mut articles).await;
+    fill_missing_summaries(&deps.http, terminal, &mut articles).await;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
@@ -829,7 +847,7 @@ fn build_article(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Write, num::NonZeroUsize};
+    use std::{collections::HashMap, num::NonZeroUsize};
     use url::Url;
 
     use feed_rs::model::{Entry, Feed, Link};
@@ -875,23 +893,23 @@ mod tests {
         ));
     }
 
+    // The urls file as `run` hands it over: its path, for diagnostics, and
+    // its text.
+    fn parse_urls(text: &str) -> crate::error::Result<HashMap<Url, Option<NonZeroUsize>>> {
+        parse_urls_from_file(std::path::Path::new("urls.txt"), text)
+    }
+
     #[test]
     fn parse_urls_ignores_comments_and_blank_lines_and_whitespace() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-
-        // Valid URLs
-        writeln!(tmp, "https://first.example/").unwrap();
-        writeln!(tmp, "   https://second.example   ").unwrap(); // leading/trailing spaces
-        writeln!(tmp, " https://first.example   ").unwrap(); // duplicate (even missing trailing slash)
-
-        // Comments
-        writeln!(tmp, "# a hash comment").unwrap();
-        writeln!(tmp, "// a double‑slash comment").unwrap();
-
-        // Blank line
-        writeln!(tmp).unwrap();
-
-        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+        let parsed = parse_urls(
+            "https://first.example/\n\
+             \x20  https://second.example   \n\
+             \x20https://first.example   \n\
+             # a hash comment\n\
+             // a double‑slash comment\n\
+             \n",
+        )
+        .unwrap();
 
         let expected = HashMap::from([
             (Url::parse("https://first.example/").unwrap(), None),
@@ -902,11 +920,13 @@ mod tests {
 
     // Round-trip: any mix of valid `URL [WEIGHT]` lines, comments, blanks,
     // and stray whitespace parses back to exactly the map written.
-    #[hegel::test(test_cases = 25)]
+    #[hegel::test]
     fn parse_urls_round_trips_urls_through_a_file(tc: hegel::TestCase) {
+        use std::fmt::Write as _;
+
         let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
         let mut expected: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
-        let mut lines = Vec::new();
+        let mut text = String::new();
         for _ in 0..n {
             let url = Url::parse(&tc.draw(generators::urls())).expect("generated URL is valid");
             // A duplicate URL repeats its recorded weight: conflicting
@@ -915,53 +935,34 @@ mod tests {
                 Some(&w) => w,
                 None => tc
                     .draw(generators::optional(
-                        generators::integers::<usize>().min_value(1).max_value(1000),
+                        generators::integers::<usize>().min_value(1),
                     ))
                     .and_then(NonZeroUsize::new),
             };
             match weight {
-                Some(w) => lines.push(format!("  {url} {w}  ")),
-                None => lines.push(format!("  {url}  ")),
+                Some(w) => writeln!(text, "  {url} {w}  "),
+                None => writeln!(text, "  {url}  "),
             }
+            .expect("writing to a String cannot fail");
             expected.insert(url, weight);
             if tc.draw(generators::booleans()) {
-                lines.push(tc.draw(hegel::one_of!(
-                    generators::just("# comment".to_string()),
-                    generators::just("// comment".to_string()),
-                    generators::just(String::new()),
-                    generators::just("   ".to_string()),
+                text.push_str(&tc.draw(hegel::one_of!(
+                    generators::just("# comment\n".to_string()),
+                    generators::just("// comment\n".to_string()),
+                    generators::just("\n".to_string()),
+                    generators::just("   \n".to_string()),
                 )));
             }
         }
 
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        for line in &lines {
-            writeln!(tmp, "{line}").unwrap();
-        }
-
-        assert_eq!(parse_urls_from_file(tmp.path()).unwrap(), expected);
-    }
-
-    #[test]
-    fn parse_urls_errors_instead_of_panicking_on_invalid_utf8() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(&[0xFF, 0xFE, b'\n']).unwrap();
-        // A urls file in a non-UTF-8 encoding is a user mistake, not a crash.
-        assert!(matches!(
-            parse_urls_from_file(tmp.path()),
-            Err(crate::error::OpenringError::IoError(_))
-        ));
+        assert_eq!(parse_urls(&text).unwrap(), expected);
     }
 
     #[test]
     fn parse_urls_diagnostic_points_at_the_offending_line() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
         // The same text appears first inside a comment; the span must point
         // at the real line, not the first substring match in the file.
-        writeln!(tmp, "# not a url").unwrap();
-        writeln!(tmp, "not a url").unwrap();
-
-        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let err = parse_urls("# not a url\nnot a url\n").unwrap_err();
         let crate::error::OpenringError::FeedUrlError(feed_url_error) = err else {
             panic!("expected FeedUrlError, got {err:?}");
         };
@@ -971,25 +972,19 @@ mod tests {
 
     #[test]
     fn parse_urls_reports_invalid_url() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://valid.example/").unwrap();
-        writeln!(tmp, "not a url").unwrap();
-
         // An unparseable line yields a diagnostic error rather than being
         // silently dropped.
         assert!(matches!(
-            parse_urls_from_file(tmp.path()),
+            parse_urls("https://valid.example/\nnot a url\n"),
             Err(crate::error::OpenringError::FeedUrlError(_))
         ));
     }
 
     #[test]
     fn parse_urls_parses_optional_weights() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://weighted.example/feed.xml 7").unwrap();
-        writeln!(tmp, "https://plain.example/feed.xml").unwrap();
-
-        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+        let parsed =
+            parse_urls("https://weighted.example/feed.xml 7\nhttps://plain.example/feed.xml\n")
+                .unwrap();
 
         let expected = HashMap::from([
             (
@@ -1003,10 +998,7 @@ mod tests {
 
     #[test]
     fn parse_urls_weight_diagnostic_points_at_the_token() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://valid.example/ abc").unwrap();
-
-        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let err = parse_urls("https://valid.example/ abc\n").unwrap_err();
         let crate::error::OpenringError::FeedWeightError(e) = err else {
             panic!("expected FeedWeightError, got {err:?}");
         };
@@ -1016,10 +1008,7 @@ mod tests {
 
     #[test]
     fn parse_urls_rejects_a_zero_weight() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://valid.example/ 0").unwrap();
-
-        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let err = parse_urls("https://valid.example/ 0\n").unwrap_err();
         let crate::error::OpenringError::FeedWeightError(e) = err else {
             panic!("expected FeedWeightError, got {err:?}");
         };
@@ -1029,10 +1018,7 @@ mod tests {
 
     #[test]
     fn parse_urls_rejects_trailing_garbage_after_the_weight() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://valid.example/ 7 9").unwrap();
-
-        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let err = parse_urls("https://valid.example/ 7 9\n").unwrap_err();
         let crate::error::OpenringError::FeedWeightError(e) = err else {
             panic!("expected FeedWeightError, got {err:?}");
         };
@@ -1043,11 +1029,7 @@ mod tests {
 
     #[test]
     fn parse_urls_rejects_conflicting_duplicate_weights() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://valid.example/ 3").unwrap();
-        writeln!(tmp, "https://valid.example/ 7").unwrap();
-
-        let err = parse_urls_from_file(tmp.path()).unwrap_err();
+        let err = parse_urls("https://valid.example/ 3\nhttps://valid.example/ 7\n").unwrap_err();
         let crate::error::OpenringError::FeedWeightError(e) = err else {
             panic!("expected FeedWeightError, got {err:?}");
         };
@@ -1061,17 +1043,17 @@ mod tests {
 
     #[test]
     fn parse_urls_merges_duplicates_per_weight_policy() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
         // Same explicit weight twice, explicit after bare, bare after
         // explicit: all collapse to one entry holding the explicit weight.
-        writeln!(tmp, "https://a.example/ 7").unwrap();
-        writeln!(tmp, "https://a.example/ 7").unwrap();
-        writeln!(tmp, "https://b.example/").unwrap();
-        writeln!(tmp, "https://b.example/ 3").unwrap();
-        writeln!(tmp, "https://c.example/ 4").unwrap();
-        writeln!(tmp, "https://c.example/").unwrap();
-
-        let parsed = parse_urls_from_file(tmp.path()).unwrap();
+        let parsed = parse_urls(
+            "https://a.example/ 7\n\
+             https://a.example/ 7\n\
+             https://b.example/\n\
+             https://b.example/ 3\n\
+             https://c.example/ 4\n\
+             https://c.example/\n",
+        )
+        .unwrap();
 
         let expected = HashMap::from([
             (
@@ -1172,15 +1154,14 @@ mod tests {
 
     #[test]
     fn feed_set_resolve_merges_cli_and_file_sources() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://a.example/ 7").unwrap();
-        writeln!(tmp, "https://b.example/").unwrap();
+        let file = "https://a.example/ 7\nhttps://b.example/\n";
         let cli = [
             "https://b.example/ 3".to_string(),
             "https://c.example/".to_string(),
         ];
 
-        let feed_set = FeedSet::resolve(&cli, Some(tmp.path())).unwrap();
+        let feed_set =
+            FeedSet::resolve(&cli, Some((std::path::Path::new("urls.txt"), file))).unwrap();
 
         assert_eq!(feed_set.urls.len(), 3);
         let weight_of = |u: &str| feed_set.weights.get(&Url::parse(u).unwrap()).copied();
@@ -1192,11 +1173,13 @@ mod tests {
 
     #[test]
     fn feed_set_resolve_rejects_cross_source_conflicts() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "https://a.example/ 7").unwrap();
         let cli = ["https://a.example/ 3".to_string()];
 
-        let err = FeedSet::resolve(&cli, Some(tmp.path())).unwrap_err();
+        let err = FeedSet::resolve(
+            &cli,
+            Some((std::path::Path::new("urls.txt"), "https://a.example/ 7\n")),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             crate::error::OpenringError::ConflictingWeightError { .. }
@@ -2261,87 +2244,126 @@ mod tests {
         }
     }
 
+    // A whole run against nulled edges: files in memory, canned HTTP
+    // answers, a stopped clock, and a terminal nobody watches.
+
+    const TEMPLATE_PATH: &str = "/site/template.html";
+    const URLS_PATH: &str = "/site/urls.txt";
+    const TITLES_TEMPLATE: &str = "{% for a in articles %}{{ a.title }}\n{% endfor %}";
+
+    const MOCK_RSS: &str = r#"<?xml version="1.0"?>
+        <rss version="2.0">
+            <channel>
+                <title>Mock Feed</title>
+                <link>https://example.com/</link>
+                <description>desc</description>
+                <item>
+                    <title>Mock Article</title>
+                    <link>https://example.com/mock</link>
+                    <description>summary</description>
+                    <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                </item>
+            </channel>
+        </rss>"#;
+
+    fn run_args(feeds: &[&str]) -> crate::args::Args {
+        crate::args::Args {
+            url: feeds.iter().map(ToString::to_string).collect(),
+            template_file: TEMPLATE_PATH.into(),
+            no_cache: true,
+            num_articles: 3,
+            per_source: 1,
+            ..Default::default()
+        }
+    }
+
+    struct RunOutcome {
+        result: crate::error::Result<()>,
+        rendered: String,
+        requests: Vec<crate::http::Request>,
+    }
+
+    async fn run_nulled(
+        args: crate::args::Args,
+        template: Option<&str>,
+        urls_file: Option<&str>,
+        answers: Vec<(&str, crate::http::Answer)>,
+    ) -> RunOutcome {
+        use super::{Deps, run_with};
+        use crate::{clock::Clock, fs::Fs, http::Http, terminal::Terminal};
+
+        let files = [(TEMPLATE_PATH, template), (URLS_PATH, urls_file)];
+        let http = Http::create_null(
+            answers
+                .into_iter()
+                .map(|(url, answer)| (Url::parse(url).unwrap(), answer)),
+        );
+        let requests = http.track_requests();
+        let deps = Deps {
+            http,
+            fs: Fs::create_null(
+                files
+                    .into_iter()
+                    .filter_map(|(path, text)| Some((path, text?))),
+            ),
+            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+        };
+        let mut rendered = Vec::new();
+        let result = run_with(&deps, &Terminal::create_null(false), args, &mut rendered).await;
+        RunOutcome {
+            result,
+            rendered: String::from_utf8(rendered).expect("template output is UTF-8"),
+            requests: requests.data(),
+        }
+    }
+
     #[tokio::test]
     async fn run_fails_on_bad_template_before_fetching_any_feed() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
         // A template with a syntax error: rendering could never succeed, so
         // the run must fail before spending time on the network.
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template.write_all(b"{% for a in %}").unwrap();
-
-        let args = Args {
-            url: vec![server.uri()],
-            template_file: template.path().to_path_buf(),
-            no_cache: true,
-            ..Default::default()
-        };
-        assert!(run(args, std::io::sink()).await.is_err());
-
-        let received = server.received_requests().await.unwrap();
-        assert!(
-            received.is_empty(),
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some("{% for a in %}"),
+            None,
+            vec![],
+        )
+        .await;
+        assert!(outcome.result.is_err());
+        assert_eq!(
+            outcome.requests,
+            [],
             "feeds were fetched despite a template that can never render"
         );
     }
 
     #[tokio::test]
+    async fn run_fails_when_the_template_file_is_missing() {
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            None,
+            None,
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            Err(crate::error::OpenringError::IoError(_))
+        ));
+        assert_eq!(outcome.requests, []);
+    }
+
+    #[tokio::test]
     async fn run_fetches_and_renders_end_to_end() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
-        let body = r#"<?xml version="1.0"?>
-            <rss version="2.0">
-                <channel>
-                    <title>Mock Feed</title>
-                    <link>https://example.com/</link>
-                    <description>desc</description>
-                    <item>
-                        <title>Mock Article</title>
-                        <link>https://example.com/mock</link>
-                        <description>summary</description>
-                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
-                    </item>
-                </channel>
-            </rss>"#;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
-            .mount(&server)
-            .await;
-
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template
-            .write_all(b"{% for a in articles %}{{ a.title }}\n{% endfor %}")
-            .unwrap();
-
-        let args = Args {
-            url: vec![server.uri()],
-            template_file: template.path().to_path_buf(),
-            // no_cache keeps the run from touching the real on-disk cache.
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            ..Default::default()
-        };
-
-        let mut rendered = Vec::new();
-        assert!(run(args, &mut rendered).await.is_ok());
-        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
-        assert_eq!(rendered, "Mock Article\n\n");
+        let url = "https://feed.example/feed.xml";
+        let outcome = run_nulled(
+            run_args(&[url]),
+            Some(TITLES_TEMPLATE),
+            None,
+            vec![(url, crate::http::Answer::ok(MOCK_RSS))],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(outcome.rendered, "Mock Article\n\n");
     }
 
     // The example template exercises every filter the docs promise (the
@@ -2403,245 +2425,156 @@ mod tests {
 
     #[tokio::test]
     async fn run_accepts_weighted_urls_end_to_end() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
-        let body = r#"<?xml version="1.0"?>
-            <rss version="2.0">
-                <channel>
-                    <title>Mock Feed</title>
-                    <link>https://example.com/</link>
-                    <description>desc</description>
-                    <item>
-                        <title>Mock Article</title>
-                        <link>https://example.com/mock</link>
-                        <description>summary</description>
-                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
-                    </item>
-                </channel>
-            </rss>"#;
-        Mock::given(method("GET"))
-            .and(path("/feed.xml"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
-            .mount(&server)
-            .await;
+        use crate::http::Answer;
 
         // One healthy weighted feed plus one weighted feed that 404s: the
         // whole pipeline must accept the `URL WEIGHT` syntax and a broken
         // weighted feed must not take down the run.
-        let mut urls = tempfile::NamedTempFile::new().unwrap();
-        writeln!(urls, "{}/feed.xml 3", server.uri()).unwrap();
-        writeln!(urls, "{}/missing.xml 2", server.uri()).unwrap();
-
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template
-            .write_all(b"{% for a in articles %}{{ a.title }}\n{% endfor %}")
-            .unwrap();
-
-        let make_args = || Args {
-            // The same feed also arrives via -s with the same weight: the
-            // CLI value and the file line must merge instead of conflicting.
-            url: vec![format!("{}/feed.xml 3", server.uri())],
-            url_file: Some(urls.path().to_path_buf()),
-            template_file: template.path().to_path_buf(),
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            seed: Some(42),
-            ..Default::default()
+        let urls_file = "https://feed.example/feed.xml 3\nhttps://feed.example/missing.xml 2\n";
+        let run = || async {
+            let args = crate::args::Args {
+                // The same feed also arrives via -s with the same weight: the
+                // CLI value and the file line must merge instead of
+                // conflicting.
+                url_file: Some(URLS_PATH.into()),
+                seed: Some(42),
+                ..run_args(&["https://feed.example/feed.xml 3"])
+            };
+            run_nulled(
+                args,
+                Some(TITLES_TEMPLATE),
+                Some(urls_file),
+                vec![
+                    ("https://feed.example/feed.xml", Answer::ok(MOCK_RSS)),
+                    ("https://feed.example/missing.xml", Answer::status(404)),
+                ],
+            )
+            .await
         };
 
-        let mut first = Vec::new();
-        assert!(run(make_args(), &mut first).await.is_ok());
-
+        let first = run().await;
+        assert!(first.result.is_ok(), "{:?}", first.result);
         // The --seed contract holds through the whole pipeline, argv to
         // rendered bytes, not just inside select_articles.
-        let mut second = Vec::new();
-        assert!(run(make_args(), &mut second).await.is_ok());
-        assert_eq!(first, second);
+        let second = run().await;
+        assert_eq!(first.rendered, second.rendered);
     }
 
     #[tokio::test]
     async fn run_derives_summary_from_page_for_rss_feed_without_summary() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use crate::http::Answer;
 
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
         // The item carries no <description>, so its summary can only come
         // from the page its link points at.
-        let feed = format!(
-            r#"<?xml version="1.0"?>
+        let feed = r#"<?xml version="1.0"?>
             <rss version="2.0">
                 <channel>
                     <title>Mock Feed</title>
-                    <link>{uri}/</link>
+                    <link>https://feed.example/</link>
                     <description>desc</description>
                     <item>
                         <title>No Summary Article</title>
-                        <link>{uri}/post</link>
+                        <link>https://feed.example/post</link>
                         <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
                     </item>
                 </channel>
-            </rss>"#,
-            uri = server.uri()
-        );
+            </rss>"#;
         let page = r#"<!DOCTYPE html><html><head>
             <meta name="description" content="Derived from the page itself.">
             </head><body><p>Body</p></body></html>"#;
 
-        Mock::given(method("GET"))
-            .and(path("/feed.xml"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(&feed))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/post"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(page.as_bytes(), "text/html"))
-            .mount(&server)
-            .await;
-
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template
-            .write_all(b"{% for a in articles %}{{ a.summary }}{% endfor %}")
-            .unwrap();
-
-        let args = Args {
-            url: vec![format!("{}/feed.xml", server.uri())],
-            template_file: template.path().to_path_buf(),
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            ..Default::default()
-        };
-
-        let mut rendered = Vec::new();
-        assert!(run(args, &mut rendered).await.is_ok());
-        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
-        assert_eq!(rendered, "Derived from the page itself.\n");
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some("{% for a in articles %}{{ a.summary }}{% endfor %}"),
+            None,
+            vec![
+                ("https://feed.example/feed.xml", Answer::ok(feed)),
+                (
+                    "https://feed.example/post",
+                    Answer::ok(page).header("content-type", "text/html"),
+                ),
+            ],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(outcome.rendered, "Derived from the page itself.\n");
     }
 
     #[tokio::test]
     async fn run_derives_summary_from_page_for_atom_feed_without_summary() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use crate::http::Answer;
 
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
         // The entry carries neither <summary> nor <content>, so its summary
         // can only come from the page its link points at. This mirrors real
         // Atom feeds like mitchellh.com/feed.xml.
-        let feed = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
+        let feed = r#"<?xml version="1.0" encoding="utf-8"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
                 <title>Mock Atom Feed</title>
-                <link href="{uri}/"/>
+                <link href="https://feed.example/"/>
                 <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
                 <updated>2003-12-13T18:30:02Z</updated>
                 <entry>
                     <title>No Summary Entry</title>
-                    <link href="{uri}/post"/>
+                    <link href="https://feed.example/post"/>
                     <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
                     <updated>2003-12-13T18:30:02Z</updated>
                 </entry>
-            </feed>"#,
-            uri = server.uri()
-        );
+            </feed>"#;
         let page = r#"<!DOCTYPE html><html><head>
             <meta property="og:description" content="Derived for the Atom entry.">
             </head><body><p>Body</p></body></html>"#;
 
-        Mock::given(method("GET"))
-            .and(path("/feed.xml"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(feed.as_bytes(), "application/atom+xml"),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/post"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(page.as_bytes(), "text/html"))
-            .mount(&server)
-            .await;
-
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template
-            .write_all(b"{% for a in articles %}{{ a.summary }}{% endfor %}")
-            .unwrap();
-
-        let args = Args {
-            url: vec![format!("{}/feed.xml", server.uri())],
-            template_file: template.path().to_path_buf(),
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            ..Default::default()
-        };
-
-        let mut rendered = Vec::new();
-        assert!(run(args, &mut rendered).await.is_ok());
-        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
-        assert_eq!(rendered, "Derived for the Atom entry.\n");
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some("{% for a in articles %}{{ a.summary }}{% endfor %}"),
+            None,
+            vec![
+                (
+                    "https://feed.example/feed.xml",
+                    Answer::ok(feed).header("content-type", "application/atom+xml"),
+                ),
+                (
+                    "https://feed.example/post",
+                    Answer::ok(page).header("content-type", "text/html"),
+                ),
+            ],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(outcome.rendered, "Derived for the Atom entry.\n");
     }
 
     #[tokio::test]
     async fn run_leaves_summary_empty_when_page_fetch_fails() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use crate::http::Answer;
 
-        use super::run;
-        use crate::args::Args;
-
-        let server = MockServer::start().await;
-        // The item's link 404s (only /feed.xml is mocked), so no summary can
-        // be derived and the run must still succeed with an empty one.
-        let feed = format!(
-            r#"<?xml version="1.0"?>
+        // The item's link 404s, so no summary can be derived and the run
+        // must still succeed with an empty one.
+        let feed = r#"<?xml version="1.0"?>
             <rss version="2.0">
                 <channel>
                     <title>Mock Feed</title>
-                    <link>{uri}/</link>
+                    <link>https://feed.example/</link>
                     <description>desc</description>
                     <item>
                         <title>No Summary Article</title>
-                        <link>{uri}/missing</link>
+                        <link>https://feed.example/missing</link>
                         <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
                     </item>
                 </channel>
-            </rss>"#,
-            uri = server.uri()
-        );
-        Mock::given(method("GET"))
-            .and(path("/feed.xml"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(&feed))
-            .mount(&server)
-            .await;
+            </rss>"#;
 
-        let mut template = tempfile::NamedTempFile::new().unwrap();
-        template
-            .write_all(b"{% for a in articles %}[{{ a.summary }}]{% endfor %}")
-            .unwrap();
-
-        let args = Args {
-            url: vec![format!("{}/feed.xml", server.uri())],
-            template_file: template.path().to_path_buf(),
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            ..Default::default()
-        };
-
-        let mut rendered = Vec::new();
-        assert!(run(args, &mut rendered).await.is_ok());
-        let rendered = String::from_utf8(rendered).expect("template output is UTF-8");
-        assert_eq!(rendered, "[]\n");
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some("{% for a in articles %}[{{ a.summary }}]{% endfor %}"),
+            None,
+            vec![
+                ("https://feed.example/feed.xml", Answer::ok(feed)),
+                ("https://feed.example/missing", Answer::status(404)),
+            ],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(outcome.rendered, "[]\n");
     }
 }
