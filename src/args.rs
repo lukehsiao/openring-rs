@@ -76,8 +76,9 @@ pub struct Args {
     /// the output stable for a period of your choosing.
     #[arg(long, value_name = "U64")]
     pub seed: Option<u64>,
-    // WarnLevel: warnings are actionable (skipped entries, cache failures,
-    // redirected feeds) and must not require -v; -q silences them.
+    // WarnLevel: warnings are actionable (failed fetches, skipped entries,
+    // cache failures, redirected feeds) and must not require -v; -q
+    // silences them.
     #[clap(flatten)]
     pub verbose: Verbosity<WarnLevel>,
 }
@@ -111,8 +112,8 @@ mod test {
     #[test]
     fn warnings_are_visible_by_default() {
         use tracing_log::AsTrace;
-        // Warnings (skipped entries, cache failures, redirected feeds) are
-        // actionable and must not require -v to see.
+        // Warnings (failed fetches, skipped entries, cache failures,
+        // redirected feeds) are actionable and must not require -v to see.
         assert_eq!(
             Args::default().verbose.log_level_filter().as_trace(),
             tracing::level_filters::LevelFilter::WARN

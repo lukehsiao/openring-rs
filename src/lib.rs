@@ -376,7 +376,15 @@ async fn get_feeds_from_urls(
             Ok((url, Err(e))) => {
                 pending_urls.remove(&url);
                 show_pending(&pb, &pending_urls);
-                pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
+                // The bar is hidden when stderr is not a terminal, and its
+                // lines vanish with it. Only then does the failure go to the
+                // log, so a terminal shows one styled line and a cron job
+                // still gets a warning.
+                if pb.is_hidden() {
+                    warn!(source = url.as_str(), error = %e, "skipping feed: fetch failed");
+                } else {
+                    pb.println(format!("{:>8} {url} ({e})", "Error".bold().red()));
+                }
             }
             Err(e) => {
                 // A fetch task that panicked or was aborted. The URL is lost
