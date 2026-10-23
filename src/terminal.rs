@@ -13,10 +13,12 @@ use yansi::Paint;
 
 use crate::nullable::OutputListener;
 
-/// Whether a status line reports success or failure. It picks the color.
+/// Whether a status line reports success, a problem the run worked around,
+/// or a failure. It picks the color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tone {
     Good,
+    Warn,
     Bad,
 }
 
@@ -97,6 +99,7 @@ impl Bar {
         let detail = detail.to_string();
         let styled = match tone {
             Tone::Good => word.bold().green(),
+            Tone::Warn => word.bold().yellow(),
             Tone::Bad => word.bold().red(),
         };
         self.pb.println(format!("{styled:>8} {detail}"));

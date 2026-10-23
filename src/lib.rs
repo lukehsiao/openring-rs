@@ -357,19 +357,28 @@ async fn get_feeds_from_urls(
     while let Some(result) = join_set.join_next().await {
         bar.inc();
         match result {
-            Ok((url, Ok(feed))) => {
+            Ok((url, Ok(fetched))) => {
                 pending_urls.remove(&url);
                 show_pending(&bar, &pending_urls);
-                bar.status("Fetched", Tone::Good, &url);
-                feeds.push((feed, url));
+                match &fetched.stale_because {
+                    None => bar.status("Fetched", Tone::Good, &url),
+                    // The bar is hidden when stderr is not a terminal, and
+                    // its lines vanish with it. Only then does the problem
+                    // go to the log, so a terminal shows one styled line and
+                    // a cron job still gets a warning.
+                    Some(e) if terminal.is_visible() => {
+                        bar.status("Stale", Tone::Warn, format!("{url} ({e})"));
+                    }
+                    Some(e) => {
+                        warn!(source = url.as_str(), error = %e, "serving cached feed: fetch failed");
+                    }
+                }
+                feeds.push((fetched.document, url));
             }
             Ok((url, Err(e))) => {
                 pending_urls.remove(&url);
                 show_pending(&bar, &pending_urls);
-                // The bar is hidden when stderr is not a terminal, and its
-                // lines vanish with it. Only then does the failure go to the
-                // log, so a terminal shows one styled line and a cron job
-                // still gets a warning.
+                // Hidden bars lose their lines, as above.
                 if terminal.is_visible() {
                     bar.status("Error", Tone::Bad, format!("{url} ({e})"));
                 } else {
@@ -2397,6 +2406,97 @@ mod tests {
                     headers: vec![("if-none-match", "\"v1\"".to_string())],
                 },
             ]
+        );
+    }
+
+    // Two runs over one cache: the first gets the feed, the second finds
+    // the server down. Returns what the second run rendered.
+    async fn run_with_server_down_the_second_time(terminal: &crate::terminal::Terminal) -> String {
+        use super::{Deps, run_with};
+        use crate::{
+            clock::Clock,
+            fs::Fs,
+            http::{Answer, Http},
+        };
+
+        let url = Url::parse("https://feed.example/feed.xml").unwrap();
+        let deps = Deps {
+            http: Http::create_null([(
+                url.clone(),
+                vec![Answer::ok(MOCK_RSS), Answer::status(503)],
+            )]),
+            fs: Fs::create_null([(TEMPLATE_PATH, TITLES_TEMPLATE)]),
+            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+            cache_path: Some("/cache/cache.json".into()),
+        };
+        let args = || crate::args::Args {
+            no_cache: false,
+            // `Args::default()` keeps nothing; the binary defaults to 30 days.
+            max_cache_age: std::time::Duration::from_hours(30 * 24),
+            ..run_args(&[url.as_str()])
+        };
+
+        let quiet = crate::terminal::Terminal::create_null(false);
+        run_with(&deps, &quiet, args(), std::io::sink())
+            .await
+            .expect("first run");
+        let mut rendered = Vec::new();
+        run_with(&deps, terminal, args(), &mut rendered)
+            .await
+            .expect("second run");
+        String::from_utf8(rendered).unwrap()
+    }
+
+    // Without a terminal, a feed served from the cache still renders, and
+    // the log says why it is stale.
+    #[test]
+    fn a_stale_feed_renders_and_warns_when_nobody_watches() {
+        let terminal = crate::terminal::Terminal::create_null(false);
+        let lines = terminal.track_lines();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut rendered = String::new();
+        let logs = warnings_logged(|| {
+            rendered = rt.block_on(run_with_server_down_the_second_time(&terminal));
+        });
+
+        assert_eq!(rendered, "Mock Article\n\n");
+        assert!(logs.contains("serving cached feed: fetch failed"), "{logs}");
+        assert!(logs.contains("HTTP 503"), "{logs}");
+        assert!(
+            !lines.data().iter().any(|line| line.word == "Stale"),
+            "a hidden bar printed the stale line too"
+        );
+    }
+
+    // On a terminal, the same feed shows as one yellow Stale line and no
+    // log line.
+    #[test]
+    fn a_stale_feed_shows_one_stale_line_when_someone_watches() {
+        use crate::terminal::{Line, Terminal, Tone};
+
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut rendered = String::new();
+        let logs = warnings_logged(|| {
+            rendered = rt.block_on(run_with_server_down_the_second_time(&terminal));
+        });
+
+        assert_eq!(rendered, "Mock Article\n\n");
+        assert_eq!(logs, "");
+        assert_eq!(
+            lines.data(),
+            [Line {
+                word: "Stale",
+                tone: Tone::Warn,
+                detail: "https://feed.example/feed.xml (The request feed at `https://feed.example/feed.xml` received an unexpected error (HTTP 503).)".to_string(),
+            }]
         );
     }
 

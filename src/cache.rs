@@ -33,27 +33,27 @@ use crate::{error::OpenringError, fs::Fs};
 pub(crate) type Body = Arc<Vec<u8>>;
 
 /// The `ETag` and `Last-Modified` values a server sent with a Feed.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Validators {
     pub(crate) etag: Option<String>,
     pub(crate) last_modified: Option<String>,
 }
 
 /// What to do about a Feed before fetching it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     /// A Retry window is open: serve this cached body and send nothing.
     Serve(Body),
     /// Send a request carrying these Validators. They are empty when the
-    /// cache holds no body to fall back on, because a "not modified" answer
-    /// would then leave nothing to serve.
+    /// cache holds nothing for the Feed.
     Request(Validators),
 }
 
 /// What the server said about a Feed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum Outcome {
-    /// A new body, with the Validators that came with it.
+    /// A new body that parsed as a feed, so it is not empty, with the
+    /// Validators that came with it.
     Fresh {
         body: Vec<u8>,
         validators: Validators,
@@ -62,21 +62,25 @@ pub(crate) enum Outcome {
     NotModified(Validators),
     /// Too many requests: ask again no sooner than `until`.
     RateLimited { until: Timestamp },
+    /// The fetch failed for a reason that may pass: the network, the
+    /// server, or a body that was too large, empty, or not a feed. Serve the
+    /// cached body if there is one, and change nothing, so the entry still
+    /// ages out from when the server last answered.
+    Failed,
 }
 
 /// What the cache holds for one Feed.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Entry {
     /// When the server last answered. Entries older than the maximum cache
     /// age are dropped on load.
     fetched_at: Timestamp,
     /// The end of the Retry window, if one is open or was.
     retry_until: Option<Timestamp>,
-    etag: Option<String>,
-    last_modified: Option<String>,
-    /// `None` when the server never sent a body worth serving.
+    #[serde(flatten)]
+    validators: Validators,
     #[serde(with = "body_base64")]
-    body: Option<Body>,
+    body: Body,
 }
 
 /// Serialize the body as base64: `serde_json` would otherwise render a byte
@@ -85,30 +89,26 @@ mod body_base64 {
     use std::sync::Arc;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    // serde's `with` contract passes the field by reference, so the
-    // idiomatic Option<&Body> is not an option here.
-    #[expect(clippy::ref_option)]
     pub(super) fn serialize<S: Serializer>(
-        body: &Option<super::Body>,
+        body: &super::Body,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        body.as_ref()
-            .map(|bytes| STANDARD.encode(bytes.as_slice()))
-            .serialize(serializer)
+        serializer.serialize_str(&STANDARD.encode(body.as_slice()))
     }
 
-    /// An empty body decodes as no body, as [`super::Cache::record`] stores
-    /// it, so a hand-edited file cannot make an empty feed servable.
+    /// An empty body fails to decode, as no stored feed is empty, so a
+    /// hand-edited file cannot make an empty feed servable.
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<super::Body>, D::Error> {
-        let encoded: Option<String> = Option::deserialize(deserializer)?;
-        let decoded = encoded
-            .map(|s| STANDARD.decode(s).map_err(serde::de::Error::custom))
-            .transpose()?;
-        Ok(decoded.filter(|b| !b.is_empty()).map(Arc::new))
+    ) -> Result<super::Body, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        let decoded = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        if decoded.is_empty() {
+            return Err(serde::de::Error::custom("empty body"));
+        }
+        Ok(Arc::new(decoded))
     }
 }
 
@@ -135,19 +135,15 @@ impl Cache {
     /// starts an empty cache with a warning. That includes caches written by
     /// older versions in another format, which is the intended migration.
     pub(crate) fn load(fs: &Fs, path: &Path, max_age: Duration, now: Timestamp) -> Self {
-        let text = match fs.read_locked(path) {
-            Ok(text) => text,
+        let loaded = fs.read_locked(path).and_then(|text| {
+            serde_json::from_str::<DashMap<Url, Entry>>(&text).map_err(io::Error::other)
+        });
+        let entries = match loaded {
+            Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 debug!(path = %path.display(), "no cache yet; starting empty");
                 return Self::default();
             }
-            Err(e) => {
-                warn!("Error while loading cache: {e}. Continuing without.");
-                return Self::default();
-            }
-        };
-        let entries: DashMap<Url, Entry> = match serde_json::from_str(&text) {
-            Ok(entries) => entries,
             Err(e) => {
                 warn!("Error while loading cache: {e}. Continuing without.");
                 return Self::default();
@@ -184,18 +180,11 @@ impl Cache {
         let Some(entry) = self.entries.get(url) else {
             return Plan::Request(Validators::default());
         };
-        match &entry.body {
-            Some(body) if entry.retry_until.is_some_and(|until| until > now) => {
-                debug!(url = url.as_str(), retry_until = ?entry.retry_until, "retry window open; serving the cached feed");
-                Plan::Serve(Arc::clone(body))
-            }
-            Some(_) => Plan::Request(Validators {
-                etag: entry.etag.clone(),
-                last_modified: entry.last_modified.clone(),
-            }),
-            // An open window with nothing cached still fetches.
-            None => Plan::Request(Validators::default()),
+        if entry.retry_until.is_some_and(|until| until > now) {
+            debug!(url = url.as_str(), retry_until = ?entry.retry_until, "retry window open; serving the cached feed");
+            return Plan::Serve(Arc::clone(&entry.body));
         }
+        Plan::Request(entry.validators.clone())
     }
 
     /// Record what the server said about the Feed at `url` at `now`, and
@@ -203,9 +192,9 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns [`OpenringError::EmptyFeedError`] when there is no body to
-    /// serve, and [`OpenringError::RateLimitError`] when the server is rate
-    /// limiting a Feed the cache knows nothing about.
+    /// Returns [`OpenringError::EmptyFeedError`] when the cache holds no
+    /// body to serve, and [`OpenringError::RateLimitError`] when the server
+    /// is rate limiting a Feed the cache knows nothing about.
     pub(crate) fn record(
         &self,
         url: &Url,
@@ -215,27 +204,21 @@ impl Cache {
         let empty = || OpenringError::EmptyFeedError(url.as_str().to_string());
         match outcome {
             Outcome::Fresh { body, validators } => {
-                // An empty body counts as no body. Caching it as servable
-                // would make later runs send conditional requests, get "not
-                // modified", and serve the empty feed until the entry aged
-                // out.
-                let body = (!body.is_empty()).then(|| Arc::new(body));
+                let body = Arc::new(body);
                 self.entries.insert(
                     url.clone(),
                     Entry {
                         fetched_at: now,
                         // A normal answer ends any Retry window.
                         retry_until: None,
-                        etag: validators.etag,
-                        last_modified: validators.last_modified,
-                        body: body.clone(),
+                        validators,
+                        body: Arc::clone(&body),
                     },
                 );
-                body.ok_or_else(empty)
+                Ok(body)
             }
             Outcome::NotModified(validators) => {
                 let mut entry = self.entries.get_mut(url).ok_or_else(empty)?;
-                let body = entry.body.clone().ok_or_else(empty)?;
                 entry.fetched_at = now;
                 // "Not modified" is a normal answer too, so it ends any Retry
                 // window just as a fresh body does.
@@ -243,12 +226,12 @@ impl Cache {
                 // RFC 7232 lets the answer rotate the Validators it confirms.
                 // Absent ones leave the stored ones in place.
                 if validators.etag.is_some() {
-                    entry.etag = validators.etag;
+                    entry.validators.etag = validators.etag;
                 }
                 if validators.last_modified.is_some() {
-                    entry.last_modified = validators.last_modified;
+                    entry.validators.last_modified = validators.last_modified;
                 }
-                Ok(body)
+                Ok(Arc::clone(&entry.body))
             }
             Outcome::RateLimited { until } => {
                 let mut entry = self
@@ -257,8 +240,13 @@ impl Cache {
                     .ok_or_else(|| OpenringError::RateLimitError(url.as_str().to_string()))?;
                 entry.fetched_at = now;
                 entry.retry_until = Some(until);
-                entry.body.clone().ok_or_else(empty)
+                Ok(Arc::clone(&entry.body))
             }
+            Outcome::Failed => self
+                .entries
+                .get(url)
+                .map(|entry| Arc::clone(&entry.body))
+                .ok_or_else(empty),
         }
     }
 }
@@ -287,18 +275,14 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn fresh(body: &str, etag: Option<&str>) -> Outcome {
+    fn fresh(etag: Option<&str>) -> Outcome {
         Outcome::Fresh {
-            body: body.as_bytes().to_vec(),
+            body: b"feed".to_vec(),
             validators: Validators {
                 etag: etag.map(str::to_string),
                 last_modified: None,
             },
         }
-    }
-
-    fn body(s: &str) -> Body {
-        Arc::new(s.as_bytes().to_vec())
     }
 
     // The bug a 304 after an expired 429 once caused: the 304 kept the old
@@ -307,9 +291,7 @@ mod tests {
     fn a_not_modified_after_an_expired_retry_window_does_not_reopen_it() {
         let cache = Cache::default();
         let t0 = at("2026-01-01T00:00:00Z");
-        cache
-            .record(&url(), fresh("feed", Some("\"v1\"")), t0)
-            .unwrap();
+        cache.record(&url(), fresh(Some("\"v1\"")), t0).unwrap();
         cache
             .record(
                 &url(),
@@ -352,19 +334,22 @@ mod tests {
         assert_eq!(logs, "");
     }
 
-    // An entry whose stored body is empty, as only a hand-edited file holds,
-    // has nothing to serve: no Validators go out, and a Retry window cannot
-    // serve it.
+    // No stored feed is empty, so an empty body, as only a hand-edited file
+    // holds, fails to load like any other malformed file: the cache starts
+    // empty with a warning, and nothing is served from it.
     #[test]
-    fn an_empty_stored_body_loads_as_no_body() {
+    fn an_empty_stored_body_discards_the_file() {
         let file = r#"{"https://feed.example/feed.xml":{"fetched_at":"2026-01-01T00:00:00Z","retry_until":"2027-01-01T00:00:00Z","last_modified":null,"etag":"\"v1\"","body":""}}"#;
         let fs = Fs::create_null([(CACHE_PATH, file)]);
         let now = at("2026-01-01T00:00:01Z");
-        let cache = Cache::load(&fs, Path::new(CACHE_PATH), Duration::MAX, now);
-        assert_eq!(
-            cache.plan(&url(), now),
-            Plan::Request(Validators::default())
-        );
+        let logs = warnings_logged(|| {
+            let cache = Cache::load(&fs, Path::new(CACHE_PATH), Duration::MAX, now);
+            assert_eq!(
+                cache.plan(&url(), now),
+                Plan::Request(Validators::default())
+            );
+        });
+        assert!(logs.contains("Error while loading cache"), "{logs}");
     }
 
     // A cache written by an older version uses other field names. It fails
@@ -396,7 +381,7 @@ mod tests {
         let path = blocker.path().join("cache.json");
         let cache = Cache::default();
         cache
-            .record(&url(), fresh("feed", None), at("2026-01-01T00:00:00Z"))
+            .record(&url(), fresh(None), at("2026-01-01T00:00:00Z"))
             .unwrap();
 
         let logs = warnings_logged(|| cache.save(&Fs::create(), &path));
@@ -409,9 +394,7 @@ mod tests {
         let path = dir.path().join("cache.json");
         let now = at("2026-01-01T00:00:00Z");
         let cache = Cache::default();
-        cache
-            .record(&url(), fresh("feed", Some("\"v1\"")), now)
-            .unwrap();
+        cache.record(&url(), fresh(Some("\"v1\"")), now).unwrap();
 
         cache.save(&Fs::create(), &path);
         let loaded = Cache::load(&Fs::create(), &path, Duration::MAX, now);
@@ -419,7 +402,7 @@ mod tests {
             loaded
                 .record(&url(), Outcome::NotModified(Validators::default()), now)
                 .unwrap(),
-            body("feed")
+            Arc::new(b"feed".to_vec())
         );
         // Prove the file holds JSON a person can read, with the body in
         // base64 rather than one number per byte.
@@ -431,12 +414,12 @@ mod tests {
     // A model of the cache in plain terms, one entry per Feed, that the real
     // cache must agree with after any sequence of answers, clock moves, and
     // save-then-load round trips.
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug)]
     struct ModelEntry {
         fetched_at: Timestamp,
         retry_until: Option<Timestamp>,
         validators: Validators,
-        body: Option<Vec<u8>>,
+        body: Vec<u8>,
     }
 
     #[derive(Debug, PartialEq)]
@@ -497,7 +480,12 @@ mod tests {
         #[rule]
         fn record_fresh(&mut self, tc: TestCase) {
             let url = self.pick_url(&tc);
-            let body = tc.draw(generators::vecs(generators::integers::<u8>()).max_size(16));
+            // A fresh body parsed as a feed, so it is never empty.
+            let body = tc.draw(
+                generators::vecs(generators::integers::<u8>())
+                    .min_size(1)
+                    .max_size(16),
+            );
             let validators = Self::draw_validators(&tc);
             let got = served(self.subject.record(
                 &url,
@@ -508,18 +496,16 @@ mod tests {
                 self.now,
             ));
 
-            let body = (!body.is_empty()).then_some(body);
-            let expected = body.clone().map_or(Served::Empty, Served::Body);
             self.model.insert(
                 url,
                 ModelEntry {
                     fetched_at: self.now,
                     retry_until: None,
                     validators,
-                    body,
+                    body: body.clone(),
                 },
             );
-            assert_eq!(got, expected);
+            assert_eq!(got, Served::Body(body));
         }
 
         #[rule]
@@ -533,7 +519,7 @@ mod tests {
             ));
 
             let expected = match self.model.get_mut(&url) {
-                Some(entry) if entry.body.is_some() => {
+                Some(entry) => {
                     entry.fetched_at = self.now;
                     entry.retry_until = None;
                     if validators.etag.is_some() {
@@ -542,9 +528,9 @@ mod tests {
                     if validators.last_modified.is_some() {
                         entry.validators.last_modified = validators.last_modified;
                     }
-                    Served::Body(entry.body.clone().unwrap())
+                    Served::Body(entry.body.clone())
                 }
-                _ => Served::Empty,
+                None => Served::Empty,
             };
             assert_eq!(got, expected);
         }
@@ -569,10 +555,23 @@ mod tests {
                 Some(entry) => {
                     entry.fetched_at = self.now;
                     entry.retry_until = Some(until);
-                    entry.body.clone().map_or(Served::Empty, Served::Body)
+                    Served::Body(entry.body.clone())
                 }
                 None => Served::RateLimited,
             };
+            assert_eq!(got, expected);
+        }
+
+        #[rule]
+        fn record_failed(&mut self, tc: TestCase) {
+            let url = self.pick_url(&tc);
+            let got = served(self.subject.record(&url, Outcome::Failed, self.now));
+
+            // A failure serves what is cached and changes nothing.
+            let expected = self
+                .model
+                .get(&url)
+                .map_or(Served::Empty, |entry| Served::Body(entry.body.clone()));
             assert_eq!(got, expected);
         }
 
@@ -581,16 +580,12 @@ mod tests {
             let url = self.pick_url(&tc);
             let expected = match self.model.get(&url) {
                 Some(ModelEntry {
-                    body: Some(body),
+                    body,
                     retry_until: Some(until),
                     ..
                 }) if *until > self.now => Plan::Serve(Arc::new(body.clone())),
-                Some(ModelEntry {
-                    body: Some(_),
-                    validators,
-                    ..
-                }) => Plan::Request(validators.clone()),
-                _ => Plan::Request(Validators::default()),
+                Some(entry) => Plan::Request(entry.validators.clone()),
+                None => Plan::Request(Validators::default()),
             };
             assert_eq!(self.subject.plan(&url, self.now), expected);
         }
