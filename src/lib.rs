@@ -2,6 +2,7 @@ pub mod args;
 mod cache;
 mod clock;
 pub mod error;
+mod fan_out;
 mod feed_list;
 mod feedfetcher;
 mod fs;
@@ -14,19 +15,14 @@ pub mod terminal;
 #[cfg(test)]
 mod test_logs;
 
-use std::{
-    collections::HashSet,
-    io::{self, Write},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 use jiff::{Timestamp, tz::TimeZone};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use tera::Tera;
-use tokio::{sync::Semaphore, task::JoinSet};
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 use crate::{
@@ -34,12 +30,13 @@ use crate::{
     cache::Cache,
     clock::Clock,
     error::Result,
+    fan_out::{Outcome, Words, fan_out},
     feed_list::{Feed, UrlsFile},
-    feedfetcher::fetch_feed,
+    feedfetcher::{Fetched, fetch_feed},
     fs::Fs,
     http::Http,
     source::Source,
-    terminal::{Bar, Terminal, Tone},
+    terminal::Terminal,
 };
 
 #[derive(Serialize, Debug)]
@@ -52,108 +49,52 @@ pub(crate) struct Article {
     timestamp: Timestamp,
 }
 
-/// Cap on in-flight fetches so a long urls file cannot exhaust the process's
-/// file descriptors (macOS defaults to 256 per process). 32 keeps the network
-/// saturated while staying well below that floor.
-const MAX_CONCURRENT_FETCHES: usize = 32;
+const FETCH_WORDS: Words = Words {
+    progress: "Fetching",
+    done: "Fetched",
+    stale_log: "serving cached feed: fetch failed",
+    failed_log: "skipping feed: fetch failed",
+    panic_log: "feed fetch task failed",
+};
 
-/// Set the progress bar's message to the list of URLs still in flight.
-fn show_pending(bar: &Bar, pending: &HashSet<&Url>) {
-    bar.set_message(
-        pending
-            .iter()
-            .map(|u| u.as_str())
-            .collect::<Vec<&str>>()
-            .join(", "),
-    );
-}
-
-// Get all feeds concurrently, sharing one `http` client, as of `now`, and
-// project each fetched document onto its Source.
-//
-// Skips feeds if there are errors, and shows progress as fetches finish.
-async fn get_feeds_from_urls(
+/// Fetch every Feed through the shared `http` client as of `now`, and
+/// project each fetched document onto its Source. A Feed that is gone (404
+/// or 410), or that fails with nothing cached to fall back on, is skipped.
+async fn fetch_sources(
     http: &Http,
     terminal: &Terminal,
-    feeds: &[Feed],
+    feeds: Vec<Feed>,
     cache: &Cache,
     now: Timestamp,
 ) -> Vec<Source> {
-    let bar = terminal.bar("Fetching", feeds.len());
-
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
-
-    let mut join_set = JoinSet::new();
-    let mut pending_urls: HashSet<&Url> = feeds.iter().map(|f| &f.url).collect();
-
-    show_pending(&bar, &pending_urls);
-
-    for feed in feeds {
-        // Cache is a cheap handle to the shared entries.
-        let cache_clone = cache.clone();
-        // Http is a cheap handle to the shared pool.
-        let http = http.clone();
-        let semaphore_clone = Arc::clone(&semaphore);
-        let feed = feed.clone();
-        join_set.spawn(async move {
-            // acquire_owned errors only when the semaphore is closed, and
-            // this one never is.
-            let _permit = semaphore_clone
-                .acquire_owned()
-                .await
-                .expect("semaphore is never closed");
-            let fetch_result = fetch_feed(&feed.url, &http, &cache_clone, now).await;
-            (feed, fetch_result)
-        });
-    }
-    let mut sources = Vec::new();
-
-    while let Some(result) = join_set.join_next().await {
-        bar.inc();
-        match result {
-            Ok((feed, Ok(fetched))) => {
-                let url = &feed.url;
-                pending_urls.remove(url);
-                show_pending(&bar, &pending_urls);
-                match &fetched.stale_because {
-                    None => bar.status("Fetched", Tone::Good, url),
-                    // The bar is hidden when stderr is not a terminal, and
-                    // its lines vanish with it. Only then does the problem
-                    // go to the log, so a terminal shows one styled line and
-                    // a cron job still gets a warning.
-                    Some(e) if terminal.is_visible() => {
-                        bar.status("Stale", Tone::Warn, format!("{url} ({e})"));
-                    }
-                    Some(e) => {
-                        warn!(source = url.as_str(), error = %e, "serving cached feed: fetch failed");
-                    }
-                }
-                sources.push(source::project(&fetched.document, feed));
-            }
-            Ok((feed, Err(e))) => {
-                let url = &feed.url;
-                pending_urls.remove(url);
-                show_pending(&bar, &pending_urls);
-                // Hidden bars lose their lines, as above.
-                if terminal.is_visible() {
-                    bar.status("Error", Tone::Bad, format!("{url} ({e})"));
-                } else {
-                    warn!(source = url.as_str(), error = %e, "skipping feed: fetch failed");
-                }
-            }
-            Err(e) => {
-                // A fetch task that panicked or was aborted. The URL is lost
-                // with the task, so it cannot be removed from the pending
-                // list, but the failure must not be silent.
-                warn!(error=%e, "feed fetch task failed");
-                bar.status("Error", Tone::Bad, format!("fetch task failed ({e})"));
+    let items = feeds.into_iter().map(|f| (f.url.clone(), f)).collect();
+    fan_out(terminal, &FETCH_WORDS, items, |url, feed| {
+        // Both are cheap handles to shared state.
+        let (http, cache) = (http.clone(), cache.clone());
+        async move {
+            match fetch_feed(&url, &http, &cache, now).await {
+                Ok(Fetched {
+                    document,
+                    stale_because: None,
+                }) => Outcome::Done(source::project(&document, feed)),
+                Ok(Fetched {
+                    document,
+                    stale_because: Some(e),
+                }) => Outcome::Stale(source::project(&document, feed), e.to_string()),
+                Err(e) => Outcome::Failed(e.to_string()),
             }
         }
-    }
-
-    bar.finish_and_clear();
-    sources
+    })
+    .await
 }
+
+const SUMMARY_WORDS: Words = Words {
+    progress: "Summarizing",
+    done: "Summary",
+    stale_log: "using a fallback summary",
+    failed_log: "could not derive a summary",
+    panic_log: "summary fetch task failed",
+};
 
 /// Derive summaries for the chosen `articles` whose feeds provided none, by
 /// fetching each article's own page (see [`summarize::fetch_summary`]).
@@ -163,60 +104,25 @@ async fn get_feeds_from_urls(
 /// nothing keeps its empty summary, exactly as if the feed had one that was
 /// blank, so nothing here can fail the run.
 async fn fill_missing_summaries(http: &Http, terminal: &Terminal, articles: &mut [Article]) {
-    // Owned links so the pending set below borrows from `missing`, leaving
-    // `articles` free to take the derived summaries by index afterward.
-    let missing: Vec<(usize, Url)> = articles
+    let items = articles
         .iter()
         .enumerate()
         .filter(|(_, a)| a.summary.is_empty())
-        .map(|(i, a)| (i, a.link.clone()))
+        .map(|(i, a)| (a.link.clone(), i))
         .collect();
-    if missing.is_empty() {
-        return;
-    }
-
-    let bar = terminal.bar("Summarizing", missing.len());
-
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
-    let mut pending_urls: HashSet<&Url> = missing.iter().map(|(_, url)| url).collect();
-    show_pending(&bar, &pending_urls);
-
-    let mut join_set = JoinSet::new();
-    for (idx, url) in &missing {
+    let summaries = fan_out(terminal, &SUMMARY_WORDS, items, |url, i| {
         let http = http.clone();
-        let semaphore_clone = Arc::clone(&semaphore);
-        let idx = *idx;
-        let url = url.clone();
-        join_set.spawn(async move {
-            let _permit = semaphore_clone
-                .acquire_owned()
+        async move {
+            // A page with nothing quotable is routine, not worth a report.
+            summarize::fetch_summary(&http, &url)
                 .await
-                .expect("semaphore is never closed");
-            let summary = summarize::fetch_summary(&http, &url).await;
-            (idx, url, summary)
-        });
-    }
-
-    while let Some(result) = join_set.join_next().await {
-        bar.inc();
-        match result {
-            Ok((idx, url, summary)) => {
-                pending_urls.remove(&url);
-                show_pending(&bar, &pending_urls);
-                if let Some(summary) = summary {
-                    bar.status("Summary", Tone::Good, &url);
-                    articles[idx].summary = summary;
-                }
-            }
-            Err(e) => {
-                // A task that panicked or was aborted; its article keeps the
-                // empty summary, but the failure must not be silent.
-                warn!(error = %e, "summary fetch task failed");
-            }
+                .map_or(Outcome::Skipped, |summary| Outcome::Done((i, summary)))
         }
+    })
+    .await;
+    for (i, summary) in summaries {
+        articles[i].summary = summary;
     }
-
-    bar.finish_and_clear();
 }
 
 /// The edges a run talks to the outside world through. Tests build them
@@ -288,7 +194,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
         .transpose()?;
 
-    let sources = get_feeds_from_urls(&deps.http, terminal, &feed_list, &cache, now).await;
+    let sources = fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
 
     if let Some(path) = cache_path {
         cache.save(&deps.fs, path);
