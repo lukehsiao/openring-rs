@@ -9,7 +9,7 @@ A web feed the user configured by URL, with an optional Weight.
 _Avoid_: URL, subscription, channel
 
 **Weight**:
-A number N on a Feed that makes it fill its slots at random from its N newest eligible Entries, so a prolific Feed stops crowding out the rest.
+A number N on a Feed that makes it fill its slots at random from its N newest Articles, so a prolific Feed stops crowding out the rest.
 _Avoid_: priority, frequency
 
 **Feed list**:
@@ -23,11 +23,11 @@ One item as a fetched Feed's document lists it, complete or not.
 _Avoid_: item, post
 
 **Source**:
-The display identity of a fetched Feed: its title and homepage link.
+A fetched Feed as a reader meets it: its display title, its homepage link, and its Articles.
 _Avoid_: site, blog, publisher
 
 **Article**:
-An Entry with a link, a title, and a date, tied to its Source, ready to render.
+An Entry with a web link, a title a reader can see, and a date, tied to its Source, ready to render.
 _Avoid_: post, story, link
 
 ## Fetching
