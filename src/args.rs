@@ -56,13 +56,17 @@ pub struct Args {
     pub before: Option<Date>,
     /// Do NOT use request cache stored on disk.
     ///
-    /// Note that the cache only prevents refetching if the feed source responds
-    /// with a 429. In this case, we respect Retry-After, or default to 4h.
-    /// Otherwise, the existence of a cache file just allows openring to respect
-    /// `ETag` and `Last-Modified` headers for conditional requests.
+    /// The cache lets openring send conditional requests with the `ETag` and
+    /// `Last-Modified` headers a feed last sent. It skips a request only while
+    /// a 429 rate limit lasts, respecting Retry-After or defaulting to 4h. When
+    /// a fetch fails for a reason that may pass, such as a network error, a
+    /// server error, or a body that is empty, too large, or not a feed, the
+    /// cached copy is served and reported as stale. A 404 or 410 is never
+    /// covered up.
     #[arg(long)]
     pub no_cache: bool,
-    /// Discard all cached requests older than this duration
+    /// Discard a cached feed once this long has passed since its server last
+    /// sent, confirmed, or rate-limited it
     #[arg(
         long,
         value_parser = humantime::parse_duration,

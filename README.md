@@ -86,8 +86,9 @@ Options:
                                        specify multiple)
   -b, --before <BEFORE>                Only include articles before this date (in YYYY-MM-DD format)
       --no-cache                       Do NOT use request cache stored on disk
-      --max-cache-age <MAX_CACHE_AGE>  Discard all cached requests older than this duration
-                                       [default: 30d]
+      --max-cache-age <MAX_CACHE_AGE>  Discard a cached feed once this long has passed since its
+                                       server last sent, confirmed, or rate-limited it [default:
+                                       30d]
       --seed <U64>                     Seed the random selection used by weighted feeds, for
                                        reproducible output
   -v, --verbose...                     Increase logging verbosity
@@ -137,9 +138,13 @@ We use OS-standard locations for caching.
 The cache file is simple JSON.
 Feed bodies are stored as base64-encoded bytes so the original transfer encoding survives for the parser; the other fields are plain text.
 
-The cache only prevents refetching a feed if the feed source responds with a 429.
+The cache prevents refetching a feed only while the feed source's 429 rate limit lasts.
 In this case, we respect `Retry-After`, or default to 4 hours.
 Otherwise, we use the cache to send conditional requests by respecting the `ETag` and `Last-Modified` headers.
+
+When a fetch fails for a reason that may pass, such as a network error, a server error, or a response that is empty or not a feed, `openring-rs` serves the cached copy and says so: a yellow `Stale` line in a terminal, or a warning in the log.
+A `404` or `410` means the feed is gone, so it is reported as an error and never covered up by the cache.
+A cached copy is dropped once `--max-cache-age` (30 days by default) has passed since its server last sent, confirmed, or rate-limited it, so a dead feed eventually leaves the output.
 
 ## Why a Rust port?
 Just for fun.

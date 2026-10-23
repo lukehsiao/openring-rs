@@ -3,7 +3,7 @@
 //! the body the cache hands back. Every rule about what the cache stores
 //! lives in the cache module.
 
-use feed_rs::{model::Feed, parser};
+use feed_rs::{model::Feed as Document, parser};
 use jiff::{SignedDuration, Timestamp};
 use tracing::{debug, warn};
 use url::Url;
@@ -63,18 +63,82 @@ fn response_validators(resp: &Response) -> Validators {
     }
 }
 
+/// A parsed feed document for this run.
+#[derive(Debug)]
+pub(crate) struct Fetched {
+    pub(crate) document: Document,
+    /// Why the server could not be used, when the feed came from the cache
+    /// instead. `None` when the feed counts as current: the server sent or
+    /// confirmed it, or a Retry window covers it.
+    pub(crate) stale_because: Option<OpenringError>,
+}
+
+/// Why the server did not give a usable feed.
+enum Failure {
+    /// The server says the feed is gone (404 or 410). Only the user can fix
+    /// that, in the urls file, and a cached copy would only hide it.
+    Gone(OpenringError),
+    /// Anything that may pass by a later run. The cached copy fills in.
+    Passing(OpenringError),
+}
+
 /// Fetch the feed at `url` through `http`, using and updating the `cache`.
 /// Every cache decision and every timestamp written uses `now`.
+///
+/// When the server fails for a reason that may pass, the cached feed is
+/// served instead, and [`Fetched::stale_because`] says why.
+///
+/// # Errors
+///
+/// Returns the failure when the feed is gone, or when it failed and the
+/// cache holds nothing to serve.
 pub(crate) async fn fetch_feed(
     url: &Url,
     http: &Http,
     cache: &Cache,
     now: Timestamp,
-) -> Result<Feed, OpenringError> {
+) -> Result<Fetched, OpenringError> {
     let validators = match cache.plan(url, now) {
-        Plan::Serve(body) => return Ok(parser::parse(body.as_slice())?),
+        Plan::Serve(body) => {
+            return Ok(Fetched {
+                document: parser::parse(body.as_slice())?,
+                stale_because: None,
+            });
+        }
         Plan::Request(validators) => validators,
     };
+    match fetch_from_server(url, http, cache, &validators, now).await {
+        Ok(document) => Ok(Fetched {
+            document,
+            stale_because: None,
+        }),
+        Err(Failure::Gone(e)) => Err(e),
+        // A cached copy that does not parse cannot fill in, and the failure
+        // that sent us to the cache is the one worth reporting.
+        Err(Failure::Passing(e)) => match cache
+            .record(url, Outcome::Failed, now)
+            .ok()
+            .and_then(|body| parser::parse(body.as_slice()).ok())
+        {
+            Some(document) => Ok(Fetched {
+                document,
+                stale_because: Some(e),
+            }),
+            None => Err(e),
+        },
+    }
+}
+
+/// Ask the server for the feed, record its answer in the cache, and parse
+/// the body the answer leaves to serve.
+async fn fetch_from_server(
+    url: &Url,
+    http: &Http,
+    cache: &Cache,
+    validators: &Validators,
+    now: Timestamp,
+) -> Result<Document, Failure> {
+    let passing = Failure::Passing;
     let mut headers = Vec::with_capacity(2);
     if let Some(last_modified) = &validators.last_modified {
         headers.push(("if-modified-since", last_modified.as_str()));
@@ -84,7 +148,10 @@ pub(crate) async fn fetch_feed(
     }
     debug!(url=%url, ?headers, "sending request");
 
-    let resp = http.get(url, &headers).await?;
+    let resp = http
+        .get(url, &headers)
+        .await
+        .map_err(|e| passing(e.into()))?;
     debug!(url=%url, status=%resp.status(), "received response");
 
     // reqwest follows redirects silently, so a moved feed keeps working
@@ -97,28 +164,27 @@ pub(crate) async fn fetch_feed(
         );
     }
 
-    // Reject grossly oversized responses before buffering them. Chunked and
-    // compressed responses announce no usable length, so the read below
-    // enforces the same cap as the bytes arrive.
-    if let Some(bytes) = resp.content_length()
-        && !usize::try_from(bytes).is_ok_and(|b| b <= MAX_FEED_BYTES)
-    {
-        return Err(OpenringError::FeedTooLargeError {
-            url: url.as_str().to_string(),
-            bytes,
-        });
-    }
-
     let status = resp.status();
     let outcome = if status == StatusCode::NOT_MODIFIED {
         Outcome::NotModified(response_validators(&resp))
     } else if status.is_success() {
+        // Reject grossly oversized bodies before buffering them. Only a
+        // success has a body worth reading, so only it is checked: a 404 or
+        // 429 that announces a huge body still means what its status says.
+        // Chunked and compressed responses announce no usable length, so
+        // the read below enforces the same cap as the bytes arrive.
+        if let Some(bytes) = resp.content_length()
+            && !usize::try_from(bytes).is_ok_and(|b| b <= MAX_FEED_BYTES)
+        {
+            return Err(passing(OpenringError::FeedTooLargeError {
+                url: url.as_str().to_string(),
+                bytes,
+            }));
+        }
         let validators = response_validators(&resp);
         // Keep the raw bytes: pre-decoding to text re-encodes the transfer
         // as UTF-8 while the XML prolog still declares the original charset,
-        // so the parser would decode non-UTF-8 feeds twice into mojibake. A
-        // transfer error mid-read fails the fetch with its cause and leaves
-        // the cache untouched.
+        // so the parser would decode non-UTF-8 feeds twice into mojibake.
         let body = resp
             .read_capped(MAX_FEED_BYTES)
             .await
@@ -128,20 +194,40 @@ pub(crate) async fn fetch_feed(
                     bytes,
                 },
                 ReadError::Transfer(e) => e.into(),
-            })?;
-        Outcome::Fresh { body, validators }
+            })
+            .map_err(passing)?;
+        // Parse before storing: a body that is empty or not a feed, such as
+        // an HTML error page sent with a 200, must not replace a good cached
+        // body and its Validators.
+        if body.is_empty() {
+            return Err(passing(OpenringError::EmptyFeedError(
+                url.as_str().to_string(),
+            )));
+        }
+        let document = parser::parse(body.as_slice()).map_err(|e| passing(e.into()))?;
+        cache
+            .record(url, Outcome::Fresh { body, validators }, now)
+            .map_err(passing)?;
+        return Ok(document);
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         Outcome::RateLimited {
             until: retry_deadline(resp.header("retry-after"), now),
         }
     } else {
-        return Err(OpenringError::UnexpectedStatusError {
+        let e = OpenringError::UnexpectedStatusError {
             url: url.as_str().to_string(),
             status: status.as_str().to_string(),
-        });
+        };
+        return Err(
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                Failure::Gone(e)
+            } else {
+                passing(e)
+            },
+        );
     };
-    let body = cache.record(url, outcome, now)?;
-    Ok(parser::parse(body.as_slice())?)
+    let body = cache.record(url, outcome, now).map_err(passing)?;
+    parser::parse(body.as_slice()).map_err(|e| passing(e.into()))
 }
 
 #[cfg(test)]
@@ -182,8 +268,6 @@ mod tests {
         "#
         )
     }
-
-    // Retry-After parsing.
 
     // Whatever the header holds and whenever it arrives, the deadline is an
     // instant, never a panic.
@@ -277,10 +361,8 @@ mod tests {
     // Whole fetches against a nulled Http and a real cache: the request
     // that goes out, and what each answer means for the next run.
 
-    const NOW: &str = "2026-01-01T00:00:00Z";
-
     fn now() -> Timestamp {
-        NOW.parse().unwrap()
+        "2026-01-01T00:00:00Z".parse().unwrap()
     }
 
     fn feed_url() -> Url {
@@ -295,7 +377,7 @@ mod tests {
     }
 
     // A cache that already holds a feed titled `title` from an earlier run.
-    fn cache_holding(title: &str, validators: Validators, at: Timestamp) -> Cache {
+    fn cache_holding(title: &str, validators: Validators) -> Cache {
         let cache = Cache::default();
         cache
             .record(
@@ -304,14 +386,50 @@ mod tests {
                     body: get_valid_rss_feed(title).into_bytes(),
                     validators,
                 },
-                at,
+                now(),
             )
             .unwrap();
         cache
     }
 
-    fn title(feed: &feed_rs::model::Feed) -> &str {
-        &feed.title.as_ref().expect("feed has a title").content
+    fn title(fetched: &super::Fetched) -> &str {
+        &fetched
+            .document
+            .title
+            .as_ref()
+            .expect("feed has a title")
+            .content
+    }
+
+    // Fetch with a cache that holds a feed titled "cached" with etag v1,
+    // against a server that gives `answer`.
+    async fn fetch_over_cached(answer: Answer) -> (Result<super::Fetched, OpenringError>, Cache) {
+        let cache = cache_holding("cached", validators(Some("\"v1\""), None));
+        let http = Http::create_null([(feed_url(), answer)]);
+        (fetch_feed(&feed_url(), &http, &cache, now()).await, cache)
+    }
+
+    // The cache serves its copy, says why, and keeps its Validators for the
+    // next run.
+    fn assert_served_stale(
+        result: &Result<super::Fetched, OpenringError>,
+        cache: &Cache,
+        cause: &str,
+    ) {
+        let fetched = result.as_ref().expect("served the cached feed");
+        assert_eq!(title(fetched), "cached");
+        assert_eq!(
+            fetched
+                .stale_because
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(cause)
+        );
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(Some("\"v1\""), None))
+        );
     }
 
     fn request(headers: &[(&'static str, &str)]) -> Request {
@@ -329,7 +447,6 @@ mod tests {
         let cache = cache_holding(
             "cached",
             validators(Some("\"abc123\""), Some("Mon, 01 Jan 2024 00:00:00 GMT")),
-            now(),
         );
         let http = Http::create_null([(feed_url(), Answer::status(304))]);
         let requests = http.track_requests();
@@ -349,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_304_rotates_the_validators_for_the_next_run() {
-        let cache = cache_holding("cached", validators(Some("\"old\""), None), now());
+        let cache = cache_holding("cached", validators(Some("\"old\""), None));
         // RFC 7232 allows a 304 to rotate the validators it confirms.
         let http = Http::create_null([(feed_url(), Answer::status(304).header("etag", "\"new\""))]);
 
@@ -365,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn a_304_after_an_expired_retry_window_does_not_reopen_it() {
         let t0 = now();
-        let cache = cache_holding("cached", validators(Some("\"v1\""), None), t0);
+        let cache = cache_holding("cached", validators(Some("\"v1\""), None));
         cache
             .record(
                 &feed_url(),
@@ -487,40 +604,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_request_is_an_error_and_leaves_the_cache_alone() {
-        let cache = cache_holding("cached", validators(Some("\"v1\""), None), now());
-        let http = Http::create_null([(feed_url(), Answer::send_error("connection refused"))]);
+    async fn a_failed_request_serves_the_cache() {
+        let (result, cache) = fetch_over_cached(Answer::send_error("connection refused")).await;
+        assert_served_stale(&result, &cache, "connection refused");
+    }
 
-        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
+    #[tokio::test]
+    async fn a_failed_request_with_nothing_cached_is_an_error() {
+        let http = Http::create_null([(feed_url(), Answer::send_error("connection refused"))]);
+        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
         assert!(
             matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection refused"),
             "{res:?}"
         );
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(Some("\"v1\""), None))
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_serves_the_cache() {
+        let (result, cache) = fetch_over_cached(
+            Answer::ok(get_valid_rss_feed("partial"))
+                .header("etag", "\"v2\"")
+                .transfer_error("connection reset"),
+        )
+        .await;
+        assert_served_stale(&result, &cache, "connection reset");
+    }
+
+    // A 200 that carries an HTML error page instead of a feed must not
+    // replace the good copy. If it did, its Validators would go out next
+    // run, the server would answer 304, and the error page would be served
+    // until it changed.
+    #[tokio::test]
+    async fn a_200_that_is_not_a_feed_serves_the_cache_and_keeps_it() {
+        let (result, cache) = fetch_over_cached(
+            Answer::ok("<html><body>Service Unavailable</body></html>").header("etag", "\"v2\""),
+        )
+        .await;
+        assert!(
+            matches!(
+                result.as_ref().map(|f| f.stale_because.as_ref()),
+                Ok(Some(OpenringError::ParseFeedError(_)))
+            ),
+            "{result:?}"
+        );
+        let cause = result.as_ref().unwrap().stale_because.as_ref().unwrap();
+        assert_served_stale(&result, &cache, &cause.to_string());
+    }
+
+    #[tokio::test]
+    async fn an_empty_200_serves_the_cache_and_keeps_it() {
+        let (result, cache) = fetch_over_cached(Answer::ok("").header("etag", "\"v2\"")).await;
+        assert_served_stale(
+            &result,
+            &cache,
+            "The feed at `https://feed.example/feed.xml` was empty.",
         );
     }
 
     #[tokio::test]
-    async fn a_body_that_stops_arriving_is_an_error_and_leaves_the_cache_alone() {
-        let cache = cache_holding("cached", validators(Some("\"v1\""), None), now());
-        let http = Http::create_null([(
-            feed_url(),
-            Answer::ok(get_valid_rss_feed("partial"))
-                .header("etag", "\"v2\"")
-                .transfer_error("connection reset"),
-        )]);
+    async fn an_oversized_answer_serves_the_cache() {
+        let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        let (result, cache) = fetch_over_cached(Answer::ok("big").content_length(announced)).await;
+        assert_served_stale(
+            &result,
+            &cache,
+            &format!(
+                "The feed at `https://feed.example/feed.xml` is too large ({announced} bytes)."
+            ),
+        );
+    }
+
+    // Any status that is not a feed, a 304, a 429, or a sign the feed is
+    // gone may pass by a later run, so the cached copy fills in.
+    #[hegel::test]
+    fn a_failing_status_serves_the_cache(tc: hegel::TestCase) {
+        let code = tc.draw(generators::integers::<u16>().min_value(300).max_value(599));
+        tc.assume(![304, 404, 410, 429].contains(&code));
+        let (result, cache) = block_on(fetch_over_cached(Answer::status(code)));
+        assert_served_stale(
+            &result,
+            &cache,
+            &format!(
+                "The request feed at `https://feed.example/feed.xml` received an unexpected error (HTTP {code})."
+            ),
+        );
+    }
+
+    // A 404 or 410 says the feed is gone. Only the user can fix that, so
+    // the cached copy must not hide it.
+    #[tokio::test]
+    async fn a_gone_feed_is_an_error_even_with_a_cached_copy() {
+        let huge = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        for code in [404, 410] {
+            // An announced body too large to read changes nothing: the
+            // status alone says the feed is gone.
+            for answer in [
+                Answer::status(code),
+                Answer::status(code).content_length(huge),
+            ] {
+                let (result, _) = fetch_over_cached(answer).await;
+                assert!(
+                    matches!(&result, Err(OpenringError::UnexpectedStatusError { status, .. }) if *status == code.to_string()),
+                    "{code}: {result:?}"
+                );
+            }
+        }
+    }
+
+    // A 429 that announces a huge body is still a rate limit: the cache
+    // serves its copy as current and remembers the Retry window.
+    #[tokio::test]
+    async fn a_429_announcing_a_huge_body_still_opens_a_retry_window() {
+        let huge = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        let (result, cache) = fetch_over_cached(
+            Answer::status(429)
+                .header("retry-after", "120")
+                .content_length(huge),
+        )
+        .await;
+        let fetched = result.expect("served the cache");
+        assert!(fetched.stale_because.is_none());
+        assert!(matches!(
+            cache.plan(&feed_url(), now() + 119.seconds()),
+            Plan::Serve(_)
+        ));
+    }
+
+    // When the cached copy itself does not parse, it cannot fill in, and
+    // the error reported is the server's, not the parser's.
+    #[tokio::test]
+    async fn an_unparseable_cached_copy_reports_the_original_failure() {
+        let cache = Cache::default();
+        cache
+            .record(
+                &feed_url(),
+                Outcome::Fresh {
+                    body: b"<html>not a feed</html>".to_vec(),
+                    validators: Validators::default(),
+                },
+                now(),
+            )
+            .unwrap();
+        let http = Http::create_null([(feed_url(), Answer::status(503))]);
 
         let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(
-            matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection reset"),
+            matches!(&res, Err(OpenringError::UnexpectedStatusError { status, .. }) if status == "503"),
             "{res:?}"
         );
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(Some("\"v1\""), None))
-        );
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[tokio::test]
@@ -533,10 +771,9 @@ mod tests {
         let first = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
 
-        // The cached entry must not pretend to have something to serve. If it
-        // did, the next fetch would send If-None-Match, the server would say
-        // 304, and the run would serve the empty body until the entry aged
-        // out of the cache.
+        // The empty body must not be cached. If it were, the next fetch
+        // would send If-None-Match, the server would say 304, and the run
+        // would serve the empty body until the entry aged out of the cache.
         let second = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
         assert_eq!(
@@ -548,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_429_serves_the_cache_until_its_retry_after_passes() {
-        let cache = cache_holding("rate-limited", Validators::default(), now());
+        let cache = cache_holding("rate-limited", Validators::default());
         let http =
             Http::create_null([(feed_url(), Answer::status(429).header("retry-after", "120"))]);
 
@@ -572,7 +809,7 @@ mod tests {
         let until = now() + 600.seconds();
         let header =
             jiff::fmt::rfc2822::to_string(&until.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
-        let cache = cache_holding("rate-limited", Validators::default(), now());
+        let cache = cache_holding("rate-limited", Validators::default());
         let http = Http::create_null([(
             feed_url(),
             Answer::status(429).header("retry-after", &header),
@@ -590,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_retry_window_serves_the_cache_without_a_request() {
-        let cache = cache_holding("cached", Validators::default(), now());
+        let cache = cache_holding("cached", Validators::default());
         cache
             .record(
                 &feed_url(),
