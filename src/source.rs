@@ -6,7 +6,7 @@
 use feed_rs::model::{Entry, Feed as Document, Link};
 use jiff::Timestamp;
 use tracing::{debug, info, warn};
-use url::Url;
+use url::{Position, Url};
 
 use crate::{Article, feed_list::Feed};
 
@@ -51,12 +51,54 @@ pub(crate) fn article_order(a: &Article, b: &Article) -> std::cmp::Ordering {
         .then_with(|| a.link.cmp(&b.link))
 }
 
-/// The href of the first link explicitly tagged `rel="alternate"`, if any.
-fn find_alternate_link(links: &[Link]) -> Option<&str> {
-    links
-        .iter()
-        .find(|l| l.rel.as_deref() == Some("alternate"))
+/// The content links among `links`: the explicit `alternate` ones first,
+/// then the ones with no `rel`, each group in document order. Atom treats a
+/// missing `rel` as `alternate`, and RSS writes none, so both name the
+/// content itself. Comment links carry a target, and edit, enclosure, hub,
+/// paging, and `self` links carry another `rel`; they all point somewhere
+/// else.
+fn content_hrefs(links: &[Link]) -> impl Iterator<Item = &str> {
+    let alternate = links.iter().filter(|l| {
+        l.rel
+            .as_deref()
+            .is_some_and(|rel| rel.eq_ignore_ascii_case("alternate"))
+    });
+    let bare = links.iter().filter(|l| l.rel.is_none());
+    alternate
+        .chain(bare)
+        .filter(|l| l.target.is_none())
         .map(|l| l.href.as_str())
+}
+
+/// `href` resolved against the feed URL, if it names a web page other than
+/// the feed itself.
+///
+/// Only http and https pass. A feed controls these links, and templates
+/// embed them through `| safe`, so a `javascript:` or `data:` link would
+/// run script in the reader's page. An empty href or a bare fragment
+/// resolves to the feed itself, which is never the page a reader wants.
+fn usable_link(href: &str, feed_url: &Url) -> Option<Url> {
+    let url = feed_url.join(href.trim()).ok()?;
+    let is_web = matches!(url.scheme(), "http" | "https");
+    let is_feed = url[..Position::AfterQuery] == feed_url[..Position::AfterQuery];
+    if !is_web || is_feed {
+        return None;
+    }
+    attribute_safe(&url)
+}
+
+/// `url` with nothing that could end a quoted attribute, or `None` when
+/// that cannot be done.
+///
+/// The url crate escapes `"`, `<`, `>`, and spaces in a path, query, or
+/// fragment, and `'` in an http or https query, but keeps `'` in a path or
+/// fragment, which would end a single-quoted `href='…'`.
+/// `%27` names the same resource. A host may still hold a quote of either
+/// kind: the url crate accepts one there, and decodes `%27` back to `'`.
+/// No real host does.
+fn attribute_safe(url: &Url) -> Option<Url> {
+    let url = Url::parse(&url.as_str().replace('\'', "%27")).ok()?;
+    (!url.as_str().contains(['\'', '"'])).then_some(url)
 }
 
 /// The display title for a feed: its declared title, or the fetch URL's host
@@ -75,24 +117,16 @@ fn resolve_source_title(document: &Document, feed_url: &Url) -> String {
 
 /// The canonical homepage link for a feed.
 ///
-/// Prefers the title's `src`, then an `alternate` link, then any link that is
-/// not the feed's own `self` link, and finally falls back to the feed URL.
-/// An href that does not resolve against the feed URL is skipped, and the
-/// next link in that order applies.
+/// Prefers the title's `src`, then the feed's content links (see
+/// [`content_hrefs`]), and finally falls back to the feed URL. A link that
+/// is not usable (see [`usable_link`]) is skipped, and the next one in that
+/// order applies.
 fn resolve_source_link(document: &Document, feed_url: &Url) -> Url {
     let src = document.title.as_ref().and_then(|t| t.src.as_deref());
-    let alternate = find_alternate_link(&document.links);
-    // Ignore "self" rels, which usually link back to the feed itself.
-    let others = document
-        .links
-        .iter()
-        .filter(|l| l.rel.as_deref() != Some("self"))
-        .map(|l| l.href.as_str());
     if let Some(url) = src
         .into_iter()
-        .chain(alternate)
-        .chain(others)
-        .find_map(|href| feed_url.join(href).ok())
+        .chain(content_hrefs(&document.links))
+        .find_map(|href| usable_link(href, feed_url))
     {
         return url;
     }
@@ -100,25 +134,18 @@ fn resolve_source_link(document: &Document, feed_url: &Url) -> Url {
         source = feed_url.as_str(),
         "feed is missing root link: falling back to rss feed url."
     );
-    feed_url.clone()
+    // The user configured this URL, so it is trusted, but it reaches
+    // templates the same way as a feed's own links.
+    attribute_safe(feed_url).unwrap_or_else(|| feed_url.clone())
 }
 
-/// The best link for an entry, resolved against the feed URL.
-///
-/// Prefers an `alternate` link, falling back to the first link present.
-/// Comment links are never chosen: they point at discussion of the post, not
-/// the post itself. `None` when the entry has no other links or the href
-/// cannot be parsed; the caller skips such entries like any other incomplete
-/// entry.
+/// The best link for an entry, resolved against the feed URL: its first
+/// usable content link (see [`content_hrefs`] and [`usable_link`]).
+/// Comment links are never chosen: they point at discussion of the post,
+/// not the post itself. `None` when no link is usable; the caller skips
+/// such entries like any other incomplete entry.
 fn resolve_entry_link(entry: &Entry, feed_url: &Url) -> Option<Url> {
-    let href = find_alternate_link(&entry.links).or_else(|| {
-        entry
-            .links
-            .iter()
-            .find(|link| link.target.is_none())
-            .map(|link| link.href.as_str())
-    })?;
-    feed_url.join(href).ok()
+    content_hrefs(&entry.links).find_map(|href| usable_link(href, feed_url))
 }
 
 /// The entry's summary text, preferring an explicit `<summary>` and falling back
@@ -143,12 +170,16 @@ fn sanitize_html(raw: &str) -> String {
 
 /// Reduce feed-supplied text like titles to plain text: entities decoded,
 /// every tag stripped, script/style bodies dropped, and the remaining text
-/// kept entity-escaped so it is safe to embed in HTML.
+/// kept entity-escaped so it is safe to embed in HTML, quoted attributes
+/// included.
 fn sanitize_text(raw: &str) -> String {
     let decoded = html_escape::decode_html_entities(raw);
     let mut builder = ammonia::Builder::empty();
     builder.clean_content_tags(["script", "style"].into_iter().collect());
-    builder.clean(&decoded).to_string().trim().to_string()
+    let text = builder.clean(&decoded).to_string();
+    // Ammonia escapes `&`, `<`, and `>`, but not quotes, which would end a
+    // quoted attribute such as `title="{{ article.title | safe }}"`.
+    text.trim().replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 /// Build a renderable [`Article`] from a feed entry. `source_title` must
@@ -213,8 +244,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        Source, article_order, build_article, find_alternate_link, project, raw_summary,
-        resolve_entry_link, resolve_source_link, resolve_source_title, sanitize_html,
+        Source, article_order, build_article, project, raw_summary, resolve_entry_link,
+        resolve_source_link, resolve_source_title, sanitize_html,
     };
     use crate::{feed_list::Feed, test_logs::warnings_logged};
 
@@ -276,17 +307,177 @@ mod tests {
         }
     }
 
+    fn entry_with(links: Vec<Link>) -> Entry {
+        Entry {
+            links,
+            ..Entry::default()
+        }
+    }
+
+    // Whatever links an entry carries, its Article link is a web page that
+    // is not the feed itself, and holds nothing that could end a quoted
+    // attribute. A feed controls these links and the bundled template
+    // embeds them through `| safe`, so any other scheme or a stray quote
+    // could run script in the reader's page.
+    #[hegel::test]
+    fn entry_links_are_only_web_pages_other_than_the_feed(tc: hegel::TestCase) {
+        let href = || {
+            hegel::one_of!(
+                generators::sampled_from(
+                    [
+                        "https://example.com/post",
+                        "http://example.com/post",
+                        "/post",
+                        "post#frag",
+                        "",
+                        "#top",
+                        "feed.xml",
+                        "https://example.com/feed.xml#x",
+                        "javascript:alert(1)",
+                        "JavaScript:alert(1)",
+                        "javascript:\"><img src=x onerror=alert(1)>",
+                        "data:text/html,<script>alert(1)</script>",
+                        "mailto:me@example.com",
+                        "ftp://example.com/post",
+                        "http://[",
+                        "/x'/onmouseover='alert(1)",
+                        "/a#f'g",
+                        "/p?q=a'b",
+                        "//a\"b.example/post",
+                        "https://a'b.example/post",
+                        "https://a\"onmouseover=\"alert(1)\".example/",
+                    ]
+                    .map(str::to_owned)
+                    .to_vec()
+                ),
+                generators::text().max_size(24)
+            )
+        };
+        let rel = || {
+            generators::sampled_from(vec![
+                None,
+                Some("alternate"),
+                Some("Alternate"),
+                Some("replies"),
+                Some("edit"),
+                Some("self"),
+                Some("hub"),
+            ])
+        };
+        let n = tc.draw(generators::integers::<usize>().max_value(4));
+        let links = (0..n)
+            .map(|_| link(&tc.draw(href()), tc.draw(rel())))
+            .collect();
+
+        if let Some(url) = resolve_entry_link(&entry_with(links), &feed_url()) {
+            assert!(matches!(url.scheme(), "http" | "https"), "{url}");
+            let mut bare = url.clone();
+            bare.set_fragment(None);
+            assert_ne!(bare, feed_url(), "{url}");
+            assert!(
+                !url.as_str().contains(
+                    |c: char| matches!(c, '"' | '\'' | '<' | '>') || c.is_ascii_whitespace()
+                ),
+                "{url}"
+            );
+        }
+    }
+
     #[test]
-    fn find_alternate_link_picks_the_alternate_rel() {
-        let links = vec![
-            link("https://example.com/feed.xml", Some("self")),
-            link("https://example.com/home", Some("alternate")),
+    fn a_script_link_never_becomes_the_article_link() {
+        // The only link runs script, so the entry has no usable link.
+        let only_script = entry_with(vec![link(
+            "javascript:\"><img src=x onerror=alert(1)>",
+            Some("alternate"),
+        )]);
+        assert_eq!(resolve_entry_link(&only_script, &feed_url()), None);
+
+        // A safe link after it wins instead.
+        let with_page = entry_with(vec![
+            link("javascript:alert(1)", Some("alternate")),
+            link("https://example.com/post", None),
+        ]);
+        assert_eq!(
+            resolve_entry_link(&with_page, &feed_url())
+                .unwrap()
+                .as_str(),
+            "https://example.com/post"
+        );
+    }
+
+    #[test]
+    fn an_entry_link_back_to_the_feed_is_not_a_link_to_the_post() {
+        let entry = entry_with(vec![
+            link("", Some("alternate")),
+            link("#comments", None),
+            link("https://example.com/post", None),
+        ]);
+        assert_eq!(
+            resolve_entry_link(&entry, &feed_url()).unwrap().as_str(),
+            "https://example.com/post"
+        );
+    }
+
+    // A feed URL may hold an apostrophe. Links that resolve back to it are
+    // still the feed, not the post.
+    #[test]
+    fn a_link_back_to_a_feed_url_with_an_apostrophe_is_still_the_feed() {
+        let feed = Url::parse("https://example.com/it's/feed.xml").unwrap();
+        let entry = entry_with(vec![
+            link("", Some("alternate")),
+            link("#top", None),
+            link("feed.xml", None),
+            link("post", None),
+        ]);
+        assert_eq!(
+            resolve_entry_link(&entry, &feed).unwrap().as_str(),
+            "https://example.com/it%27s/post"
+        );
+
+        // With no usable homepage link, the fallback to the feed URL is
+        // escaped the same way.
+        let mut document = parse_feed(&atom(""));
+        document.links.clear();
+        assert_eq!(
+            resolve_source_link(&document, &feed).as_str(),
+            "https://example.com/it%27s/feed.xml"
+        );
+    }
+
+    #[test]
+    fn a_bad_alternate_falls_back_to_the_next_content_link() {
+        let entry = entry_with(vec![
+            link("http://[", Some("alternate")),
+            link("https://example.com/post", None),
+        ]);
+        assert_eq!(
+            resolve_entry_link(&entry, &feed_url()).unwrap().as_str(),
+            "https://example.com/post"
+        );
+    }
+
+    #[test]
+    fn atom_comment_edit_and_enclosure_links_are_never_the_post() {
+        let entry = entry_with(vec![
+            link("https://example.com/post/comments", Some("replies")),
+            link("https://example.com/post/edit", Some("edit")),
+            link("https://example.com/post.mp3", Some("enclosure")),
+        ]);
+        assert_eq!(resolve_entry_link(&entry, &feed_url()), None);
+    }
+
+    #[test]
+    fn the_homepage_is_never_a_hub_or_paging_link() {
+        let mut document = parse_feed(&atom(""));
+        document.links = vec![
+            link("https://hub.example/", Some("hub")),
+            link("https://example.com/feed.xml?page=2", Some("next")),
+            link("https://example.com/", None),
         ];
         assert_eq!(
-            find_alternate_link(&links),
-            Some("https://example.com/home")
+            resolve_source_link(&document, &feed_url()).as_str(),
+            "https://example.com/"
         );
-        assert_eq!(find_alternate_link(&links[..1]), None);
     }
 
     #[test]
@@ -337,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn project_source_link_prefers_alternate_then_other_then_feed_url() {
+    fn project_source_link_prefers_alternate_then_plain_then_feed_url() {
         // An explicit alternate link wins over a self link.
         let alt = parse_feed(
             r#"<?xml version="1.0"?>
@@ -353,8 +544,26 @@ mod tests {
             "https://example.com/home"
         );
 
-        // With no alternate, any link that is not the feed's own `self` is used.
-        let other = parse_feed(
+        // An RSS channel's plain <link> has no rel, and it is the homepage
+        // even when a self link comes first.
+        let plain = parse_feed(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+                <channel>
+                    <title>t</title>
+                    <atom:link rel="self" href="https://example.com/feed.xml"/>
+                    <link>https://example.com/plain</link>
+                    <description>d</description>
+                </channel>
+            </rss>"#,
+        );
+        assert_eq!(
+            resolve_source_link(&plain, &feed_url()).as_str(),
+            "https://example.com/plain"
+        );
+
+        // A related link points somewhere else, so the feed URL stands in.
+        let related = parse_feed(
             r#"<?xml version="1.0"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
                 <title>t</title>
@@ -363,10 +572,7 @@ mod tests {
                 <updated>2020-01-01T00:00:00Z</updated>
             </feed>"#,
         );
-        assert_eq!(
-            resolve_source_link(&other, &feed_url()).as_str(),
-            "https://example.com/related"
-        );
+        assert_eq!(resolve_source_link(&related, &feed_url()), feed_url());
     }
 
     #[test]
@@ -410,11 +616,12 @@ mod tests {
     // the last resort.
     #[hegel::test]
     fn project_source_link_skips_unparseable_hrefs(tc: hegel::TestCase) {
-        // Each href is either valid or one that `Url::join` rejects.
+        // Each href is valid, unparseable, or not a web page.
         let pick = |good: &'static str| {
             hegel::one_of!(
                 generators::just(Some(good)),
                 generators::just(Some("http://[")),
+                generators::just(Some("javascript:alert(1)")),
                 generators::just(None::<&'static str>),
             )
         };
@@ -431,9 +638,9 @@ mod tests {
             document.links.push(link(href, Some("alternate")));
         }
         if let Some(href) = other {
-            document.links.push(link(href, Some("related")));
+            document.links.push(link(href, None));
         }
-        let good = |href: Option<&'static str>| href.filter(|h| !h.contains('['));
+        let good = |href: Option<&'static str>| href.filter(|h| h.starts_with("https://"));
         let expected = good(src)
             .or(good(alternate))
             .or(good(other))
@@ -573,6 +780,25 @@ mod tests {
             !out.to_lowercase().contains("<script"),
             "live script tag in sanitized output: {out:?}"
         );
+    }
+
+    // Sanitized text holds no character that could open a tag or end a
+    // quoted attribute, so it is safe anywhere a template puts it.
+    #[hegel::test]
+    fn sanitize_text_never_emits_markup_or_quotes(tc: hegel::TestCase) {
+        let payload = tc.draw(hegel::one_of!(
+            generators::just("\"><img src=x onerror=alert(1)>".to_string()),
+            generators::just("' onmouseover='alert(1)".to_string()),
+            generators::just("&quot; onclick=&quot;alert(1)".to_string()),
+            generators::just("&lt;script&gt;alert(1)&lt;/script&gt;".to_string()),
+            generators::text(),
+        ));
+        let prefix = tc.draw(generators::text().max_size(16));
+        let suffix = tc.draw(generators::text().max_size(16));
+        let out = super::sanitize_text(&format!("{prefix}{payload}{suffix}"));
+        for c in ['<', '>', '"', '\''] {
+            assert!(!out.contains(c), "{c:?} in sanitized text: {out:?}");
+        }
     }
 
     #[test]

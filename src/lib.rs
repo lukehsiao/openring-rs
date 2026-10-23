@@ -607,6 +607,46 @@ mod tests {
         );
     }
 
+    // A hostile feed cannot get script into the page the bundled template
+    // renders, through links, titles, or summaries.
+    #[tokio::test]
+    async fn a_hostile_feed_cannot_inject_script_through_the_bundled_template() {
+        use crate::http::Answer;
+
+        let feed = r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title>Evil &lt;script&gt;alert(1)&lt;/script&gt;</title>
+                <link rel="alternate" href='javascript:"><img src=x onerror=alert(1)>'/>
+                <updated>2020-01-01T00:00:00Z</updated>
+                <entry>
+                    <title>Bad link</title>
+                    <link href='javascript:"><img src=x onerror=alert(1)>'/>
+                    <published>2020-01-02T00:00:00Z</published>
+                    <summary>s</summary>
+                </entry>
+                <entry>
+                    <title>&lt;img src=x onerror=alert(2)&gt;Good</title>
+                    <link href="https://feed.example/good"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                    <summary>&lt;script&gt;alert(3)&lt;/script&gt;fine</summary>
+                </entry>
+            </feed>"#;
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some(include_str!("../in.html")),
+            None,
+            vec![("https://feed.example/feed.xml", Answer::ok(feed))],
+        )
+        .await;
+
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let page = outcome.rendered.to_ascii_lowercase();
+        for live in ["javascript:", "<script", "<img", "onerror"] {
+            assert!(!page.contains(live), "{live} reached the page:\n{page}");
+        }
+        assert!(page.contains("https://feed.example/good"), "{page}");
+    }
+
     // The example template exercises every filter the docs promise (the
     // tera-contrib `date` and `striptags` we register plus tera's own
     // built-ins), so it parsing and rendering is what pins template
