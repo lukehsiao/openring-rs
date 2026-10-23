@@ -13,7 +13,7 @@ pub enum OpenringError {
     #[error("Failed to parse civil date.")]
     CivilDateError(#[from] jiff::Error),
     #[error(transparent)]
-    ReqwestError(#[from] reqwest::Error),
+    HttpError(#[from] crate::http::TransportError),
     #[error(transparent)]
     #[diagnostic(code(openring::cache_error))]
     SerdeJsonError(#[from] serde_json::Error),

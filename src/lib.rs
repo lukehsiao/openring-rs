@@ -2,6 +2,8 @@ pub mod args;
 mod cache;
 pub mod error;
 mod feedfetcher;
+mod http;
+mod nullable;
 pub mod progress;
 mod summarize;
 
@@ -20,7 +22,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use miette::NamedSource;
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use reqwest::Client;
 use serde::Serialize;
 use tera::Tera;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -33,6 +34,7 @@ use crate::{
     cache::{Cache, CachePath},
     error::{FeedUrlError, FeedWeightError, OpenringError, Result},
     feedfetcher::fetch_feed,
+    http::Http,
 };
 
 #[derive(Serialize, Debug)]
@@ -309,14 +311,10 @@ fn show_pending(pb: &ProgressBar, pending: &HashSet<&Url>) {
     );
 }
 
-// Get all feeds from URLs concurrently, sharing one `client`.
+// Get all feeds from URLs concurrently, sharing one `http` client.
 //
 // Skips feeds if there are errors, and shows progress as fetches finish.
-async fn get_feeds_from_urls(
-    client: &Client,
-    urls: &[Url],
-    cache: &Arc<Cache>,
-) -> Vec<(Feed, Url)> {
+async fn get_feeds_from_urls(http: &Http, urls: &[Url], cache: &Arc<Cache>) -> Vec<(Feed, Url)> {
     // Registered with the shared progress area so tracing output suspends
     // the bar instead of splicing into it.
     let pb = progress::add(
@@ -336,8 +334,8 @@ async fn get_feeds_from_urls(
 
     for url in urls {
         let cache_clone = Arc::clone(cache);
-        // reqwest::Client is a cheap handle to the shared pool.
-        let client_clone = client.clone();
+        // Http is a cheap handle to the shared pool.
+        let http = http.clone();
         let semaphore_clone = Arc::clone(&semaphore);
         let url_clone = url.clone();
         join_set.spawn(async move {
@@ -347,7 +345,7 @@ async fn get_feeds_from_urls(
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
-            let fetch_result = fetch_feed(&url_clone, &client_clone, &cache_clone).await;
+            let fetch_result = fetch_feed(&url_clone, &http, &cache_clone).await;
             (url_clone, fetch_result)
         });
     }
@@ -399,7 +397,7 @@ async fn get_feeds_from_urls(
 /// fetch, and mutates `articles` in place. An article whose page yields
 /// nothing keeps its empty summary, exactly as if the feed had one that was
 /// blank, so nothing here can fail the run.
-async fn fill_missing_summaries(client: &Client, articles: &mut [Article]) {
+async fn fill_missing_summaries(http: &Http, articles: &mut [Article]) {
     // Owned links so the pending set below borrows from `missing`, leaving
     // `articles` free to take the derived summaries by index afterward.
     let missing: Vec<(usize, Url)> = articles
@@ -426,7 +424,7 @@ async fn fill_missing_summaries(client: &Client, articles: &mut [Article]) {
 
     let mut join_set = JoinSet::new();
     for (idx, url) in &missing {
-        let client_clone = client.clone();
+        let http = http.clone();
         let semaphore_clone = Arc::clone(&semaphore);
         let idx = *idx;
         let url = url.clone();
@@ -435,7 +433,7 @@ async fn fill_missing_summaries(client: &Client, articles: &mut [Article]) {
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
-            let summary = summarize::fetch_summary(&client_clone, &url).await;
+            let summary = summarize::fetch_summary(&http, &url).await;
             (idx, url, summary)
         });
     }
@@ -488,9 +486,9 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
 
     // One client for the whole run, so every fetch shares a connection pool
     // instead of paying for TLS setup per request, feeds and summary pages alike.
-    let client = feedfetcher::build_client()?;
+    let http = Http::create()?;
 
-    let feeds = get_feeds_from_urls(&client, &feed_set.urls, &cache).await;
+    let feeds = get_feeds_from_urls(&http, &feed_set.urls, &cache).await;
 
     cache::store_cache(&cache, args.no_cache, CachePath::Default);
 
@@ -513,7 +511,7 @@ pub async fn run(args: Args, out: impl Write) -> Result<()> {
     // Feeds that ship no summary get one derived from the article page
     // itself. Deferred until here so only the articles that will render
     // trigger a page fetch.
-    fill_missing_summaries(&client, &mut articles).await;
+    fill_missing_summaries(&http, &mut articles).await;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
