@@ -20,12 +20,6 @@ pub enum OpenringError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     FeedWeightError(#[from] FeedWeightError),
-    #[error("The feed `{url}` is listed with conflicting weights ({a} and {b}).")]
-    #[diagnostic(
-        code(openring::conflicting_weight_error),
-        help("each feed takes a single weight; keep one of the two")
-    )]
-    ConflictingWeightError { url: String, a: usize, b: usize },
     #[error("The feed at `{0}` was empty.")]
     #[diagnostic(code(openring::empty_feed_error))]
     EmptyFeedError(String),

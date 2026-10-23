@@ -2,6 +2,7 @@ pub mod args;
 mod cache;
 mod clock;
 pub mod error;
+mod feed_list;
 mod feedfetcher;
 mod fs;
 mod http;
@@ -15,14 +16,12 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
     num::NonZeroUsize,
-    ops::Range,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
 use feed_rs::model::{Entry, Feed, Link};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
-use miette::NamedSource;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use tera::Tera;
@@ -34,7 +33,8 @@ use crate::{
     args::Args,
     cache::Cache,
     clock::Clock,
-    error::{FeedUrlError, FeedWeightError, OpenringError, Result},
+    error::Result,
+    feed_list::UrlsFile,
     feedfetcher::fetch_feed,
     fs::Fs,
     http::Http,
@@ -49,253 +49,6 @@ pub(crate) struct Article {
     source_link: Url,
     source_title: String,
     timestamp: Timestamp,
-}
-
-/// Whitespace-separated tokens of `line`, each with the byte offset it
-/// starts at, so diagnostics can point at the exact offending token.
-fn tokens_with_offsets(line: &str) -> Vec<(usize, &str)> {
-    let mut tokens = Vec::new();
-    let mut start = None;
-    for (i, c) in line.char_indices() {
-        match (start, c.is_whitespace()) {
-            (None, false) => start = Some(i),
-            (Some(s), true) => {
-                tokens.push((s, &line[s..i]));
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(s) = start {
-        tokens.push((s, &line[s..]));
-    }
-    tokens
-}
-
-/// Why a feed line failed to parse, with the byte range of the offending
-/// part so file diagnostics can label it precisely.
-struct LineIssue {
-    span: Range<usize>,
-    kind: LineIssueKind,
-    help: String,
-}
-
-enum LineIssueKind {
-    Url,
-    Weight,
-}
-
-/// A parsed weight together with the byte range of its token, which the file
-/// parser needs to label duplicate-weight conflicts discovered only after
-/// the line itself parsed.
-type SpannedWeight = (NonZeroUsize, Range<usize>);
-
-/// Parse one `URL [WEIGHT]` feed line.
-///
-/// Tokenization happens before URL parsing on purpose: `Url::parse`
-/// percent-encodes interior spaces, so handing it the whole line would
-/// silently swallow the weight as part of the URL path.
-fn parse_feed_line(line: &str) -> std::result::Result<(Url, Option<SpannedWeight>), LineIssue> {
-    let tokens = tokens_with_offsets(line);
-    let trimmed_end = tokens.last().map_or(0, |&(off, tok)| off + tok.len());
-    let Some(&(first_start, url_token)) = tokens.first() else {
-        return Err(LineIssue {
-            span: 0..line.len(),
-            kind: LineIssueKind::Url,
-            help: "expected a feed URL".to_string(),
-        });
-    };
-
-    let url = Url::parse(url_token).map_err(|e| LineIssue {
-        // The whole line is suspect when its first token is not a URL.
-        span: first_start..trimmed_end,
-        kind: LineIssueKind::Url,
-        help: e.to_string(),
-    })?;
-
-    let weight = match tokens.len() {
-        1 => None,
-        2 => {
-            let (w_start, w_token) = tokens[1];
-            let span = w_start..w_start + w_token.len();
-            let weight = w_token.parse::<NonZeroUsize>().map_err(|e| LineIssue {
-                span: span.clone(),
-                kind: LineIssueKind::Weight,
-                help: format!(
-                    "the weight after a URL must be a positive integer ({e}); omit it for the default unweighted behavior"
-                ),
-            })?;
-            Some((weight, span))
-        }
-        _ => {
-            let (extra_start, _) = tokens[1];
-            return Err(LineIssue {
-                span: extra_start..trimmed_end,
-                kind: LineIssueKind::Weight,
-                help: "expected `URL [WEIGHT]`: at most one integer weight may follow the URL"
-                    .to_string(),
-            });
-        }
-    };
-
-    Ok((url, weight))
-}
-
-/// Wrap a [`LineIssue`] into the matching diagnostic, with `src` as the
-/// source text and the issue's span shifted by `base` into that text.
-fn diagnostic_for(issue: LineIssue, src: NamedSource<String>, base: usize) -> OpenringError {
-    let span = (base + issue.span.start..base + issue.span.end).into();
-    match issue.kind {
-        LineIssueKind::Url => FeedUrlError {
-            src,
-            span,
-            help: issue.help,
-        }
-        .into(),
-        LineIssueKind::Weight => FeedWeightError {
-            src,
-            span,
-            help: issue.help,
-        }
-        .into(),
-    }
-}
-
-/// Parse one `-s/--url` argument in the same `URL [WEIGHT]` grammar as
-/// urls-file lines, with the argument text as the diagnostic source so
-/// errors point at the offending token.
-fn parse_cli_url(raw: &str) -> Result<(Url, Option<NonZeroUsize>)> {
-    parse_feed_line(raw)
-        .map(|(url, weight)| (url, weight.map(|(w, _)| w)))
-        .map_err(|issue| diagnostic_for(issue, NamedSource::new("-s/--url", raw.to_owned()), 0))
-}
-
-/// Merge a newly seen weight for a feed into the weight already on record.
-///
-/// Absence means "no opinion", so an explicit weight wins over none and
-/// repeating the same weight is fine. Two different explicit weights are a
-/// contradiction only the user can resolve; the pair comes back as the error.
-fn merge_weight(
-    existing: &mut Option<NonZeroUsize>,
-    incoming: Option<NonZeroUsize>,
-) -> std::result::Result<(), (NonZeroUsize, NonZeroUsize)> {
-    match (*existing, incoming) {
-        (Some(a), Some(b)) if a != b => Err((a, b)),
-        (None, Some(b)) => {
-            *existing = Some(b);
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Record one configured feed, merging duplicates per [`merge_weight`].
-fn record_feed(
-    feeds: &mut HashMap<Url, Option<NonZeroUsize>>,
-    url: Url,
-    weight: Option<NonZeroUsize>,
-) -> Result<()> {
-    if let Some(existing) = feeds.get_mut(&url) {
-        merge_weight(existing, weight).map_err(|(a, b)| OpenringError::ConflictingWeightError {
-            url: String::from(url),
-            a: a.get(),
-            b: b.get(),
-        })?;
-    } else {
-        feeds.insert(url, weight);
-    }
-    Ok(())
-}
-
-/// Every configured feed, with `-s` values and the urls file merged into one
-/// weight per URL. This is the typed boundary between raw command-line input
-/// and the rest of the program.
-#[derive(Debug)]
-struct FeedSet {
-    /// Every feed to fetch, weighted or not.
-    urls: Vec<Url>,
-    /// Only the explicitly weighted feeds appear here.
-    weights: HashMap<Url, NonZeroUsize>,
-}
-
-impl FeedSet {
-    /// Parse and merge the configured feeds from `-s` values and the urls
-    /// file, given as its path and text, rejecting contradictory weights for
-    /// the same URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no feeds are configured at all, a `-s` value or
-    /// file line fails to parse, or one feed is given two different weights.
-    fn resolve(cli_urls: &[String], url_file: Option<(&Path, &str)>) -> Result<Self> {
-        let mut configured: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
-        for raw in cli_urls {
-            let (url, weight) = parse_cli_url(raw)?;
-            record_feed(&mut configured, url, weight)?;
-        }
-        if let Some((path, text)) = url_file {
-            for (url, weight) in parse_urls_from_file(path, text)? {
-                record_feed(&mut configured, url, weight)?;
-            }
-        }
-        if configured.is_empty() {
-            return Err(OpenringError::FeedMissing);
-        }
-
-        let urls = configured.keys().cloned().collect();
-        let weights = configured
-            .into_iter()
-            .filter_map(|(url, weight)| weight.map(|w| (url, w)))
-            .collect();
-        Ok(FeedSet { urls, weights })
-    }
-}
-
-/// Parse the urls file, read from `path`, into feed URLs, each with its
-/// optional weight.
-///
-/// Each line is `URL [WEIGHT]`. Blank lines and lines starting with `#` or
-/// `//` are ignored, and duplicate URLs merge per [`merge_weight`]. The first
-/// invalid line fails the parse with a diagnostic spanning the offending
-/// tokens.
-fn parse_urls_from_file(path: &Path, file_src: &str) -> Result<HashMap<Url, Option<NonZeroUsize>>> {
-    let mut feeds: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
-    let mut offset = 0;
-    for raw_line in file_src.split_inclusive('\n') {
-        let line = raw_line.trim();
-        if !(line.is_empty() || line.starts_with('#') || line.starts_with("//")) {
-            let (url, weight) = parse_feed_line(raw_line).map_err(|issue| {
-                diagnostic_for(
-                    issue,
-                    NamedSource::new(path.to_string_lossy(), file_src.to_string()),
-                    offset,
-                )
-            })?;
-            match weight {
-                Some((w, w_span)) => {
-                    if let Err((existing, _)) =
-                        merge_weight(feeds.entry(url).or_insert(None), Some(w))
-                    {
-                        return Err(FeedWeightError {
-                            src: NamedSource::new(path.to_string_lossy(), file_src.to_string()),
-                            span: (offset + w_span.start..offset + w_span.end).into(),
-                            help: format!(
-                                "this feed is already listed with weight {existing}; each feed takes a single weight"
-                            ),
-                        }
-                        .into());
-                    }
-                }
-                // The URL is recorded either way; a bare line has no opinion
-                // about an existing weight.
-                None => {
-                    feeds.entry(url).or_insert(None);
-                }
-            }
-        }
-        offset += raw_line.len();
-    }
-    Ok(feeds)
 }
 
 /// Cap on in-flight fetches so a long urls file cannot exhaust the process's
@@ -512,18 +265,26 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         Cache::load(&deps.fs, path, args.max_cache_age, now)
     });
 
-    // Merge -s urls and the urls file into one weight-per-feed view, so
-    // duplicate listings collapse and contradictory weights fail fast.
-    let url_file = match &args.url_file {
-        Some(path) => Some((path.as_path(), deps.fs.read_to_string(path)?)),
+    // The Feed list from -s values and the urls file. Repeated listings
+    // collapse and contradictory weights fail fast, before any fetch.
+    let urls_text = match &args.url_file {
+        Some(path) => Some(deps.fs.read_to_string(path)?),
         None => None,
     };
-    let feed_set = FeedSet::resolve(
+    let feed_list = feed_list::parse(
         &args.url,
-        url_file.as_ref().map(|(path, text)| (*path, text.as_str())),
+        args.url_file
+            .as_deref()
+            .zip(urls_text.as_deref())
+            .map(|(path, text)| UrlsFile { path, text }),
     )?;
+    let urls: Vec<Url> = feed_list.iter().map(|f| f.url.clone()).collect();
+    let weights: HashMap<Url, NonZeroUsize> = feed_list
+        .into_iter()
+        .filter_map(|f| Some((f.url, f.weight?)))
+        .collect();
 
-    let feeds = get_feeds_from_urls(&deps.http, terminal, &feed_set.urls, &cache, now).await;
+    let feeds = get_feeds_from_urls(&deps.http, terminal, &urls, &cache, now).await;
 
     if let Some(path) = cache_path {
         cache.save(&deps.fs, path);
@@ -541,7 +302,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         args.per_source,
         args.num_articles,
         args.before,
-        &feed_set.weights,
+        &weights,
         &mut rng,
     )?;
 
@@ -874,9 +635,9 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::{
-        Article, FeedSet, build_article, draw_weighted_slots, find_alternate_link, merge_weight,
-        parse_cli_url, parse_urls_from_file, raw_summary, record_feed, resolve_entry_link,
-        resolve_source_link, resolve_source_title, sanitize_html, select_articles, write_output,
+        Article, build_article, draw_weighted_slots, find_alternate_link, raw_summary,
+        resolve_entry_link, resolve_source_link, resolve_source_title, sanitize_html,
+        select_articles, write_output,
     };
     use crate::test_logs::warnings_logged;
 
@@ -910,307 +671,6 @@ mod tests {
         assert!(matches!(
             write_output(FailingWriter(std::io::ErrorKind::PermissionDenied), "x"),
             Err(crate::error::OpenringError::IoError(_))
-        ));
-    }
-
-    // The urls file as `run` hands it over: its path, for diagnostics, and
-    // its text.
-    fn parse_urls(text: &str) -> crate::error::Result<HashMap<Url, Option<NonZeroUsize>>> {
-        parse_urls_from_file(std::path::Path::new("urls.txt"), text)
-    }
-
-    #[test]
-    fn parse_urls_ignores_comments_and_blank_lines_and_whitespace() {
-        let parsed = parse_urls(
-            "https://first.example/\n\
-             \x20  https://second.example   \n\
-             \x20https://first.example   \n\
-             # a hash comment\n\
-             // a double‑slash comment\n\
-             \n",
-        )
-        .unwrap();
-
-        let expected = HashMap::from([
-            (Url::parse("https://first.example/").unwrap(), None),
-            (Url::parse("https://second.example/").unwrap(), None),
-        ]);
-        assert_eq!(parsed, expected);
-    }
-
-    // Round-trip: any mix of valid `URL [WEIGHT]` lines, comments, blanks,
-    // and stray whitespace parses back to exactly the map written.
-    #[hegel::test]
-    fn parse_urls_round_trips_urls_through_a_file(tc: hegel::TestCase) {
-        use std::fmt::Write as _;
-
-        let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(20));
-        let mut expected: HashMap<Url, Option<NonZeroUsize>> = HashMap::new();
-        let mut text = String::new();
-        for _ in 0..n {
-            let url = Url::parse(&tc.draw(generators::urls())).expect("generated URL is valid");
-            // A duplicate URL repeats its recorded weight: conflicting
-            // weights are a parse error with its own test.
-            let weight = match expected.get(&url) {
-                Some(&w) => w,
-                None => tc
-                    .draw(generators::optional(
-                        generators::integers::<usize>().min_value(1),
-                    ))
-                    .and_then(NonZeroUsize::new),
-            };
-            match weight {
-                Some(w) => writeln!(text, "  {url} {w}  "),
-                None => writeln!(text, "  {url}  "),
-            }
-            .expect("writing to a String cannot fail");
-            expected.insert(url, weight);
-            if tc.draw(generators::booleans()) {
-                text.push_str(&tc.draw(hegel::one_of!(
-                    generators::just("# comment\n".to_string()),
-                    generators::just("// comment\n".to_string()),
-                    generators::just("\n".to_string()),
-                    generators::just("   \n".to_string()),
-                )));
-            }
-        }
-
-        assert_eq!(parse_urls(&text).unwrap(), expected);
-    }
-
-    #[test]
-    fn parse_urls_diagnostic_points_at_the_offending_line() {
-        // The same text appears first inside a comment; the span must point
-        // at the real line, not the first substring match in the file.
-        let err = parse_urls("# not a url\nnot a url\n").unwrap_err();
-        let crate::error::OpenringError::FeedUrlError(feed_url_error) = err else {
-            panic!("expected FeedUrlError, got {err:?}");
-        };
-        assert_eq!(feed_url_error.span.offset(), "# not a url\n".len());
-        assert_eq!(feed_url_error.span.len(), "not a url".len());
-    }
-
-    #[test]
-    fn parse_urls_reports_invalid_url() {
-        // An unparseable line yields a diagnostic error rather than being
-        // silently dropped.
-        assert!(matches!(
-            parse_urls("https://valid.example/\nnot a url\n"),
-            Err(crate::error::OpenringError::FeedUrlError(_))
-        ));
-    }
-
-    #[test]
-    fn parse_urls_parses_optional_weights() {
-        let parsed =
-            parse_urls("https://weighted.example/feed.xml 7\nhttps://plain.example/feed.xml\n")
-                .unwrap();
-
-        let expected = HashMap::from([
-            (
-                Url::parse("https://weighted.example/feed.xml").unwrap(),
-                NonZeroUsize::new(7),
-            ),
-            (Url::parse("https://plain.example/feed.xml").unwrap(), None),
-        ]);
-        assert_eq!(parsed, expected);
-    }
-
-    #[test]
-    fn parse_urls_weight_diagnostic_points_at_the_token() {
-        let err = parse_urls("https://valid.example/ abc\n").unwrap_err();
-        let crate::error::OpenringError::FeedWeightError(e) = err else {
-            panic!("expected FeedWeightError, got {err:?}");
-        };
-        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
-        assert_eq!(e.span.len(), "abc".len());
-    }
-
-    #[test]
-    fn parse_urls_rejects_a_zero_weight() {
-        let err = parse_urls("https://valid.example/ 0\n").unwrap_err();
-        let crate::error::OpenringError::FeedWeightError(e) = err else {
-            panic!("expected FeedWeightError, got {err:?}");
-        };
-        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
-        assert_eq!(e.span.len(), 1);
-    }
-
-    #[test]
-    fn parse_urls_rejects_trailing_garbage_after_the_weight() {
-        let err = parse_urls("https://valid.example/ 7 9\n").unwrap_err();
-        let crate::error::OpenringError::FeedWeightError(e) = err else {
-            panic!("expected FeedWeightError, got {err:?}");
-        };
-        // The span covers everything after the URL.
-        assert_eq!(e.span.offset(), "https://valid.example/ ".len());
-        assert_eq!(e.span.len(), "7 9".len());
-    }
-
-    #[test]
-    fn parse_urls_rejects_conflicting_duplicate_weights() {
-        let err = parse_urls("https://valid.example/ 3\nhttps://valid.example/ 7\n").unwrap_err();
-        let crate::error::OpenringError::FeedWeightError(e) = err else {
-            panic!("expected FeedWeightError, got {err:?}");
-        };
-        // The diagnostic points at the second line's weight token and names
-        // the weight it contradicts.
-        let second_weight_offset = "https://valid.example/ 3\nhttps://valid.example/ ".len();
-        assert_eq!(e.span.offset(), second_weight_offset);
-        assert_eq!(e.span.len(), 1);
-        assert!(e.help.contains('3'), "help: {}", e.help);
-    }
-
-    #[test]
-    fn parse_urls_merges_duplicates_per_weight_policy() {
-        // Same explicit weight twice, explicit after bare, bare after
-        // explicit: all collapse to one entry holding the explicit weight.
-        let parsed = parse_urls(
-            "https://a.example/ 7\n\
-             https://a.example/ 7\n\
-             https://b.example/\n\
-             https://b.example/ 3\n\
-             https://c.example/ 4\n\
-             https://c.example/\n",
-        )
-        .unwrap();
-
-        let expected = HashMap::from([
-            (
-                Url::parse("https://a.example/").unwrap(),
-                NonZeroUsize::new(7),
-            ),
-            (
-                Url::parse("https://b.example/").unwrap(),
-                NonZeroUsize::new(3),
-            ),
-            (
-                Url::parse("https://c.example/").unwrap(),
-                NonZeroUsize::new(4),
-            ),
-        ]);
-        assert_eq!(parsed, expected);
-    }
-
-    #[test]
-    fn parse_cli_url_accepts_url_and_optional_weight() {
-        let (url, weight) = parse_cli_url("https://example.com/feed.xml 7").unwrap();
-        assert_eq!(url.as_str(), "https://example.com/feed.xml");
-        assert_eq!(weight, NonZeroUsize::new(7));
-
-        let (_, bare) = parse_cli_url("https://example.com/feed.xml").unwrap();
-        assert_eq!(bare, None);
-    }
-
-    #[test]
-    fn parse_cli_url_rejects_malformed_values() {
-        for bad in [
-            "",
-            "not a url",
-            "https://example.com/ 0",
-            "https://example.com/ -3",
-            "https://example.com/ abc",
-            "https://example.com/ 7 9",
-        ] {
-            assert!(parse_cli_url(bad).is_err(), "accepted: {bad:?}");
-        }
-    }
-
-    // A bad -s value gets the same span-pointing diagnostic as a urls-file
-    // line: the label sits exactly on the offending token.
-    #[test]
-    fn parse_cli_url_diagnostic_points_at_the_weight_token() {
-        let err = parse_cli_url("https://luke.hsiao.dev/atom.xml X").unwrap_err();
-        let crate::error::OpenringError::FeedWeightError(e) = err else {
-            panic!("expected FeedWeightError, got {err:?}");
-        };
-        assert_eq!(e.span.offset(), "https://luke.hsiao.dev/atom.xml ".len());
-        assert_eq!(e.span.len(), 1);
-    }
-
-    // The parser must accept or reject, never panic, whatever the value holds.
-    #[hegel::test]
-    fn parse_cli_url_never_panics(tc: hegel::TestCase) {
-        let line = tc.draw(generators::text());
-        let _ = parse_cli_url(&line);
-    }
-
-    #[test]
-    fn merge_weight_lets_explicit_beat_absent_and_rejects_conflicts() {
-        let mut recorded = None;
-        merge_weight(&mut recorded, NonZeroUsize::new(3)).unwrap();
-        assert_eq!(recorded, NonZeroUsize::new(3));
-
-        // A bare duplicate has no opinion; the explicit weight stays.
-        merge_weight(&mut recorded, None).unwrap();
-        assert_eq!(recorded, NonZeroUsize::new(3));
-
-        // Repeating the same weight is fine.
-        merge_weight(&mut recorded, NonZeroUsize::new(3)).unwrap();
-        assert_eq!(recorded, NonZeroUsize::new(3));
-
-        // A different weight is a contradiction carrying both values.
-        assert_eq!(
-            merge_weight(&mut recorded, NonZeroUsize::new(7)),
-            Err((
-                NonZeroUsize::new(3).expect("non-zero"),
-                NonZeroUsize::new(7).expect("non-zero")
-            ))
-        );
-    }
-
-    #[test]
-    fn record_feed_reports_conflicting_weights_for_the_url() {
-        let mut feeds = HashMap::new();
-        record_feed(&mut feeds, feed_url(), NonZeroUsize::new(3)).unwrap();
-        record_feed(&mut feeds, feed_url(), None).unwrap();
-
-        let err = record_feed(&mut feeds, feed_url(), NonZeroUsize::new(7)).unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::OpenringError::ConflictingWeightError { .. }
-        ));
-    }
-
-    #[test]
-    fn feed_set_resolve_merges_cli_and_file_sources() {
-        let file = "https://a.example/ 7\nhttps://b.example/\n";
-        let cli = [
-            "https://b.example/ 3".to_string(),
-            "https://c.example/".to_string(),
-        ];
-
-        let feed_set =
-            FeedSet::resolve(&cli, Some((std::path::Path::new("urls.txt"), file))).unwrap();
-
-        assert_eq!(feed_set.urls.len(), 3);
-        let weight_of = |u: &str| feed_set.weights.get(&Url::parse(u).unwrap()).copied();
-        assert_eq!(weight_of("https://a.example/"), NonZeroUsize::new(7));
-        // The file's bare listing defers to the CLI's explicit weight.
-        assert_eq!(weight_of("https://b.example/"), NonZeroUsize::new(3));
-        assert_eq!(weight_of("https://c.example/"), None);
-    }
-
-    #[test]
-    fn feed_set_resolve_rejects_cross_source_conflicts() {
-        let cli = ["https://a.example/ 3".to_string()];
-
-        let err = FeedSet::resolve(
-            &cli,
-            Some((std::path::Path::new("urls.txt"), "https://a.example/ 7\n")),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::OpenringError::ConflictingWeightError { .. }
-        ));
-    }
-
-    #[test]
-    fn feed_set_resolve_requires_at_least_one_feed() {
-        assert!(matches!(
-            FeedSet::resolve(&[], None),
-            Err(crate::error::OpenringError::FeedMissing)
         ));
     }
 
