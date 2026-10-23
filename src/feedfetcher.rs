@@ -1,45 +1,19 @@
-use std::time::Duration;
-
 use feed_rs::{model::Feed, parser};
 use jiff::Timestamp;
-use reqwest::{
-    StatusCode, {Client, ClientBuilder},
-};
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
     cache::{Cache, CacheValue},
     error::OpenringError,
+    http::{Http, ReadError, StatusCode},
 };
 
 /// The largest response body accepted as a feed. Even full-content,
 /// full-history feeds run single-digit MiB; anything bigger is almost
 /// certainly a urls-file mistake pointing at media, and buffering it would
 /// balloon memory and the on-disk cache.
-const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
-
-/// How openring identifies itself to feed servers.
-pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-/// Build the HTTP client shared by every feed fetch: one connection pool and
-/// one TLS setup for the whole run, and the openring user agent.
-///
-/// Timeouts are granular rather than one total deadline: a large feed on a
-/// slow server (e.g. 1.7 MiB at ~85 KiB/s) is legitimate and must be allowed
-/// to finish, while a dead or stalled server should fail fast.
-pub(crate) fn build_client() -> Result<Client, OpenringError> {
-    Ok(ClientBuilder::new()
-        // A server that cannot complete a TCP/TLS handshake in 10s is down.
-        .connect_timeout(Duration::from_secs(10))
-        // A transfer may take as long as it keeps flowing, but 30s with no
-        // bytes at all means a stall.
-        .read_timeout(Duration::from_secs(30))
-        // Ceiling so a trickling server cannot pin a fetch slot forever.
-        .timeout(Duration::from_mins(5))
-        .user_agent(USER_AGENT)
-        .build()?)
-}
+const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Normalize an etag so it carries the literal double quotes HTTP requires.
 fn normalize_etag(s: &str) -> String {
@@ -55,8 +29,8 @@ fn normalize_etag(s: &str) -> String {
 /// can be exercised directly. Each function takes plain values and returns a plain
 /// decision; the coordinator (`fetch_feed`) performs the I/O around it.
 pub(crate) mod logic {
+    use crate::http::StatusCode;
     use jiff::{Span, Timestamp, ToSpan};
-    use reqwest::StatusCode;
 
     use crate::cache::{CacheValue, MAX_SPAN_SEC};
 
@@ -186,35 +160,6 @@ pub(crate) mod logic {
     }
 }
 
-/// Read the response body, failing once it grows past `limit` bytes. This
-/// backstops the Content-Length check for chunked or compressed responses,
-/// which present no usable length up front. A transfer error mid-read fails
-/// the fetch with the underlying cause and leaves the cache untouched.
-async fn read_body_capped(
-    url: &Url,
-    mut resp: reqwest::Response,
-    limit: u64,
-) -> Result<Vec<u8>, OpenringError> {
-    // The limit always fits in usize on supported platforms.
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut body = Vec::new();
-    loop {
-        match resp.chunk().await? {
-            Some(chunk) => {
-                let total = body.len().saturating_add(chunk.len());
-                if total > limit {
-                    return Err(OpenringError::FeedTooLargeError {
-                        url: url.as_str().to_string(),
-                        bytes: u64::try_from(total).unwrap_or(u64::MAX),
-                    });
-                }
-                body.extend_from_slice(&chunk);
-            }
-            None => return Ok(body),
-        }
-    }
-}
-
 /// Apply a decided [`logic::Disposition`] to the cache and return the feed body to
 /// serve, or a terminal error. This is the write half of a fetch; the decision is
 /// made purely in [`logic::disposition`].
@@ -289,10 +234,10 @@ fn apply_disposition(
     }
 }
 
-/// Fetch the feed at `url`, using the shared HTTP `client` and the `cache`.
+/// Fetch the feed at `url` through `http`, using and updating the `cache`.
 pub(crate) async fn fetch_feed(
     url: &Url,
-    client: &Client,
+    http: &Http,
     cache: &Cache,
 ) -> Result<Feed, OpenringError> {
     // Capture the clock once so every timestamp written during this call agrees
@@ -315,18 +260,18 @@ pub(crate) async fn fetch_feed(
         debug!(url=%url.as_str(), "retry window open but nothing cached; fetching anyway");
     }
 
-    let mut req = client.get(url.as_str());
-    let headers = logic::conditional_headers(cached.as_ref());
-    if let Some(last_modified) = &headers.if_modified_since {
-        req = req.header("If-Modified-Since", last_modified);
+    let validators = logic::conditional_headers(cached.as_ref());
+    let mut headers = Vec::with_capacity(2);
+    if let Some(last_modified) = &validators.if_modified_since {
+        headers.push(("if-modified-since", last_modified.as_str()));
     }
-    if let Some(etag) = &headers.if_none_match {
-        req = req.header("If-None-Match", etag);
+    if let Some(etag) = &validators.if_none_match {
+        headers.push(("if-none-match", etag.as_str()));
     }
-    debug!(url=%url, request=?req, "sending request");
+    debug!(url=%url, ?headers, "sending request");
 
-    let resp = req.send().await?;
-    debug!(url=%url, response=?resp, "received response");
+    let resp = http.get(url, &headers).await?;
+    debug!(url=%url, status=%resp.status(), "received response");
 
     // reqwest follows redirects silently, so a moved feed keeps working
     // and the user never learns they should update their urls file.
@@ -338,11 +283,11 @@ pub(crate) async fn fetch_feed(
         );
     }
 
-    // Reject grossly oversized responses before buffering them. Responses
-    // that arrive compressed or chunked report no length and are bounded
-    // by the request timeout instead.
+    // Reject grossly oversized responses before buffering them. Chunked and
+    // compressed responses announce no usable length, so the read below
+    // enforces the same cap as the bytes arrive.
     if let Some(bytes) = resp.content_length()
-        && bytes > MAX_FEED_BYTES
+        && !usize::try_from(bytes).is_ok_and(|b| b <= MAX_FEED_BYTES)
     {
         return Err(OpenringError::FeedTooLargeError {
             url: url.as_str().to_string(),
@@ -350,29 +295,29 @@ pub(crate) async fn fetch_feed(
         });
     }
 
-    // Pull the plain values the decision logic needs out of the response before
-    // `text()` consumes it. The etag is normalized at this boundary.
+    // Pull the plain values the decision logic needs out of the response
+    // before reading the body consumes it. The etag is normalized here.
     let status = resp.status();
-    let etag = resp
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(normalize_etag);
-    let last_modified = resp
-        .headers()
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let etag = resp.header("etag").map(normalize_etag);
+    let last_modified = resp.header("last-modified").map(str::to_string);
+    let retry_after = resp.header("retry-after").map(str::to_string);
     // Keep the raw bytes: pre-decoding to text re-encodes the transfer
     // as UTF-8 while the XML prolog still declares the original charset,
     // so the parser would decode non-UTF-8 feeds twice into mojibake.
     let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        Some(read_body_capped(url, resp, MAX_FEED_BYTES).await?)
+        // A transfer error mid-read fails the fetch with its cause and
+        // leaves the cache untouched.
+        Some(
+            resp.read_capped(MAX_FEED_BYTES)
+                .await
+                .map_err(|e| match e {
+                    ReadError::TooLarge { bytes } => OpenringError::FeedTooLargeError {
+                        url: url.as_str().to_string(),
+                        bytes,
+                    },
+                    ReadError::Transfer(e) => e.into(),
+                })?,
+        )
     } else {
         None
     };
@@ -395,18 +340,16 @@ mod tests {
     use std::sync::Arc;
 
     use jiff::{Span, Timestamp, ToSpan};
-    use reqwest::StatusCode;
     use url::Url;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use hegel::extras::jiff as jiff_gs;
     use hegel::generators;
 
     use crate::cache::{Cache, CacheValue, MAX_SPAN_SEC};
     use crate::error::OpenringError;
+    use crate::http::{Answer, Http, Request, StatusCode};
 
-    use super::{USER_AGENT, build_client, fetch_feed, logic, normalize_etag};
+    use super::{MAX_FEED_BYTES, fetch_feed, logic, normalize_etag};
 
     // Bounds for gate timestamps/spans. 50e9 seconds is ~1585 years past the
     // epoch; a timestamp plus a span stays under jiff's Timestamp::MAX, while
@@ -740,88 +683,77 @@ mod tests {
         assert_eq!(s, status.as_str());
     }
 
-    // The remaining tests exercise the HTTP wiring that pure tests cannot see:
-    // header spelling on the wire, reading a real reqwest::Response, and the
-    // status -> cache-mutation path end to end.
+    // The remaining tests run a whole fetch against a nulled Http: the
+    // request that goes out, and what each answer does to the cache.
+
+    fn feed_url() -> Url {
+        Url::parse("https://feed.example/feed.xml").unwrap()
+    }
+
+    fn cached_entry(body: Option<&str>) -> CacheValue {
+        CacheValue {
+            timestamp: Timestamp::now(),
+            retry_after: None,
+            last_modified: None,
+            etag: None,
+            body: body.map(|b| get_valid_rss_feed(b).into_bytes()),
+        }
+    }
+
+    fn title(feed: &feed_rs::model::Feed) -> &str {
+        &feed.title.as_ref().expect("feed has a title").content
+    }
 
     #[tokio::test]
     async fn sends_conditional_headers_and_reuses_on_304() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(304))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::status(304))]);
+        let requests = http.track_requests();
         let cache = Arc::new(Cache::new());
         let etag = normalize_etag("abc123");
         let last_modified = "Mon, 01 Jan 2024 00:00:00 GMT".to_string();
         cache.insert(
             url.clone(),
             CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
                 last_modified: Some(last_modified.clone()),
                 etag: Some(etag.clone()),
-                body: Some(get_valid_rss_feed("cached").into_bytes()),
+                ..cached_entry(Some("cached"))
             },
         );
 
-        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &http, &cache)
             .await
             .expect("served cache on 304");
-        assert!(
-            feed.title
-                .as_ref()
-                .is_some_and(|t| t.content.contains("cached"))
-        );
-
-        let received = server.received_requests().await.unwrap();
-        let req = &received[0];
+        assert_eq!(title(&feed), "cached");
         assert_eq!(
-            req.headers.get("if-none-match").unwrap().to_str().unwrap(),
-            etag
-        );
-        assert_eq!(
-            req.headers
-                .get("if-modified-since")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            last_modified
+            requests.data(),
+            [Request {
+                url,
+                headers: vec![
+                    ("if-modified-since", last_modified),
+                    ("if-none-match", etag)
+                ],
+            }]
         );
     }
 
     #[tokio::test]
     async fn refreshes_validators_from_304_headers() {
-        use wiremock::matchers::header;
-
-        let server = MockServer::start().await;
-        let old_etag = normalize_etag("old");
+        let url = feed_url();
         let new_etag = normalize_etag("new");
         // RFC 7232 allows a 304 to rotate the validators it confirms.
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .and(header("if-none-match", old_etag.as_str()))
-            .respond_with(ResponseTemplate::new(304).insert_header("etag", new_etag.as_str()))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let http =
+            Http::create_null([(url.clone(), Answer::status(304).header("etag", &new_etag))]);
         let cache = Arc::new(Cache::new());
         cache.insert(
             url.clone(),
             CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: Some(old_etag),
-                body: Some(get_valid_rss_feed("cached").into_bytes()),
+                etag: Some(normalize_etag("old")),
+                ..cached_entry(Some("cached"))
             },
         );
 
-        fetch_feed(&url, &build_client().unwrap(), &cache)
+        fetch_feed(&url, &http, &cache)
             .await
             .expect("served cache on 304");
         // The next run must validate against the rotated etag, or the server
@@ -834,17 +766,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_304_after_an_expired_retry_window_does_not_reopen_it() {
-        let server = MockServer::start().await;
-        // Two runs, two requests: a 304 ends the rate limit just as a 200
-        // does, so the second run must ask the server again.
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(304))
-            .expect(2)
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::status(304))]);
+        let requests = http.track_requests();
         let cache = Arc::new(Cache::new());
         // An earlier 429 opened a one-hour window two hours ago, so it has
         // already closed.
@@ -853,59 +777,45 @@ mod tests {
             CacheValue {
                 timestamp: Timestamp::now() - 2.hours(),
                 retry_after: Some(1.hour()),
-                last_modified: None,
                 etag: Some(normalize_etag("cached")),
-                body: Some(get_valid_rss_feed("cached").into_bytes()),
+                ..cached_entry(Some("cached"))
             },
         );
 
-        let client = build_client().unwrap();
         for run in ["first", "second"] {
-            fetch_feed(&url, &client, &cache)
+            fetch_feed(&url, &http, &cache)
                 .await
                 .unwrap_or_else(|e| panic!("{run} run served cache on 304: {e}"));
         }
+        // Two runs, two requests: a 304 ends the rate limit just as a 200
+        // does, so the second run must ask the server again.
+        assert_eq!(requests.data().len(), 2);
     }
 
     #[tokio::test]
     async fn stores_etag_and_last_modified_on_200() {
-        let server = MockServer::start().await;
-        let etag_raw = "feed-etag";
+        let url = feed_url();
         let last_modified = "Mon, 01 Jan 2024 00:00:00 GMT";
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .append_header("etag", etag_raw)
-                    .append_header("last-modified", last_modified)
-                    .set_body_string(get_valid_rss_feed("fresh")),
-            )
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let http = Http::create_null([(
+            url.clone(),
+            Answer::ok(get_valid_rss_feed("fresh"))
+                .header("etag", "feed-etag")
+                .header("last-modified", last_modified),
+        )]);
         let cache = Arc::new(Cache::new());
 
-        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &http, &cache)
             .await
             .expect("fetched fresh feed");
-        assert!(
-            feed.title
-                .as_ref()
-                .is_some_and(|t| t.content.contains("fresh"))
-        );
+        assert_eq!(title(&feed), "fresh");
 
         let entry = cache.get(&url).expect("cached after 200");
-        assert_eq!(
-            entry.etag.as_deref(),
-            Some(normalize_etag(etag_raw).as_str())
-        );
+        assert_eq!(entry.etag.as_deref(), Some("\"feed-etag\""));
         assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
     }
 
     #[tokio::test]
     async fn decodes_non_utf8_feeds_per_their_xml_prolog() {
-        let server = MockServer::start().await;
         // A real ISO-8859-1 feed: 0xE9 is é, and the prolog declares the
         // encoding. Decoding the transfer as UTF-8 first would corrupt the
         // byte before the XML parser ever saw the prolog.
@@ -916,141 +826,152 @@ mod tests {
         body.extend_from_slice(
             br"</title><link>https://x.example/</link><description>d</description></channel></rss>",
         );
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::ok(body))]);
         let cache = Arc::new(Cache::new());
-        let client = build_client().unwrap();
-        let feed = fetch_feed(&url, &client, &cache)
+
+        let feed = fetch_feed(&url, &http, &cache)
             .await
             .expect("parsed latin-1 feed");
-        assert_eq!(feed.title.unwrap().content, "caf\u{e9}");
+        assert_eq!(title(&feed), "caf\u{e9}");
 
         // The cached bytes must reparse identically (e.g. on a later 304).
         let cached = cache.get(&url).expect("cached").body.clone().unwrap();
         let reparsed = feed_rs::parser::parse(cached.as_slice()).expect("cache reparses");
-        assert_eq!(reparsed.title.unwrap().content, "caf\u{e9}");
+        assert_eq!(title(&reparsed), "caf\u{e9}");
     }
 
     #[tokio::test]
-    async fn streamed_bodies_without_content_length_are_capped() {
-        use super::{MAX_FEED_BYTES, read_body_capped};
-
-        // A response with no Content-Length header, the shape a chunked or
-        // compressed transfer takes once reqwest strips the encoding. The
-        // header fast-path cannot see these; only the streaming cap can.
-        let big = vec![b'x'; usize::try_from(MAX_FEED_BYTES).unwrap() + 1];
-        let resp = reqwest::Response::from(http::Response::new(big));
-        let url = Url::parse("https://example.com/feed.xml").unwrap();
-
-        let res = read_body_capped(&url, resp, MAX_FEED_BYTES).await;
-        assert!(matches!(res, Err(OpenringError::FeedTooLargeError { .. })));
-    }
-
-    #[tokio::test]
-    async fn oversized_feeds_are_rejected_without_buffering() {
-        let server = MockServer::start().await;
-        // A valid feed padded past the size limit, standing in for a urls-file
-        // typo that points at a video or other huge file.
-        let padding = format!("<!-- {} -->", "x".repeat(65 * 1024 * 1024));
-        let body =
-            get_valid_rss_feed("huge").replace("</channel>", &format!("{padding}</channel>"));
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+    async fn streamed_bodies_past_the_cap_are_rejected() {
+        // No Content-Length, the shape a chunked or compressed transfer
+        // takes. The header check cannot see these; only the read cap can.
+        let url = feed_url();
+        let http = Http::create_null([(
+            url.clone(),
+            Answer::status(200)
+                .chunks(vec![vec![b'x'; MAX_FEED_BYTES], vec![b'x']])
+                .chunked(),
+        )]);
         let cache = Arc::new(Cache::new());
-        let res = fetch_feed(&url, &build_client().unwrap(), &cache).await;
-        assert!(matches!(res, Err(OpenringError::FeedTooLargeError { .. })));
+
+        let res = fetch_feed(&url, &http, &cache).await;
+        assert!(matches!(
+            res,
+            Err(OpenringError::FeedTooLargeError { bytes, .. })
+                if bytes == u64::try_from(MAX_FEED_BYTES).unwrap() + 1
+        ));
+        assert!(!cache.contains_key(&url));
+    }
+
+    #[tokio::test]
+    async fn oversized_feeds_are_rejected_by_their_announced_length() {
+        // A urls-file typo that points at a video or other huge file.
+        let url = feed_url();
+        let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        let http = Http::create_null([(
+            url.clone(),
+            Answer::ok(get_valid_rss_feed("huge")).content_length(announced),
+        )]);
+        let cache = Arc::new(Cache::new());
+
+        let res = fetch_feed(&url, &http, &cache).await;
+        assert!(matches!(
+            res,
+            Err(OpenringError::FeedTooLargeError { bytes, .. }) if bytes == announced
+        ));
         // Nothing that big belongs in the cache either.
         assert!(!cache.contains_key(&url));
     }
 
     #[tokio::test]
-    async fn empty_body_is_not_cached_as_servable() {
-        let server = MockServer::start().await;
-        // A misbehaving feed: 200 with an etag but a completely empty body.
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .append_header("etag", "\"empty\"")
-                    .set_body_string(""),
-            )
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+    async fn a_failed_request_is_an_error_and_leaves_the_cache_alone() {
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::send_error("connection refused"))]);
         let cache = Arc::new(Cache::new());
-        let client = build_client().unwrap();
+        cache.insert(url.clone(), cached_entry(Some("cached")));
+        let before = cache.get(&url).unwrap().clone();
 
-        let first = fetch_feed(&url, &client, &cache).await;
+        let res = fetch_feed(&url, &http, &cache).await;
+        assert!(
+            matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection refused"),
+            "{res:?}"
+        );
+        assert_eq!(*cache.get(&url).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_is_an_error_and_leaves_the_cache_alone() {
+        let url = feed_url();
+        let http = Http::create_null([(
+            url.clone(),
+            Answer::ok(get_valid_rss_feed("partial")).transfer_error("connection reset"),
+        )]);
+        let cache = Arc::new(Cache::new());
+        cache.insert(url.clone(), cached_entry(Some("cached")));
+        let before = cache.get(&url).unwrap().clone();
+
+        let res = fetch_feed(&url, &http, &cache).await;
+        assert!(
+            matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection reset"),
+            "{res:?}"
+        );
+        assert_eq!(*cache.get(&url).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_not_cached_as_servable() {
+        // A misbehaving feed: 200 with an etag but a completely empty body.
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::ok("").header("etag", "\"empty\""))]);
+        let requests = http.track_requests();
+        let cache = Arc::new(Cache::new());
+
+        let first = fetch_feed(&url, &http, &cache).await;
         assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
 
         // The cached entry must not pretend to have something to serve. If it
         // did, the next fetch would send If-None-Match, the server would say
         // 304, and the run would serve the empty body until the entry aged
         // out of the cache.
-        let second = fetch_feed(&url, &client, &cache).await;
+        let second = fetch_feed(&url, &http, &cache).await;
         assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
-
-        let received = server.received_requests().await.unwrap();
-        assert_eq!(received.len(), 2);
-        assert!(
-            !received[1].headers.contains_key("if-none-match"),
+        let unconditional = Request {
+            url,
+            headers: vec![],
+        };
+        assert_eq!(
+            requests.data(),
+            [unconditional.clone(), unconditional],
             "second fetch sent a conditional request with nothing to serve"
         );
     }
 
     #[tokio::test]
     async fn refetches_unconditionally_when_cached_entry_has_no_body() {
-        use wiremock::matchers::header;
-
-        let server = MockServer::start().await;
-        let etag = normalize_etag("abc123");
-        // A conditional request gets 304; only an unconditional one gets the
-        // feed. With a bodyless cache entry, a 304 leaves nothing to serve,
-        // so the fetch must go out unconditional.
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .and(header("if-none-match", etag.as_str()))
-            .respond_with(ResponseTemplate::new(304))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("fresh")))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::ok(get_valid_rss_feed("fresh")))]);
+        let requests = http.track_requests();
         let cache = Arc::new(Cache::new());
         // What a 200 whose body read failed leaves behind: metadata, no body.
+        // A 304 to a conditional request would leave nothing to serve.
         cache.insert(
             url.clone(),
             CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: Some(etag),
-                body: None,
+                etag: Some(normalize_etag("abc123")),
+                ..cached_entry(None)
             },
         );
 
-        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &http, &cache)
             .await
-            .expect("refetched the feed instead of erroring on 304");
-        assert!(
-            feed.title
-                .as_ref()
-                .is_some_and(|t| t.content.contains("fresh"))
+            .expect("refetched the feed");
+        assert_eq!(title(&feed), "fresh");
+        assert_eq!(
+            requests.data(),
+            [Request {
+                url: url.clone(),
+                headers: vec![],
+            }]
         );
         // The fresh body must now be cached for the next run.
         assert!(cache.get(&url).expect("entry present").body.is_some());
@@ -1058,112 +979,56 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_serves_cache_and_records_retry_after() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
-        let cache = Arc::new(Cache::new());
-        cache.insert(
+        let url = feed_url();
+        let http = Http::create_null([(
             url.clone(),
-            CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: None,
-                body: Some(get_valid_rss_feed("rate-limited").into_bytes()),
-            },
-        );
+            Answer::status(429).header("retry-after", "120"),
+        )]);
+        let cache = Arc::new(Cache::new());
+        cache.insert(url.clone(), cached_entry(Some("rate-limited")));
 
-        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
+        let feed = fetch_feed(&url, &http, &cache)
             .await
             .expect("served cache on 429");
-        assert!(
-            feed.title
-                .as_ref()
-                .is_some_and(|t| t.content.contains("rate-limited"))
-        );
+        assert_eq!(title(&feed), "rate-limited");
         let entry = cache.get(&url).expect("entry present");
         assert_eq!(entry.retry_after.unwrap().get_seconds(), 120);
     }
 
     #[tokio::test]
-    async fn sends_openring_user_agent() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("ua")))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
-        let cache = Arc::new(Cache::new());
-        fetch_feed(&url, &build_client().unwrap(), &cache)
-            .await
-            .expect("fetched");
-
-        let received = server.received_requests().await.unwrap();
-        assert_eq!(received[0].headers.get("user-agent").unwrap(), USER_AGENT);
-    }
-
-    #[tokio::test]
     async fn follows_redirects_and_caches_under_the_requested_url() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/old"))
-            .respond_with(ResponseTemplate::new(301).insert_header("location", "/new"))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/new"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(get_valid_rss_feed("moved")))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&format!("{}/old", server.uri())).unwrap();
+        let url = feed_url();
+        let moved = Url::parse("https://feed.example/new.xml").unwrap();
+        let http = Http::create_null([(
+            url.clone(),
+            Answer::ok(get_valid_rss_feed("moved")).redirected_to(moved.clone()),
+        )]);
         let cache = Arc::new(Cache::new());
-        let feed = fetch_feed(&url, &build_client().unwrap(), &cache)
+
+        let feed = fetch_feed(&url, &http, &cache)
             .await
             .expect("followed the redirect");
-        assert!(
-            feed.title
-                .as_ref()
-                .is_some_and(|t| t.content.contains("moved"))
-        );
+        assert_eq!(title(&feed), "moved");
         // The cache stays keyed by the URL the user configured, so later runs
         // still find their entry.
         assert!(cache.contains_key(&url));
+        assert!(!cache.contains_key(&moved));
     }
 
     #[tokio::test]
     async fn rate_limited_with_http_date_records_window() {
-        let server = MockServer::start().await;
         // RFC 9110 allows Retry-After to be an HTTP-date as well as seconds.
         let date = (Timestamp::now() + 600.seconds()).to_zoned(jiff::tz::TimeZone::UTC);
         let header = jiff::fmt::rfc2822::to_string(&date).unwrap();
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", header.as_str()))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
-        let cache = Arc::new(Cache::new());
-        cache.insert(
+        let url = feed_url();
+        let http = Http::create_null([(
             url.clone(),
-            CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: None,
-                body: Some(get_valid_rss_feed("rate-limited").into_bytes()),
-            },
-        );
+            Answer::status(429).header("retry-after", &header),
+        )]);
+        let cache = Arc::new(Cache::new());
+        cache.insert(url.clone(), cached_entry(Some("rate-limited")));
 
-        fetch_feed(&url, &build_client().unwrap(), &cache)
+        fetch_feed(&url, &http, &cache)
             .await
             .expect("served cache on 429");
         // The recorded window is the time until the given date, allowing for
@@ -1179,19 +1044,14 @@ mod tests {
 
     #[tokio::test]
     async fn unexpected_status_is_an_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        let url = Url::parse(&server.uri()).unwrap();
+        let url = feed_url();
+        let http = Http::create_null([(url.clone(), Answer::status(500))]);
         let cache = Arc::new(Cache::new());
-        let res = fetch_feed(&url, &build_client().unwrap(), &cache).await;
+        let res = fetch_feed(&url, &http, &cache).await;
         assert!(matches!(
             res,
-            Err(OpenringError::UnexpectedStatusError { .. })
+            Err(OpenringError::UnexpectedStatusError { status, .. })
+                if status == StatusCode::INTERNAL_SERVER_ERROR.as_str()
         ));
     }
 }

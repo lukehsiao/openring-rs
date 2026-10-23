@@ -1,7 +1,7 @@
 //! Derive a summary for an article whose feed provided none, by fetching the
 //! article's own page and reading the page's description of itself.
 
-use reqwest::{Client, header::CONTENT_TYPE};
+use crate::http::Http;
 use scraper::{Html, Selector};
 use tracing::debug;
 use url::Url;
@@ -23,13 +23,8 @@ const MAX_SUMMARY_CHARS: usize = 500;
 /// exactly like a feed that offered no summary, so nothing here can fail the
 /// run. The returned text is plain text with HTML special characters
 /// escaped, safe to embed even through the template's `| safe` filter.
-pub(crate) async fn fetch_summary(client: &Client, url: &Url) -> Option<String> {
-    let resp = match client
-        .get(url.clone())
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-    {
+pub(crate) async fn fetch_summary(http: &Http, url: &Url) -> Option<String> {
+    let resp = match http.get(url, &[]).await {
         Ok(resp) => resp,
         Err(e) => {
             // Only worth a debug line: the article renders fine without a
@@ -38,14 +33,14 @@ pub(crate) async fn fetch_summary(client: &Client, url: &Url) -> Option<String> 
             return None;
         }
     };
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        debug!(url = url.as_str(), %status, "page fetch failed; no summary to derive");
+        return None;
+    }
 
-    let content_type = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        // Owned copy so the borrow on `resp` ends before the body is consumed.
-        .map(str::to_owned);
-    if !is_html(content_type.as_deref()) {
+    let content_type = resp.header("content-type");
+    if !is_html(content_type) {
         debug!(
             url = url.as_str(),
             content_type, "not an HTML page; no summary to derive"
@@ -53,7 +48,15 @@ pub(crate) async fn fetch_summary(client: &Client, url: &Url) -> Option<String> 
         return None;
     }
 
-    let body = read_page_capped(url, resp).await?;
+    // Content-Length cannot be trusted for chunked or compressed responses,
+    // so the cap applies to the bytes as they arrive.
+    let body = match resp.read_capped(MAX_PAGE_BYTES).await {
+        Ok(body) => body,
+        Err(e) => {
+            debug!(url = url.as_str(), error = %e, "could not read the page; no summary derived");
+            return None;
+        }
+    };
     // Non-UTF-8 pages are rare enough that lossy decoding is fine: mangled
     // bytes degrade a summary, not the run.
     extract_summary(&String::from_utf8_lossy(&body))
@@ -69,29 +72,6 @@ fn is_html(content_type: Option<&str>) -> bool {
     };
     let mime = value.split(';').next().unwrap_or("").trim();
     mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
-}
-
-/// Read the response body, giving up once it grows past [`MAX_PAGE_BYTES`].
-/// Content-Length cannot be trusted for chunked or compressed responses, so
-/// the cap is enforced on the decoded bytes as they arrive.
-async fn read_page_capped(url: &Url, mut resp: reqwest::Response) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > MAX_PAGE_BYTES {
-                    debug!(url = url.as_str(), "page too large; no summary derived");
-                    return None;
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => return Some(body),
-            Err(e) => {
-                debug!(url = url.as_str(), error = %e, "transfer failed while fetching page");
-                return None;
-            }
-        }
-    }
 }
 
 /// Derive a display-ready summary from an HTML page: the page's own meta
@@ -196,6 +176,7 @@ mod tests {
     use hegel::generators;
 
     use super::*;
+    use crate::http::Answer;
 
     #[test]
     fn is_html_accepts_html_content_types() {
@@ -338,32 +319,56 @@ mod tests {
         assert!(summary.ends_with('…'));
     }
 
-    #[tokio::test]
-    async fn non_html_pages_yield_no_summary() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(br#"{"summary":"nope"}"#.to_vec(), "application/json"),
-            )
-            .mount(&server)
-            .await;
-        let client = crate::feedfetcher::build_client().unwrap();
-        let url = Url::parse(&server.uri()).unwrap();
-        assert_eq!(fetch_summary(&client, &url).await, None);
+    fn post_url() -> Url {
+        Url::parse("https://blog.example/post").unwrap()
     }
 
-    // Constructed straight from an http::Response so the cap is exercised
-    // without a multi-megabyte transfer over a socket.
-    #[tokio::test]
-    async fn oversized_pages_are_not_read() {
-        let big = vec![b'x'; MAX_PAGE_BYTES + 1];
-        let resp = reqwest::Response::from(http::Response::new(big));
-        let url = Url::parse("https://example.com/post").unwrap();
-        assert!(read_page_capped(&url, resp).await.is_none());
+    fn summarize(answer: Answer) -> Option<String> {
+        let http = Http::create_null([(post_url(), answer)]);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(fetch_summary(&http, &post_url()))
+    }
+
+    #[test]
+    fn an_html_page_yields_its_summary() {
+        let page =
+            r#"<html><head><meta name="description" content="About this post."></head></html>"#;
+        assert_eq!(
+            summarize(Answer::ok(page).header("content-type", "text/html; charset=utf-8"))
+                .as_deref(),
+            Some("About this post.")
+        );
+    }
+
+    #[test]
+    fn non_html_pages_yield_no_summary() {
+        let answer = Answer::ok(r#"{"summary":"nope"}"#).header("content-type", "application/json");
+        assert_eq!(summarize(answer), None);
+    }
+
+    #[test]
+    fn oversized_pages_yield_no_summary() {
+        let page = format!(
+            r#"<html><head><meta name="description" content="Huge."></head><body>{}</body></html>"#,
+            "x".repeat(MAX_PAGE_BYTES)
+        );
+        assert_eq!(summarize(Answer::ok(page).chunked()), None);
+    }
+
+    #[test]
+    fn unreachable_pages_yield_no_summary() {
+        assert_eq!(summarize(Answer::send_error("connection refused")), None);
+    }
+
+    // A page that answers with an error status yields nothing, even when
+    // the error page itself carries a description.
+    #[hegel::test]
+    fn error_statuses_yield_no_summary(tc: hegel::TestCase) {
+        let status = tc.draw(generators::integers::<u16>().min_value(400).max_value(599));
+        let page = r#"<html><head><meta name="description" content="Not Found"></head></html>"#;
+        assert_eq!(summarize(Answer::status(status).body(page)), None);
     }
 
     // Whatever the page holds, deriving a summary yields text or nothing but
