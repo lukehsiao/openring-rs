@@ -1,12 +1,17 @@
+//! The feed fetch module: HTTP for one Feed. It asks the cache what to do,
+//! sends the request, turns the response into an [`Outcome`], and parses
+//! the body the cache hands back. Every rule about what the cache stores
+//! lives in the cache module.
+
 use feed_rs::{model::Feed, parser};
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    cache::{Cache, CacheValue},
+    cache::{Cache, Outcome, Plan, Validators},
     error::OpenringError,
-    http::{Http, ReadError, StatusCode},
+    http::{Http, ReadError, Response, StatusCode},
 };
 
 /// The largest response body accepted as a feed. Even full-content,
@@ -14,6 +19,10 @@ use crate::{
 /// certainly a urls-file mistake pointing at media, and buffering it would
 /// balloon memory and the on-disk cache.
 const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long to wait after a 429 that names no time, or names one in neither
+/// form RFC 9110 allows. The README and `--help` promise four hours.
+const DEFAULT_RETRY_WINDOW: SignedDuration = SignedDuration::from_hours(4);
 
 /// Normalize an etag so it carries the literal double quotes HTTP requires.
 fn normalize_etag(s: &str) -> String {
@@ -25,212 +34,32 @@ fn normalize_etag(s: &str) -> String {
     }
 }
 
-/// Pure decision logic for fetching, separated from all HTTP and cache I/O so it
-/// can be exercised directly. Each function takes plain values and returns a plain
-/// decision; the coordinator (`fetch_feed`) performs the I/O around it.
-pub(crate) mod logic {
-    use crate::http::StatusCode;
-    use jiff::{Span, Timestamp, ToSpan};
-
-    use crate::cache::{CacheValue, MAX_SPAN_SEC};
-
-    /// The conditional-request headers to attach to a fetch, derived from cache.
-    #[derive(Debug, Default, Clone, PartialEq, Eq)]
-    pub(crate) struct ConditionalHeaders {
-        pub if_modified_since: Option<String>,
-        pub if_none_match: Option<String>,
-    }
-
-    /// What to do with the cache and response after a fetch, decided purely from
-    /// the response. `Reuse` and `RateLimited` direct the coordinator to serve the
-    /// body from the live cache entry rather than carrying it in the variant,
-    /// since that body can be large and is owned by the map.
-    #[derive(Debug, Clone)]
-    pub(crate) enum Disposition {
-        /// 2xx: overwrite the cached metadata and body, clearing any retry window.
-        Store {
-            etag: Option<String>,
-            last_modified: Option<String>,
-            body: Option<Vec<u8>>,
+/// The instant a `Retry-After` header asks the client to wait until.
+///
+/// An integer that fits in an `i64`, with an optional sign, counts that
+/// many seconds from `now`, stopping at the nearest instant jiff can
+/// represent. An RFC 2822 date, which covers the IMF-fixdate servers send,
+/// is the deadline itself. Anything else waits [`DEFAULT_RETRY_WINDOW`]:
+/// no header, text, a number too long for an `i64`, and the obsolete RFC
+/// 850 and asctime date forms. No value can panic a fetch.
+fn retry_deadline(header: Option<&str>, now: Timestamp) -> Timestamp {
+    let wait = match header.map(|h| (h, h.parse::<i64>())) {
+        Some((_, Ok(secs))) => SignedDuration::from_secs(secs),
+        Some((h, Err(_))) => match jiff::fmt::rfc2822::parse(h) {
+            Ok(date) => return date.timestamp(),
+            Err(_) => DEFAULT_RETRY_WINDOW,
         },
-        /// 304 with an existing entry: keep the cached body, refreshing the
-        /// validators with any the response carried (RFC 7232 allows a 304 to
-        /// rotate them) and clearing any retry window.
-        Reuse {
-            etag: Option<String>,
-            last_modified: Option<String>,
-        },
-        /// 429 with an existing entry: record the retry window and serve cache.
-        RateLimited { retry_after: Span },
-        /// 429 with no cached entry: there is nothing to serve.
-        RateLimitedNoCache,
-        /// Any other status code.
-        Unexpected { status: String },
-    }
-
-    /// Whether a cached 429 retry window is still open at `now`. While it is, the
-    /// caller should serve from cache instead of issuing a request.
-    pub(crate) fn retry_after_gate_open(cv: &CacheValue, now: Timestamp) -> bool {
-        cv.retry_after
-            .is_some_and(|retry| match cv.timestamp.checked_add(retry) {
-                Ok(deadline) => deadline > now,
-                // The cache file is user-editable JSON, so the deadline can
-                // overflow jiff's range or the span can carry calendar units
-                // that need a relative date. Fall back to the span's sign: a
-                // positive span puts the deadline in the far future (gate
-                // open), a negative one in the far past (closed).
-                Err(_) => retry.signum() > 0,
-            })
-    }
-
-    /// The conditional-request headers implied by a cached entry, if any.
-    ///
-    /// An entry without a body sends none: a 304 answer would leave nothing
-    /// to serve, so the request must go out unconditional.
-    pub(crate) fn conditional_headers(cv: Option<&CacheValue>) -> ConditionalHeaders {
-        cv.filter(|cv| cv.body.is_some())
-            .map_or_else(ConditionalHeaders::default, |cv| ConditionalHeaders {
-                if_modified_since: cv.last_modified.clone(),
-                if_none_match: cv.etag.clone(),
-            })
-    }
-
-    /// Parse a `Retry-After` header into a `Span` relative to `now`, accepting
-    /// both forms RFC 9110 allows: delta-seconds and an HTTP-date. Defaults to
-    /// 4 hours when the header is absent or in neither form. Values are
-    /// clamped to the span jiff can represent (`MAX_SPAN_SEC`) so a hostile
-    /// header cannot panic a fetch.
-    pub(crate) fn parse_retry_after(header: Option<&str>, now: Timestamp) -> Span {
-        let Some(header) = header else {
-            return 4.hours();
-        };
-        if let Ok(secs) = header.parse::<i64>() {
-            return secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds();
-        }
-        if let Ok(date) = jiff::fmt::rfc2822::parse(header) {
-            // Whole seconds, consistent with the delta form; a date in the
-            // past yields a negative span and the gate stays closed.
-            let secs = date.timestamp().as_second() - now.as_second();
-            return secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC).seconds();
-        }
-        4.hours()
-    }
-
-    /// Decide what to do with a response given its status, the already-normalized
-    /// `etag` and `last_modified` headers, the body text, whether a cache entry
-    /// already exists, the raw `retry-after` header, and the time `now` that
-    /// date-form `Retry-After` values are interpreted against.
-    pub(crate) fn disposition(
-        status: StatusCode,
-        etag: Option<&str>,
-        last_modified: Option<&str>,
-        body: Option<Vec<u8>>,
-        had_cache_entry: bool,
-        retry_after_header: Option<&str>,
-        now: Timestamp,
-    ) -> Disposition {
-        if status == StatusCode::NOT_MODIFIED && had_cache_entry {
-            Disposition::Reuse {
-                etag: etag.map(ToString::to_string),
-                last_modified: last_modified.map(ToString::to_string),
-            }
-        } else if status.is_success() || status == StatusCode::NOT_MODIFIED {
-            // A 2xx, or a 304 with no prior entry, stores the response. An
-            // empty body counts as no body: caching it as servable would make
-            // later runs send conditional requests, get 304s, and serve the
-            // empty feed until the entry expired.
-            Disposition::Store {
-                etag: etag.map(ToString::to_string),
-                last_modified: last_modified.map(ToString::to_string),
-                body: body.filter(|b| !b.is_empty()),
-            }
-        } else if status == StatusCode::TOO_MANY_REQUESTS {
-            if had_cache_entry {
-                Disposition::RateLimited {
-                    retry_after: parse_retry_after(retry_after_header, now),
-                }
-            } else {
-                Disposition::RateLimitedNoCache
-            }
-        } else {
-            Disposition::Unexpected {
-                status: status.as_str().to_string(),
-            }
-        }
-    }
+        None => DEFAULT_RETRY_WINDOW,
+    };
+    now.saturating_add(wait)
+        .expect("adding a SignedDuration saturates instead of failing")
 }
 
-/// Apply a decided [`logic::Disposition`] to the cache and return the feed body to
-/// serve, or a terminal error. This is the write half of a fetch; the decision is
-/// made purely in [`logic::disposition`].
-fn apply_disposition(
-    url: &Url,
-    cache: &Cache,
-    now: Timestamp,
-    disposition: logic::Disposition,
-) -> Result<Vec<u8>, OpenringError> {
-    match disposition {
-        logic::Disposition::Store {
-            etag,
-            last_modified,
-            body,
-        } => {
-            if let Some(mut cv) = cache.get_mut(url) {
-                cv.etag = etag;
-                cv.last_modified = last_modified;
-                cv.body.clone_from(&body);
-                cv.timestamp = now;
-                // A fresh success invalidates any stale 429 retry window.
-                cv.retry_after = None;
-            } else {
-                cache.insert(
-                    url.clone(),
-                    CacheValue {
-                        timestamp: now,
-                        retry_after: None,
-                        etag,
-                        last_modified,
-                        body: body.clone(),
-                    },
-                );
-            }
-            body.ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string()))
-        }
-        logic::Disposition::Reuse {
-            etag,
-            last_modified,
-        } => cache
-            .get_mut(url)
-            .and_then(|mut cv| {
-                cv.timestamp = now;
-                // A 304 is a normal answer, so it ends any 429 retry window
-                // just as a 2xx does.
-                cv.retry_after = None;
-                // Absent headers leave the stored validators untouched.
-                if etag.is_some() {
-                    cv.etag = etag;
-                }
-                if last_modified.is_some() {
-                    cv.last_modified = last_modified;
-                }
-                cv.body.clone()
-            })
-            .ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string())),
-        logic::Disposition::RateLimited { retry_after } => cache
-            .get_mut(url)
-            .and_then(|mut cv| {
-                cv.timestamp = now;
-                cv.retry_after = Some(retry_after);
-                cv.body.clone()
-            })
-            .ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string())),
-        logic::Disposition::RateLimitedNoCache => {
-            Err(OpenringError::RateLimitError(url.as_str().to_string()))
-        }
-        logic::Disposition::Unexpected { status } => Err(OpenringError::UnexpectedStatusError {
-            url: url.as_str().to_string(),
-            status,
-        }),
+/// The Validators a response carries. The etag is normalized here.
+fn response_validators(resp: &Response) -> Validators {
+    Validators {
+        etag: resp.header("etag").map(normalize_etag),
+        last_modified: resp.header("last-modified").map(str::to_string),
     }
 }
 
@@ -242,28 +71,15 @@ pub(crate) async fn fetch_feed(
     cache: &Cache,
     now: Timestamp,
 ) -> Result<Feed, OpenringError> {
-    // Snapshot the entry by value so no DashMap guard is held across an await
-    // point; concurrent fetches share the map through a JoinSet.
-    let cached: Option<CacheValue> = cache.get(url).map(|e| e.value().clone());
-
-    // While a 429 retry window is open, serve the cached feed without a request.
-    // An open window with no cached body falls through and fetches.
-    if let Some(cv) = &cached
-        && logic::retry_after_gate_open(cv, now)
-    {
-        debug!(timestamp=%cv.timestamp, retry_after=?cv.retry_after, "skipping request due to 429, using feed from cache");
-        if let Some(feed_str) = &cv.body {
-            return Ok(parser::parse(feed_str.as_slice())?);
-        }
-        debug!(url=%url.as_str(), "retry window open but nothing cached; fetching anyway");
-    }
-
-    let validators = logic::conditional_headers(cached.as_ref());
+    let validators = match cache.plan(url, now) {
+        Plan::Serve(body) => return Ok(parser::parse(body.as_slice())?),
+        Plan::Request(validators) => validators,
+    };
     let mut headers = Vec::with_capacity(2);
-    if let Some(last_modified) = &validators.if_modified_since {
+    if let Some(last_modified) = &validators.last_modified {
         headers.push(("if-modified-since", last_modified.as_str()));
     }
-    if let Some(etag) = &validators.if_none_match {
+    if let Some(etag) = &validators.etag {
         headers.push(("if-none-match", etag.as_str()));
     }
     debug!(url=%url, ?headers, "sending request");
@@ -293,70 +109,56 @@ pub(crate) async fn fetch_feed(
         });
     }
 
-    // Pull the plain values the decision logic needs out of the response
-    // before reading the body consumes it. The etag is normalized here.
     let status = resp.status();
-    let etag = resp.header("etag").map(normalize_etag);
-    let last_modified = resp.header("last-modified").map(str::to_string);
-    let retry_after = resp.header("retry-after").map(str::to_string);
-    // Keep the raw bytes: pre-decoding to text re-encodes the transfer
-    // as UTF-8 while the XML prolog still declares the original charset,
-    // so the parser would decode non-UTF-8 feeds twice into mojibake.
-    let body = if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        // A transfer error mid-read fails the fetch with its cause and
-        // leaves the cache untouched.
-        Some(
-            resp.read_capped(MAX_FEED_BYTES)
-                .await
-                .map_err(|e| match e {
-                    ReadError::TooLarge { bytes } => OpenringError::FeedTooLargeError {
-                        url: url.as_str().to_string(),
-                        bytes,
-                    },
-                    ReadError::Transfer(e) => e.into(),
-                })?,
-        )
+    let outcome = if status == StatusCode::NOT_MODIFIED {
+        Outcome::NotModified(response_validators(&resp))
+    } else if status.is_success() {
+        let validators = response_validators(&resp);
+        // Keep the raw bytes: pre-decoding to text re-encodes the transfer
+        // as UTF-8 while the XML prolog still declares the original charset,
+        // so the parser would decode non-UTF-8 feeds twice into mojibake. A
+        // transfer error mid-read fails the fetch with its cause and leaves
+        // the cache untouched.
+        let body = resp
+            .read_capped(MAX_FEED_BYTES)
+            .await
+            .map_err(|e| match e {
+                ReadError::TooLarge { bytes } => OpenringError::FeedTooLargeError {
+                    url: url.as_str().to_string(),
+                    bytes,
+                },
+                ReadError::Transfer(e) => e.into(),
+            })?;
+        Outcome::Fresh { body, validators }
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        Outcome::RateLimited {
+            until: retry_deadline(resp.header("retry-after"), now),
+        }
     } else {
-        None
+        return Err(OpenringError::UnexpectedStatusError {
+            url: url.as_str().to_string(),
+            status: status.as_str().to_string(),
+        });
     };
-
-    let disposition = logic::disposition(
-        status,
-        etag.as_deref(),
-        last_modified.as_deref(),
-        body,
-        cached.is_some(),
-        retry_after.as_deref(),
-        now,
-    );
-    let feed_str = apply_disposition(url, cache, now, disposition)?;
-    Ok(parser::parse(feed_str.as_slice())?)
+    let body = cache.record(url, outcome, now)?;
+    Ok(parser::parse(body.as_slice())?)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use jiff::{Span, Timestamp, ToSpan};
+    use hegel::generators;
+    use jiff::{SignedDuration, Timestamp, ToSpan};
     use url::Url;
 
-    use hegel::extras::jiff as jiff_gs;
-    use hegel::generators;
+    use super::{DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES, fetch_feed, normalize_etag, retry_deadline};
+    use crate::{
+        cache::{Cache, Outcome, Plan, Validators},
+        error::OpenringError,
+        http::{Answer, Http, Request, StatusCode},
+    };
 
-    use crate::cache::{Cache, CacheValue, MAX_SPAN_SEC};
-    use crate::error::OpenringError;
-    use crate::http::{Answer, Http, Request, StatusCode};
-
-    use super::{MAX_FEED_BYTES, fetch_feed, logic, normalize_etag};
-
-    // Bounds for gate timestamps/spans. 50e9 seconds is ~1585 years past the
-    // epoch; a timestamp plus a span stays under jiff's Timestamp::MAX, while
-    // `now` (up to 200e9s) can still fall on either side of any deadline.
-    const GATE_SECONDS_MAX: i64 = 50_000_000_000;
-    const GATE_NOW_MAX: i64 = 200_000_000_000;
-
-    // A valid RSS 2.0 feed with a parameterized title, for the HTTP integration
-    // tests that need a body the parser will accept.
+    // A valid RSS 2.0 feed with a parameterized title, for the tests that
+    // need a body the parser will accept.
     fn get_valid_rss_feed(title: &str) -> String {
         format!(
             r#"
@@ -381,409 +183,205 @@ mod tests {
         )
     }
 
-    // retry_after only ever holds a time-only span (seconds, from parse_retry_after),
-    // so we generate seconds rather than jiff_gs::spans(), whose calendar-unit spans
-    // are outside this domain and would trip cache::spans_equal.
-    #[hegel::composite]
-    fn retry_spans(tc: &hegel::TestCase) -> Span {
-        let secs = tc.draw(generators::integers::<i64>());
-        // Clamp to the span jiff can represent (see cache::MAX_SPAN_SEC).
-        Span::new().seconds(secs.clamp(0, MAX_SPAN_SEC))
-    }
+    // Retry-After parsing.
 
-    #[hegel::composite]
-    fn cache_values(tc: &hegel::TestCase) -> CacheValue {
-        CacheValue {
-            timestamp: tc.draw(jiff_gs::timestamps()),
-            retry_after: tc.draw(generators::optional(retry_spans())),
-            last_modified: tc.draw(generators::optional(generators::text())),
-            etag: tc.draw(generators::optional(generators::text())),
-            // Arbitrary bytes, exercising the base64 round-trip fully.
-            body: tc.draw(generators::optional(
-                generators::vecs(generators::integers::<u8>()).max_size(64),
-            )),
-        }
-    }
-
-    // `parse_retry_after` accepts any header value without panicking.
+    // Whatever the header holds and whenever it arrives, the deadline is an
+    // instant, never a panic.
     #[hegel::test]
-    fn parse_retry_after_never_panics(tc: hegel::TestCase) {
+    fn retry_deadline_never_panics(tc: hegel::TestCase) {
         let header = tc.draw(generators::optional(generators::text()));
-        let now = tc.draw(jiff_gs::timestamps());
-        let _ = logic::parse_retry_after(header.as_deref(), now);
+        let now = tc.draw(hegel::extras::jiff::timestamps());
+        let _ = retry_deadline(header.as_deref(), now);
     }
 
-    // An integer header yields that many seconds, clamped to jiff's span range.
+    // An integer header waits that many seconds after now, stopping at the
+    // nearest instant jiff can represent.
     #[hegel::test]
-    fn parse_retry_after_clamps_integer_seconds(tc: hegel::TestCase) {
+    fn retry_deadline_counts_integer_seconds_from_now(tc: hegel::TestCase) {
         let secs = tc.draw(generators::integers::<i64>());
-        let now = tc.draw(jiff_gs::timestamps());
-        let span = logic::parse_retry_after(Some(&secs.to_string()), now);
-        assert_eq!(span.get_seconds(), secs.clamp(-MAX_SPAN_SEC, MAX_SPAN_SEC));
+        let now = tc.draw(hegel::extras::jiff::timestamps());
+        let deadline = retry_deadline(Some(&secs.to_string()), now);
+        // Nanoseconds, since `now` may fall between whole seconds.
+        let expected = now.as_nanosecond() + i128::from(secs) * 1_000_000_000;
+        let clamped = expected.clamp(
+            Timestamp::MIN.as_nanosecond(),
+            Timestamp::MAX.as_nanosecond(),
+        );
+        assert_eq!(deadline.as_nanosecond(), clamped);
     }
 
-    // Anything that is neither delta-seconds nor an HTTP-date falls back to
-    // 4 hours.
+    // Anything that is neither delta-seconds nor an HTTP-date waits the
+    // default four hours.
     #[hegel::test]
-    fn parse_retry_after_defaults_when_unparseable(tc: hegel::TestCase) {
+    fn retry_deadline_defaults_when_unparseable(tc: hegel::TestCase) {
         let header = tc.draw(generators::optional(generators::text()));
         tc.assume(
             header
                 .as_deref()
-                .and_then(|s| s.parse::<i64>().ok())
-                .is_none(),
+                .is_none_or(|s| s.parse::<i64>().is_err() && jiff::fmt::rfc2822::parse(s).is_err()),
         );
-        tc.assume(
-            header
-                .as_deref()
-                .is_none_or(|s| jiff::fmt::rfc2822::parse(s).is_err()),
+        // Far enough from both ends of jiff's range that four hours fit.
+        let now = Timestamp::from_second(
+            tc.draw(
+                generators::integers::<i64>()
+                    .min_value(0)
+                    .max_value(200_000_000_000),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            retry_deadline(header.as_deref(), now),
+            now + DEFAULT_RETRY_WINDOW
         );
-        let now = tc.draw(jiff_gs::timestamps());
-        let span = logic::parse_retry_after(header.as_deref(), now);
-        assert_eq!(span.fieldwise(), 4.hours().fieldwise());
     }
 
     // The IMF-fixdate form servers actually send, GMT zone and all.
     #[test]
-    fn parse_retry_after_accepts_imf_fixdate() {
+    fn retry_deadline_accepts_imf_fixdate() {
         let now: Timestamp = "2003-06-10T04:00:00Z".parse().unwrap();
-        let span = logic::parse_retry_after(Some("Tue, 10 Jun 2003 05:00:00 GMT"), now);
-        assert_eq!(span.get_seconds(), 3600);
-    }
-
-    // A date-form header yields exactly the seconds between now and the date,
-    // round-tripping through jiff's RFC 2822 printer. Past dates go negative.
-    #[hegel::test]
-    fn parse_retry_after_handles_http_dates(tc: hegel::TestCase) {
-        // Bounded integers rather than jiff_gs::timestamps(): RFC 2822 only
-        // prints four-digit positive years, so the native generator's full
-        // ±9999y range would reject about half its draws, and constructing
-        // the printable domain directly also gives an exact integer oracle.
-        let date_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(GATE_SECONDS_MAX),
-        );
-        let now_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(GATE_SECONDS_MAX),
-        );
-        let date = Timestamp::from_second(date_secs)
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::UTC);
-        let header = jiff::fmt::rfc2822::to_string(&date).unwrap();
-
-        let span =
-            logic::parse_retry_after(Some(&header), Timestamp::from_second(now_secs).unwrap());
-        assert_eq!(span.get_seconds(), date_secs - now_secs);
-    }
-
-    // The gate is open exactly when the retry deadline is still in the future.
-    // An independent integer-seconds computation is the oracle for jiff's
-    // Timestamp + Span arithmetic.
-    #[hegel::test]
-    fn gate_open_iff_deadline_after_now(tc: hegel::TestCase) {
-        let ts_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(GATE_SECONDS_MAX),
-        );
-        let retry_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(GATE_SECONDS_MAX),
-        );
-        let now_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(GATE_NOW_MAX),
-        );
-
-        let cv = CacheValue {
-            timestamp: Timestamp::from_second(ts_secs).unwrap(),
-            retry_after: Some(Span::new().seconds(retry_secs)),
-            last_modified: None,
-            etag: None,
-            body: None,
-        };
-        let now = Timestamp::from_second(now_secs).unwrap();
-
-        // Both bounded under GATE_SECONDS_MAX, so the i64 sum cannot overflow.
-        let deadline_secs = ts_secs + retry_secs;
         assert_eq!(
-            logic::retry_after_gate_open(&cv, now),
-            now_secs < deadline_secs
+            retry_deadline(Some("Tue, 10 Jun 2003 05:00:00 GMT"), now),
+            "2003-06-10T05:00:00Z".parse::<Timestamp>().unwrap()
         );
     }
 
-    // The gate must answer, never panic, for any entry a cache file can hold:
-    // the file is user-editable JSON, so timestamp + retry may overflow jiff's
-    // range or carry calendar units that cannot be added to a timestamp. The
-    // explicit boundary branches make the overflowing corner reachable.
+    // A date-form header names its own deadline, whenever now is. A date in
+    // the past closes the window at once.
     #[hegel::test]
-    fn gate_never_panics_for_any_cache_value(tc: hegel::TestCase) {
-        let mut cv = tc.draw(cache_values());
-        cv.timestamp = tc.draw(hegel::one_of!(
-            jiff_gs::timestamps(),
-            generators::just(Timestamp::MAX),
-            generators::just(Timestamp::MIN),
-        ));
-        cv.retry_after = tc.draw(generators::optional(hegel::one_of!(
-            jiff_gs::spans(),
-            generators::just(MAX_SPAN_SEC.seconds()),
-            generators::just(Span::new().years(1)),
-        )));
-        let now = tc.draw(jiff_gs::timestamps());
-        let _ = logic::retry_after_gate_open(&cv, now);
+    fn retry_deadline_is_the_http_date_itself(tc: hegel::TestCase) {
+        // RFC 2822 prints only four-digit positive years, so dates run from
+        // 1970 to the last whole second jiff can represent.
+        let date = Timestamp::from_second(
+            tc.draw(
+                generators::integers::<i64>()
+                    .min_value(0)
+                    .max_value(Timestamp::MAX.as_second()),
+            ),
+        )
+        .unwrap();
+        let now = tc.draw(hegel::extras::jiff::timestamps());
+        let header =
+            jiff::fmt::rfc2822::to_string(&date.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
+        assert_eq!(retry_deadline(Some(&header), now), date);
     }
 
-    // Without a retry_after window the gate is always closed.
+    // A server's etag compares equal however many times it passes through,
+    // so the If-None-Match sent back is exactly what the server issued.
     #[hegel::test]
-    fn gate_closed_without_retry_after(tc: hegel::TestCase) {
-        let mut cv = tc.draw(cache_values());
-        cv.retry_after = None;
-        let now = tc.draw(jiff_gs::timestamps());
-        assert!(!logic::retry_after_gate_open(&cv, now));
+    fn normalize_etag_quotes_once(tc: hegel::TestCase) {
+        let raw = tc.draw(generators::text());
+        let once = normalize_etag(&raw);
+        assert_eq!(normalize_etag(&once), once);
     }
 
-    // Conditional headers are exactly the cached etag and last-modified
-    // values when the entry has a body to serve, and absent otherwise.
-    #[hegel::test]
-    fn conditional_headers_project_cache_fields(tc: hegel::TestCase) {
-        let cv = tc.draw(generators::optional(cache_values()));
-        let headers = logic::conditional_headers(cv.as_ref());
-        let servable = cv.as_ref().filter(|c| c.body.is_some());
-        assert_eq!(
-            headers.if_modified_since,
-            servable.and_then(|c| c.last_modified.clone())
-        );
-        assert_eq!(headers.if_none_match, servable.and_then(|c| c.etag.clone()));
+    // Whole fetches against a nulled Http and a real cache: the request
+    // that goes out, and what each answer means for the next run.
+
+    const NOW: &str = "2026-01-01T00:00:00Z";
+
+    fn now() -> Timestamp {
+        NOW.parse().unwrap()
     }
-
-    // A 2xx response stores the response metadata verbatim and the body with
-    // the empty string collapsed to None.
-    #[hegel::test]
-    fn disposition_success_stores_response(tc: hegel::TestCase) {
-        let code = tc.draw(generators::integers::<u16>().min_value(200).max_value(299));
-        let status = StatusCode::from_u16(code).expect("2xx is valid");
-        let etag = tc.draw(generators::optional(generators::text()));
-        let last_modified = tc.draw(generators::optional(generators::text()));
-        let body = tc
-            .draw(generators::optional(generators::text()))
-            .map(String::into_bytes);
-        let had_cache_entry = tc.draw(generators::booleans());
-        let now = tc.draw(jiff_gs::timestamps());
-
-        let disp = logic::disposition(
-            status,
-            etag.as_deref(),
-            last_modified.as_deref(),
-            body.clone(),
-            had_cache_entry,
-            None,
-            now,
-        );
-        let logic::Disposition::Store {
-            etag: e,
-            last_modified: lm,
-            body: b,
-        } = disp
-        else {
-            panic!("expected Store, got {disp:?}");
-        };
-        assert_eq!(e, etag);
-        assert_eq!(lm, last_modified);
-        assert_eq!(b, body.filter(|s| !s.is_empty()));
-    }
-
-    // A 304 with a cache entry reuses it, carrying any rotated validators;
-    // with no entry it stores the response.
-    #[hegel::test]
-    fn disposition_not_modified_depends_on_cache(tc: hegel::TestCase) {
-        let etag = tc.draw(generators::optional(generators::text()));
-        let last_modified = tc.draw(generators::optional(generators::text()));
-        let body = tc
-            .draw(generators::optional(generators::text()))
-            .map(String::into_bytes);
-        let had_cache_entry = tc.draw(generators::booleans());
-        let now = tc.draw(jiff_gs::timestamps());
-        let disp = logic::disposition(
-            StatusCode::NOT_MODIFIED,
-            etag.as_deref(),
-            last_modified.as_deref(),
-            body.clone(),
-            had_cache_entry,
-            None,
-            now,
-        );
-        if had_cache_entry {
-            let logic::Disposition::Reuse {
-                etag: e,
-                last_modified: lm,
-            } = disp
-            else {
-                panic!("expected Reuse, got {disp:?}");
-            };
-            assert_eq!(e, etag);
-            assert_eq!(lm, last_modified);
-        } else {
-            let logic::Disposition::Store { body: b, .. } = disp else {
-                panic!("expected Store, got {disp:?}");
-            };
-            assert_eq!(b, body.filter(|s| !s.is_empty()));
-        }
-    }
-
-    // A 429 with a cache entry records a retry window matching the standalone
-    // parser; with no entry it is a terminal rate-limit decision.
-    #[hegel::test]
-    fn disposition_too_many_requests_depends_on_cache(tc: hegel::TestCase) {
-        let retry_after = tc.draw(generators::optional(generators::text()));
-        let had_cache_entry = tc.draw(generators::booleans());
-        let now = tc.draw(jiff_gs::timestamps());
-        let disp = logic::disposition(
-            StatusCode::TOO_MANY_REQUESTS,
-            None,
-            None,
-            None,
-            had_cache_entry,
-            retry_after.as_deref(),
-            now,
-        );
-        if had_cache_entry {
-            let logic::Disposition::RateLimited { retry_after: span } = disp else {
-                panic!("expected RateLimited, got {disp:?}");
-            };
-            assert_eq!(
-                span.fieldwise(),
-                logic::parse_retry_after(retry_after.as_deref(), now).fieldwise()
-            );
-        } else {
-            assert!(matches!(disp, logic::Disposition::RateLimitedNoCache));
-        }
-    }
-
-    // Any status that is not 2xx, 304, or 429 is an unexpected-status decision
-    // carrying the numeric status code.
-    #[hegel::test]
-    fn disposition_other_status_is_unexpected(tc: hegel::TestCase) {
-        let code = tc.draw(generators::integers::<u16>().min_value(100).max_value(599));
-        tc.assume(!(200..=299).contains(&code) && code != 304 && code != 429);
-        let status = StatusCode::from_u16(code).expect("100..=599 is valid");
-        let had_cache_entry = tc.draw(generators::booleans());
-        let now = tc.draw(jiff_gs::timestamps());
-
-        let disp = logic::disposition(status, None, None, None, had_cache_entry, None, now);
-        let logic::Disposition::Unexpected { status: s } = disp else {
-            panic!("expected Unexpected, got {disp:?}");
-        };
-        assert_eq!(s, status.as_str());
-    }
-
-    // The remaining tests run a whole fetch against a nulled Http: the
-    // request that goes out, and what each answer does to the cache.
 
     fn feed_url() -> Url {
         Url::parse("https://feed.example/feed.xml").unwrap()
     }
 
-    fn cached_entry(body: Option<&str>) -> CacheValue {
-        CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: None,
-            etag: None,
-            body: body.map(|b| get_valid_rss_feed(b).into_bytes()),
+    fn validators(etag: Option<&str>, last_modified: Option<&str>) -> Validators {
+        Validators {
+            etag: etag.map(str::to_string),
+            last_modified: last_modified.map(str::to_string),
         }
+    }
+
+    // A cache that already holds a feed titled `title` from an earlier run.
+    fn cache_holding(title: &str, validators: Validators, at: Timestamp) -> Cache {
+        let cache = Cache::default();
+        cache
+            .record(
+                &feed_url(),
+                Outcome::Fresh {
+                    body: get_valid_rss_feed(title).into_bytes(),
+                    validators,
+                },
+                at,
+            )
+            .unwrap();
+        cache
     }
 
     fn title(feed: &feed_rs::model::Feed) -> &str {
         &feed.title.as_ref().expect("feed has a title").content
     }
 
-    #[tokio::test]
-    async fn sends_conditional_headers_and_reuses_on_304() {
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::status(304))]);
-        let requests = http.track_requests();
-        let cache = Arc::new(Cache::new());
-        let etag = normalize_etag("abc123");
-        let last_modified = "Mon, 01 Jan 2024 00:00:00 GMT".to_string();
-        cache.insert(
-            url.clone(),
-            CacheValue {
-                last_modified: Some(last_modified.clone()),
-                etag: Some(etag.clone()),
-                ..cached_entry(Some("cached"))
-            },
-        );
+    fn request(headers: &[(&'static str, &str)]) -> Request {
+        Request {
+            url: feed_url(),
+            headers: headers
+                .iter()
+                .map(|&(name, value)| (name, value.to_string()))
+                .collect(),
+        }
+    }
 
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
+    #[tokio::test]
+    async fn sends_validators_and_serves_the_cache_on_304() {
+        let cache = cache_holding(
+            "cached",
+            validators(Some("\"abc123\""), Some("Mon, 01 Jan 2024 00:00:00 GMT")),
+            now(),
+        );
+        let http = Http::create_null([(feed_url(), Answer::status(304))]);
+        let requests = http.track_requests();
+
+        let feed = fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("served cache on 304");
         assert_eq!(title(&feed), "cached");
         assert_eq!(
             requests.data(),
-            [Request {
-                url,
-                headers: vec![
-                    ("if-modified-since", last_modified),
-                    ("if-none-match", etag)
-                ],
-            }]
+            [request(&[
+                ("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT"),
+                ("if-none-match", "\"abc123\"")
+            ])]
         );
     }
 
     #[tokio::test]
-    async fn refreshes_validators_from_304_headers() {
-        let url = feed_url();
-        let new_etag = normalize_etag("new");
+    async fn a_304_rotates_the_validators_for_the_next_run() {
+        let cache = cache_holding("cached", validators(Some("\"old\""), None), now());
         // RFC 7232 allows a 304 to rotate the validators it confirms.
-        let http =
-            Http::create_null([(url.clone(), Answer::status(304).header("etag", &new_etag))]);
-        let cache = Arc::new(Cache::new());
-        cache.insert(
-            url.clone(),
-            CacheValue {
-                etag: Some(normalize_etag("old")),
-                ..cached_entry(Some("cached"))
-            },
-        );
+        let http = Http::create_null([(feed_url(), Answer::status(304).header("etag", "\"new\""))]);
 
-        fetch_feed(&url, &http, &cache, Timestamp::now())
+        fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("served cache on 304");
-        // The next run must validate against the rotated etag, or the server
-        // will answer with a full 200 every time.
         assert_eq!(
-            cache.get(&url).expect("entry present").etag.as_deref(),
-            Some(new_etag.as_str())
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(Some("\"new\""), None))
         );
     }
 
     #[tokio::test]
     async fn a_304_after_an_expired_retry_window_does_not_reopen_it() {
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::status(304))]);
+        let t0 = now();
+        let cache = cache_holding("cached", validators(Some("\"v1\""), None), t0);
+        cache
+            .record(
+                &feed_url(),
+                Outcome::RateLimited {
+                    until: t0 + 1.hour(),
+                },
+                t0,
+            )
+            .unwrap();
+        let http = Http::create_null([(feed_url(), Answer::status(304))]);
         let requests = http.track_requests();
-        let cache = Arc::new(Cache::new());
-        // An earlier 429 opened a one-hour window two hours ago, so it has
-        // already closed.
-        cache.insert(
-            url.clone(),
-            CacheValue {
-                timestamp: Timestamp::now() - 2.hours(),
-                retry_after: Some(1.hour()),
-                etag: Some(normalize_etag("cached")),
-                ..cached_entry(Some("cached"))
-            },
-        );
 
-        for run in ["first", "second"] {
-            fetch_feed(&url, &http, &cache, Timestamp::now())
+        for run in [t0 + 2.hours(), t0 + 2.hours() + 1.second()] {
+            fetch_feed(&feed_url(), &http, &cache, run)
                 .await
-                .unwrap_or_else(|e| panic!("{run} run served cache on 304: {e}"));
+                .unwrap_or_else(|e| panic!("run at {run} served cache on 304: {e}"));
         }
         // Two runs, two requests: a 304 ends the rate limit just as a 200
         // does, so the second run must ask the server again.
@@ -791,25 +389,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_etag_and_last_modified_on_200() {
-        let url = feed_url();
-        let last_modified = "Mon, 01 Jan 2024 00:00:00 GMT";
+    async fn a_200_stores_its_validators_for_the_next_run() {
         let http = Http::create_null([(
-            url.clone(),
+            feed_url(),
             Answer::ok(get_valid_rss_feed("fresh"))
                 .header("etag", "feed-etag")
-                .header("last-modified", last_modified),
+                .header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
         )]);
-        let cache = Arc::new(Cache::new());
+        let cache = Cache::default();
 
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
+        let feed = fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("fetched fresh feed");
         assert_eq!(title(&feed), "fresh");
-
-        let entry = cache.get(&url).expect("cached after 200");
-        assert_eq!(entry.etag.as_deref(), Some("\"feed-etag\""));
-        assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(
+                Some("\"feed-etag\""),
+                Some("Mon, 01 Jan 2024 00:00:00 GMT")
+            ))
+        );
     }
 
     #[tokio::test]
@@ -824,228 +423,231 @@ mod tests {
         body.extend_from_slice(
             br"</title><link>https://x.example/</link><description>d</description></channel></rss>",
         );
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::ok(body))]);
-        let cache = Arc::new(Cache::new());
+        let http = Http::create_null([(feed_url(), vec![Answer::ok(body), Answer::status(304)])]);
+        let cache = Cache::default();
 
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
+        let feed = fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("parsed latin-1 feed");
         assert_eq!(title(&feed), "caf\u{e9}");
 
-        // The cached bytes must reparse identically (e.g. on a later 304).
-        let cached = cache.get(&url).expect("cached").body.clone().unwrap();
-        let reparsed = feed_rs::parser::parse(cached.as_slice()).expect("cache reparses");
-        assert_eq!(title(&reparsed), "caf\u{e9}");
+        // The cached bytes must reparse identically on a later 304.
+        let again = fetch_feed(&feed_url(), &http, &cache, now())
+            .await
+            .expect("served cache on 304");
+        assert_eq!(title(&again), "caf\u{e9}");
     }
 
     #[tokio::test]
-    async fn streamed_bodies_past_the_cap_are_rejected() {
+    async fn streamed_bodies_past_the_cap_are_rejected_and_not_cached() {
         // No Content-Length, the shape a chunked or compressed transfer
         // takes. The header check cannot see these; only the read cap can.
-        let url = feed_url();
         let http = Http::create_null([(
-            url.clone(),
+            feed_url(),
             Answer::status(200)
                 .chunks(vec![vec![b'x'; MAX_FEED_BYTES], vec![b'x']])
                 .chunked(),
         )]);
-        let cache = Arc::new(Cache::new());
+        let cache = Cache::default();
 
-        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::FeedTooLargeError { bytes, .. })
                 if bytes == u64::try_from(MAX_FEED_BYTES).unwrap() + 1
         ));
-        assert!(!cache.contains_key(&url));
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(Validators::default())
+        );
     }
 
     #[tokio::test]
     async fn oversized_feeds_are_rejected_by_their_announced_length() {
         // A urls-file typo that points at a video or other huge file.
-        let url = feed_url();
         let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
         let http = Http::create_null([(
-            url.clone(),
-            Answer::ok(get_valid_rss_feed("huge")).content_length(announced),
+            feed_url(),
+            Answer::ok(get_valid_rss_feed("huge"))
+                .header("etag", "\"huge\"")
+                .content_length(announced),
         )]);
-        let cache = Arc::new(Cache::new());
+        let cache = Cache::default();
 
-        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::FeedTooLargeError { bytes, .. }) if bytes == announced
         ));
         // Nothing that big belongs in the cache either.
-        assert!(!cache.contains_key(&url));
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(Validators::default())
+        );
     }
 
     #[tokio::test]
     async fn a_failed_request_is_an_error_and_leaves_the_cache_alone() {
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::send_error("connection refused"))]);
-        let cache = Arc::new(Cache::new());
-        cache.insert(url.clone(), cached_entry(Some("cached")));
-        let before = cache.get(&url).unwrap().clone();
+        let cache = cache_holding("cached", validators(Some("\"v1\""), None), now());
+        let http = Http::create_null([(feed_url(), Answer::send_error("connection refused"))]);
 
-        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(
             matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection refused"),
             "{res:?}"
         );
-        assert_eq!(*cache.get(&url).unwrap(), before);
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(Some("\"v1\""), None))
+        );
     }
 
     #[tokio::test]
     async fn a_body_that_stops_arriving_is_an_error_and_leaves_the_cache_alone() {
-        let url = feed_url();
+        let cache = cache_holding("cached", validators(Some("\"v1\""), None), now());
         let http = Http::create_null([(
-            url.clone(),
-            Answer::ok(get_valid_rss_feed("partial")).transfer_error("connection reset"),
+            feed_url(),
+            Answer::ok(get_valid_rss_feed("partial"))
+                .header("etag", "\"v2\"")
+                .transfer_error("connection reset"),
         )]);
-        let cache = Arc::new(Cache::new());
-        cache.insert(url.clone(), cached_entry(Some("cached")));
-        let before = cache.get(&url).unwrap().clone();
 
-        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(
             matches!(&res, Err(OpenringError::HttpError(e)) if e.to_string() == "connection reset"),
             "{res:?}"
         );
-        assert_eq!(*cache.get(&url).unwrap(), before);
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(Some("\"v1\""), None))
+        );
     }
 
     #[tokio::test]
-    async fn empty_body_is_not_cached_as_servable() {
+    async fn an_empty_body_is_not_cached_as_servable() {
         // A misbehaving feed: 200 with an etag but a completely empty body.
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::ok("").header("etag", "\"empty\""))]);
+        let http = Http::create_null([(feed_url(), Answer::ok("").header("etag", "\"empty\""))]);
         let requests = http.track_requests();
-        let cache = Arc::new(Cache::new());
+        let cache = Cache::default();
 
-        let first = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let first = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(first, Err(OpenringError::EmptyFeedError(_))));
 
         // The cached entry must not pretend to have something to serve. If it
         // did, the next fetch would send If-None-Match, the server would say
         // 304, and the run would serve the empty body until the entry aged
         // out of the cache.
-        let second = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let second = fetch_feed(&feed_url(), &http, &cache, now()).await;
         assert!(matches!(second, Err(OpenringError::EmptyFeedError(_))));
-        let unconditional = Request {
-            url,
-            headers: vec![],
-        };
         assert_eq!(
             requests.data(),
-            [unconditional.clone(), unconditional],
+            [request(&[]), request(&[])],
             "second fetch sent a conditional request with nothing to serve"
         );
     }
 
     #[tokio::test]
-    async fn refetches_unconditionally_when_cached_entry_has_no_body() {
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::ok(get_valid_rss_feed("fresh")))]);
-        let requests = http.track_requests();
-        let cache = Arc::new(Cache::new());
-        // What a 200 whose body read failed leaves behind: metadata, no body.
-        // A 304 to a conditional request would leave nothing to serve.
-        cache.insert(
-            url.clone(),
-            CacheValue {
-                etag: Some(normalize_etag("abc123")),
-                ..cached_entry(None)
-            },
-        );
+    async fn a_429_serves_the_cache_until_its_retry_after_passes() {
+        let cache = cache_holding("rate-limited", Validators::default(), now());
+        let http =
+            Http::create_null([(feed_url(), Answer::status(429).header("retry-after", "120"))]);
 
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
-            .await
-            .expect("refetched the feed");
-        assert_eq!(title(&feed), "fresh");
-        assert_eq!(
-            requests.data(),
-            [Request {
-                url: url.clone(),
-                headers: vec![],
-            }]
-        );
-        // The fresh body must now be cached for the next run.
-        assert!(cache.get(&url).expect("entry present").body.is_some());
-    }
-
-    #[tokio::test]
-    async fn rate_limited_serves_cache_and_records_retry_after() {
-        let url = feed_url();
-        let http = Http::create_null([(
-            url.clone(),
-            Answer::status(429).header("retry-after", "120"),
-        )]);
-        let cache = Arc::new(Cache::new());
-        cache.insert(url.clone(), cached_entry(Some("rate-limited")));
-
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
+        let feed = fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("served cache on 429");
         assert_eq!(title(&feed), "rate-limited");
-        let entry = cache.get(&url).expect("entry present");
-        assert_eq!(entry.retry_after.unwrap().get_seconds(), 120);
+        assert!(matches!(
+            cache.plan(&feed_url(), now() + 119.seconds()),
+            Plan::Serve(_)
+        ));
+        assert!(matches!(
+            cache.plan(&feed_url(), now() + 120.seconds()),
+            Plan::Request(_)
+        ));
     }
 
     #[tokio::test]
-    async fn follows_redirects_and_caches_under_the_requested_url() {
-        let url = feed_url();
+    async fn a_429_with_an_http_date_waits_until_that_date() {
+        // RFC 9110 allows Retry-After to be an HTTP-date as well as seconds.
+        let until = now() + 600.seconds();
+        let header =
+            jiff::fmt::rfc2822::to_string(&until.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
+        let cache = cache_holding("rate-limited", Validators::default(), now());
+        let http = Http::create_null([(
+            feed_url(),
+            Answer::status(429).header("retry-after", &header),
+        )]);
+
+        fetch_feed(&feed_url(), &http, &cache, now())
+            .await
+            .expect("served cache on 429");
+        assert!(matches!(
+            cache.plan(&feed_url(), until - SignedDuration::from_secs(1)),
+            Plan::Serve(_)
+        ));
+        assert!(matches!(cache.plan(&feed_url(), until), Plan::Request(_)));
+    }
+
+    #[tokio::test]
+    async fn an_open_retry_window_serves_the_cache_without_a_request() {
+        let cache = cache_holding("cached", Validators::default(), now());
+        cache
+            .record(
+                &feed_url(),
+                Outcome::RateLimited {
+                    until: now() + 1.hour(),
+                },
+                now(),
+            )
+            .unwrap();
+        let http = Http::create_null::<Answer>([]);
+        let requests = http.track_requests();
+
+        let feed = fetch_feed(&feed_url(), &http, &cache, now() + 30.minutes())
+            .await
+            .expect("served the cache");
+        assert_eq!(title(&feed), "cached");
+        assert_eq!(requests.data(), []);
+    }
+
+    #[tokio::test]
+    async fn a_429_for_an_unknown_feed_is_a_rate_limit_error() {
+        let http = Http::create_null([(feed_url(), Answer::status(429))]);
+        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
+        assert!(matches!(res, Err(OpenringError::RateLimitError(_))));
+    }
+
+    #[tokio::test]
+    async fn a_redirected_feed_stays_cached_under_the_requested_url() {
         let moved = Url::parse("https://feed.example/new.xml").unwrap();
         let http = Http::create_null([(
-            url.clone(),
-            Answer::ok(get_valid_rss_feed("moved")).redirected_to(moved.clone()),
+            feed_url(),
+            Answer::ok(get_valid_rss_feed("moved"))
+                .header("etag", "\"v1\"")
+                .redirected_to(moved.clone()),
         )]);
-        let cache = Arc::new(Cache::new());
+        let cache = Cache::default();
 
-        let feed = fetch_feed(&url, &http, &cache, Timestamp::now())
+        let feed = fetch_feed(&feed_url(), &http, &cache, now())
             .await
             .expect("followed the redirect");
         assert_eq!(title(&feed), "moved");
         // The cache stays keyed by the URL the user configured, so later runs
         // still find their entry.
-        assert!(cache.contains_key(&url));
-        assert!(!cache.contains_key(&moved));
-    }
-
-    #[tokio::test]
-    async fn rate_limited_with_http_date_records_window() {
-        // RFC 9110 allows Retry-After to be an HTTP-date as well as seconds.
-        let date = (Timestamp::now() + 600.seconds()).to_zoned(jiff::tz::TimeZone::UTC);
-        let header = jiff::fmt::rfc2822::to_string(&date).unwrap();
-        let url = feed_url();
-        let http = Http::create_null([(
-            url.clone(),
-            Answer::status(429).header("retry-after", &header),
-        )]);
-        let cache = Arc::new(Cache::new());
-        cache.insert(url.clone(), cached_entry(Some("rate-limited")));
-
-        fetch_feed(&url, &http, &cache, Timestamp::now())
-            .await
-            .expect("served cache on 429");
-        // The recorded window is the time until the given date, allowing for
-        // the seconds the test itself takes, not the 4h unparseable default.
-        let secs = cache
-            .get(&url)
-            .expect("entry present")
-            .retry_after
-            .expect("window recorded")
-            .get_seconds();
-        assert!((540..=600).contains(&secs), "recorded window: {secs}s");
+        assert_eq!(
+            cache.plan(&feed_url(), now()),
+            Plan::Request(validators(Some("\"v1\""), None))
+        );
+        assert_eq!(
+            cache.plan(&moved, now()),
+            Plan::Request(Validators::default())
+        );
     }
 
     #[tokio::test]
     async fn unexpected_status_is_an_error() {
-        let url = feed_url();
-        let http = Http::create_null([(url.clone(), Answer::status(500))]);
-        let cache = Arc::new(Cache::new());
-        let res = fetch_feed(&url, &http, &cache, Timestamp::now()).await;
+        let http = Http::create_null([(feed_url(), Answer::status(500))]);
+        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
         assert!(matches!(
             res,
             Err(OpenringError::UnexpectedStatusError { status, .. })

@@ -1,756 +1,645 @@
+//! The feed cache module: what openring remembers about each Feed between
+//! runs, and every rule about that memory. It decides when a request is
+//! skipped because a Retry window is open, which Validators a request
+//! carries, how each answer changes what is stored, when an entry is too old
+//! to keep, and how the whole cache lives on disk.
+//!
+//! Callers ask two questions. Before a fetch, [`Cache::plan`] says whether
+//! to serve the cached Feed or send a request, and with which Validators.
+//! After the server answers, [`Cache::record`] takes the [`Outcome`] and
+//! returns the body to parse. Neither question touches HTTP, so tests replay
+//! whole sequences of outcomes against a stopped clock.
+
 use std::{
-    cmp::Ordering,
-    fs,
-    io::{BufReader, BufWriter, Write},
+    io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use dashmap::DashMap;
 use directories::ProjectDirs;
-use jiff::{Span, Timestamp, ToSpan};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
-use crate::{args::Args, error::Result};
+use crate::{error::OpenringError, fs::Fs};
 
-pub(crate) const MAX_SPAN_SEC: i64 = 631_107_417_600;
+/// A Feed's raw document, shared rather than copied between the cache and
+/// the fetch that serves it. It stays bytes, not text: the feed parser must
+/// see the original encoding, since a latin-1 feed pre-decoded to UTF-8
+/// turns to mojibake when the parser honors the XML prolog.
+pub(crate) type Body = Arc<Vec<u8>>;
 
-/// Options for loading cache
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum CachePath<'a> {
-    Default,
-    // Only tests construct Path, so the variant is dead in non-test builds.
-    #[cfg_attr(not(test), expect(dead_code))]
-    Path(&'a Path),
+/// The `ETag` and `Last-Modified` values a server sent with a Feed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Validators {
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
 }
 
-/// Describes a feed fetch result that can be serialized to disk
+/// What to do about a Feed before fetching it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// A Retry window is open: serve this cached body and send nothing.
+    Serve(Body),
+    /// Send a request carrying these Validators. They are empty when the
+    /// cache holds no body to fall back on, because a "not modified" answer
+    /// would then leave nothing to serve.
+    Request(Validators),
+}
+
+/// What the server said about a Feed.
+#[derive(Debug, Clone)]
+pub(crate) enum Outcome {
+    /// A new body, with the Validators that came with it.
+    Fresh {
+        body: Vec<u8>,
+        validators: Validators,
+    },
+    /// The body has not changed. The server may still send new Validators.
+    NotModified(Validators),
+    /// Too many requests: ask again no sooner than `until`.
+    RateLimited { until: Timestamp },
+}
+
+/// What the cache holds for one Feed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct CacheValue {
-    pub(crate) timestamp: Timestamp,
-    pub(crate) retry_after: Option<Span>,
-    pub(crate) last_modified: Option<String>,
-    pub(crate) etag: Option<String>,
-    /// The raw transfer bytes, not text: the feed parser must see the
-    /// original encoding, since a latin-1 feed pre-decoded to UTF-8 turns to
-    /// mojibake when the parser honors the XML prolog.
+struct Entry {
+    /// When the server last answered. Entries older than the maximum cache
+    /// age are dropped on load.
+    fetched_at: Timestamp,
+    /// The end of the Retry window, if one is open or was.
+    retry_until: Option<Timestamp>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    /// `None` when the server never sent a body worth serving.
     #[serde(with = "body_base64")]
-    pub(crate) body: Option<Vec<u8>>,
+    body: Option<Body>,
 }
 
 /// Serialize the body as base64: `serde_json` would otherwise render a byte
-/// vector as an integer array, one element per byte. Caches written by
-/// versions that stored the body as plain text fail to decode and are
-/// discarded wholesale by `load_cache`, which is the intended migration.
+/// vector as an integer array, one element per byte.
 mod body_base64 {
+    use std::sync::Arc;
+
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     // serde's `with` contract passes the field by reference, so the
-    // idiomatic Option<&Vec<u8>> is not an option here.
+    // idiomatic Option<&Body> is not an option here.
     #[expect(clippy::ref_option)]
-    pub(crate) fn serialize<S: Serializer>(
-        body: &Option<Vec<u8>>,
+    pub(super) fn serialize<S: Serializer>(
+        body: &Option<super::Body>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         body.as_ref()
-            .map(|bytes| STANDARD.encode(bytes))
+            .map(|bytes| STANDARD.encode(bytes.as_slice()))
             .serialize(serializer)
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    /// An empty body decodes as no body, as [`super::Cache::record`] stores
+    /// it, so a hand-edited file cannot make an empty feed servable.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
+    ) -> Result<Option<super::Body>, D::Error> {
         let encoded: Option<String> = Option::deserialize(deserializer)?;
-        encoded
+        let decoded = encoded
             .map(|s| STANDARD.decode(s).map_err(serde::de::Error::custom))
-            .transpose()
+            .transpose()?;
+        Ok(decoded.filter(|b| !b.is_empty()).map(Arc::new))
     }
 }
 
-/// Get the path to cache location.
-fn get_cache_path() -> Option<PathBuf> {
-    if let Some(proj_dirs) = ProjectDirs::from("dev", "hsiao", "openring") {
-        return Some(proj_dirs.cache_dir().join("cache.json"));
+/// Every Feed the cache remembers. Clones share the same entries, so
+/// concurrent fetches can each hold one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cache {
+    entries: Arc<DashMap<Url, Entry>>,
+}
+
+impl Cache {
+    /// Where the cache lives by default, if the platform has a cache
+    /// directory.
+    pub(crate) fn default_path() -> Option<PathBuf> {
+        ProjectDirs::from("dev", "hsiao", "openring")
+            .map(|dirs| dirs.cache_dir().join("cache.json"))
     }
-    None
-}
 
-fn spans_equal(a: &Span, b: &Span) -> bool {
-    // The spans we generate contain only time units, so `compare` never
-    // needs a relative datetime and cannot error.
-    a.compare(b)
-        .expect("time‑only spans never require a relative datetime")
-        == Ordering::Equal
-}
-
-impl PartialEq for CacheValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp == other.timestamp
-            && self.last_modified == other.last_modified
-            && self.etag == other.etag
-            && self.body == other.body
-            && match (&self.retry_after, &other.retry_after) {
-                (Some(a), Some(b)) => spans_equal(a, b),
-                (None, None) => true,
-                _ => false,
+    /// Load the cache saved at `path`, dropping entries whose server last
+    /// answered `max_age` or longer before `now`.
+    ///
+    /// The cache is purely an optimization, so this never fails. A missing
+    /// file starts an empty cache quietly. An unreadable or undecodable file
+    /// starts an empty cache with a warning. That includes caches written by
+    /// older versions in another format, which is the intended migration.
+    pub(crate) fn load(fs: &Fs, path: &Path, max_age: Duration, now: Timestamp) -> Self {
+        let text = match fs.read_locked(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "no cache yet; starting empty");
+                return Self::default();
             }
-    }
-}
-impl Eq for CacheValue {}
-
-pub(crate) type Cache = DashMap<Url, CacheValue>;
-
-pub(crate) trait StoreExt {
-    /// Store the cache under the given path. Update access timestamps
-    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()>;
-
-    /// Load cache from path. Discard entries older than `max_age_secs`
-    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64, now: Timestamp) -> Result<Cache>;
-}
-
-impl StoreExt for Cache {
-    fn store<T: AsRef<Path>>(&self, path: T) -> Result<()> {
-        // Ensure the parent directory exists
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            Err(e) => {
+                warn!("Error while loading cache: {e}. Continuing without.");
+                return Self::default();
+            }
+        };
+        let entries: DashMap<Url, Entry> = match serde_json::from_str(&text) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!("Error while loading cache: {e}. Continuing without.");
+                return Self::default();
+            }
+        };
+        // A maximum age too large for jiff to subtract keeps every entry.
+        if let Some(cutoff) = SignedDuration::try_from(max_age)
+            .ok()
+            .and_then(|age| now.checked_sub(age).ok())
+        {
+            entries.retain(|_, entry| entry.fetched_at > cutoff);
         }
-        // Open without truncating: the file may only be emptied after the
-        // exclusive lock is held, or concurrent readers holding the shared
-        // lock would see their data vanish mid-read.
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        f.lock()?;
-        f.set_len(0)?;
-        let mut w = BufWriter::new(f);
-        serde_json::to_writer_pretty(&mut w, self)?;
-        // BufWriter's Drop swallows write errors; flush so they surface.
-        w.flush()?;
-        Ok(())
-    }
-
-    fn load<T: AsRef<Path>>(path: T, max_age_secs: u64, now: Timestamp) -> Result<Cache> {
-        let clamped_secs: i64 = max_age_secs.min(MAX_SPAN_SEC as u64).cast_signed();
-
-        let f = fs::File::open(path)?;
-
-        // Acquire a shared lock so multiple readers can coexist, but no writers
-        f.lock_shared()?;
-
-        let r = BufReader::new(f);
-
-        let map: DashMap<Url, CacheValue> = serde_json::from_reader(r)?;
-
-        // Remove entries older than max_age_secs
-        let current_ts = now;
-        let threshold = clamped_secs.seconds();
-        let keys_to_remove: Vec<Url> = map
-            .iter()
-            .filter_map(|entry| {
-                let v = entry.value();
-                if (current_ts - v.timestamp).compare(threshold).ok()? == std::cmp::Ordering::Less {
-                    None
-                } else {
-                    Some(entry.key().clone())
-                }
-            })
-            .collect();
-
-        for k in keys_to_remove {
-            map.remove(&k);
+        Self {
+            entries: Arc::new(entries),
         }
+    }
 
-        Ok(map)
-    }
-}
-/// Persist the cache, best-effort.
-///
-/// The cache is purely an optimization, so a failed write (read-only cache
-/// dir, full disk) only logs a warning; failing the run here would throw away
-/// an entire round of fetches right before the output is rendered.
-pub(crate) fn store_cache(cache: &Cache, no_cache: bool, cache_path: CachePath) {
-    if no_cache {
-        return;
-    }
-    let path = match cache_path {
-        CachePath::Default => {
-            let Some(path) = get_cache_path() else { return };
-            path
+    /// Save the cache to `path`, best-effort.
+    ///
+    /// A failed write (read-only cache directory, full disk) only logs a
+    /// warning: failing the run here would throw away a whole round of
+    /// fetches right before the output is rendered.
+    pub(crate) fn save(&self, fs: &Fs, path: &Path) {
+        let result = fs.write_locked(path, |w| {
+            serde_json::to_writer_pretty(w, &*self.entries).map_err(io::Error::other)
+        });
+        if let Err(e) = result {
+            warn!("Error while storing cache: {e}. Continuing without.");
         }
-        CachePath::Path(p) => p.to_path_buf(),
-    };
-    if let Err(e) = cache.store(path) {
-        warn!("Error while storing cache: {e}. Continuing without.");
     }
-}
 
-/// Load cache (if exists and is still valid).
-///
-/// This returns an `Option` as starting without a cache is a common scenario
-/// and we silently discard errors on purpose.
-pub(crate) fn load_cache(args: &Args, cache_path: CachePath) -> Option<Cache> {
-    if args.no_cache {
-        return None;
-    }
-    let default_cache_path = get_cache_path();
-    let cache_path = match cache_path {
-        CachePath::Default if default_cache_path.is_none() => return None,
-        CachePath::Default => default_cache_path.unwrap(),
-        CachePath::Path(p) => p.to_path_buf(),
-    };
-
-    // Discard entire cache if it hasn't been updated since `max_cache_age`.
-    // This is an optimization, which avoids iterating over the file and
-    // checking the age of each entry.
-    match fs::metadata(&cache_path) {
-        Err(_e) => {
-            // No cache found; silently start with empty cache
-            return None;
+    /// What to do about the Feed at `url` before fetching it at `now`.
+    pub(crate) fn plan(&self, url: &Url, now: Timestamp) -> Plan {
+        let Some(entry) = self.entries.get(url) else {
+            return Plan::Request(Validators::default());
+        };
+        match &entry.body {
+            Some(body) if entry.retry_until.is_some_and(|until| until > now) => {
+                debug!(url = url.as_str(), retry_until = ?entry.retry_until, "retry window open; serving the cached feed");
+                Plan::Serve(Arc::clone(body))
+            }
+            Some(_) => Plan::Request(Validators {
+                etag: entry.etag.clone(),
+                last_modified: entry.last_modified.clone(),
+            }),
+            // An open window with nothing cached still fetches.
+            None => Plan::Request(Validators::default()),
         }
-        Ok(metadata) => {
-            let modified = metadata.modified().ok()?;
-            let elapsed = modified.elapsed().ok()?;
-            if elapsed > args.max_cache_age {
-                warn!(
-                    "Cache is too old (age: {:#?}, max age: {:#?}). Discarding and recreating.",
-                    Duration::from_secs(elapsed.as_secs()),
-                    Duration::from_secs(args.max_cache_age.as_secs())
+    }
+
+    /// Record what the server said about the Feed at `url` at `now`, and
+    /// return the body to parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenringError::EmptyFeedError`] when there is no body to
+    /// serve, and [`OpenringError::RateLimitError`] when the server is rate
+    /// limiting a Feed the cache knows nothing about.
+    pub(crate) fn record(
+        &self,
+        url: &Url,
+        outcome: Outcome,
+        now: Timestamp,
+    ) -> Result<Body, OpenringError> {
+        let empty = || OpenringError::EmptyFeedError(url.as_str().to_string());
+        match outcome {
+            Outcome::Fresh { body, validators } => {
+                // An empty body counts as no body. Caching it as servable
+                // would make later runs send conditional requests, get "not
+                // modified", and serve the empty feed until the entry aged
+                // out.
+                let body = (!body.is_empty()).then(|| Arc::new(body));
+                self.entries.insert(
+                    url.clone(),
+                    Entry {
+                        fetched_at: now,
+                        // A normal answer ends any Retry window.
+                        retry_until: None,
+                        etag: validators.etag,
+                        last_modified: validators.last_modified,
+                        body: body.clone(),
+                    },
                 );
-                return None;
+                body.ok_or_else(empty)
             }
-            info!(
-                "Cache is recent (age: {:#?}, max age: {:#?}). Using.",
-                Duration::from_secs(elapsed.as_secs()),
-                Duration::from_secs(args.max_cache_age.as_secs())
-            );
-        }
-    }
-
-    let cache = Cache::load(cache_path, args.max_cache_age.as_secs(), Timestamp::now());
-    match cache {
-        Ok(cache) => Some(cache),
-        Err(e) => {
-            warn!("Error while loading cache: {e}. Continuing without.");
-            None
+            Outcome::NotModified(validators) => {
+                let mut entry = self.entries.get_mut(url).ok_or_else(empty)?;
+                let body = entry.body.clone().ok_or_else(empty)?;
+                entry.fetched_at = now;
+                // "Not modified" is a normal answer too, so it ends any Retry
+                // window just as a fresh body does.
+                entry.retry_until = None;
+                // RFC 7232 lets the answer rotate the Validators it confirms.
+                // Absent ones leave the stored ones in place.
+                if validators.etag.is_some() {
+                    entry.etag = validators.etag;
+                }
+                if validators.last_modified.is_some() {
+                    entry.last_modified = validators.last_modified;
+                }
+                Ok(body)
+            }
+            Outcome::RateLimited { until } => {
+                let mut entry = self
+                    .entries
+                    .get_mut(url)
+                    .ok_or_else(|| OpenringError::RateLimitError(url.as_str().to_string()))?;
+                entry.fetched_at = now;
+                entry.retry_until = Some(until);
+                entry.body.clone().ok_or_else(empty)
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::{fs::File, thread::sleep, time::Duration as StdDuration};
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-    use jiff::{Span, Timestamp};
-    use tempfile::NamedTempFile;
-    use tempfile::TempDir;
+    use hegel::{
+        TestCase,
+        generators::{self, Generator},
+    };
+    use jiff::{SignedDuration, Timestamp, ToSpan};
     use url::Url;
 
-    use hegel::extras::jiff as jiff_gs;
-    use hegel::generators::{self, Generator};
-    use hegel::{PrintableGenerator, TestCase};
+    use super::{Body, Cache, Outcome, Plan, Validators};
+    use crate::{error::OpenringError, fs::Fs, test_logs::warnings_logged};
 
-    use super::*;
+    const CACHE_PATH: &str = "/cache/cache.json";
 
-    fn bounded_timestamp(secs: i64) -> Timestamp {
-        let secs = secs.clamp(Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
-        Timestamp::from_second(secs).expect("failed to clamp timestamp")
+    fn url() -> Url {
+        Url::parse("https://feed.example/feed.xml").unwrap()
     }
 
-    // Cap on generated collection sizes. The cache is a flat map, so its
-    // round-trip and age-filtering properties are fully exercised well below this;
-    // a larger cap mostly inflates per-case entropy and runtime.
-    const MAX_TEST_ENTRIES: usize = 50;
+    fn at(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
 
-    // A well-formed URL, enough to act as a distinct cache key. `Url`'s Debug
-    // prints every parsed field, so the failure report prints the constructor
-    // expression instead.
-    fn urls() -> impl PrintableGenerator<Url> {
-        generators::urls()
-            .map(|s| Url::parse(&s).expect("generated string is a valid URL"))
-            .print_with(|url, printer| {
-                printer.text(&format!("Url::parse({:?}).unwrap()", url.as_str()));
+    fn fresh(body: &str, etag: Option<&str>) -> Outcome {
+        Outcome::Fresh {
+            body: body.as_bytes().to_vec(),
+            validators: Validators {
+                etag: etag.map(str::to_string),
+                last_modified: None,
+            },
+        }
+    }
+
+    fn body(s: &str) -> Body {
+        Arc::new(s.as_bytes().to_vec())
+    }
+
+    // The bug a 304 after an expired 429 once caused: the 304 kept the old
+    // window and restarted it, so later runs never asked the server again.
+    #[test]
+    fn a_not_modified_after_an_expired_retry_window_does_not_reopen_it() {
+        let cache = Cache::default();
+        let t0 = at("2026-01-01T00:00:00Z");
+        cache
+            .record(&url(), fresh("feed", Some("\"v1\"")), t0)
+            .unwrap();
+        cache
+            .record(
+                &url(),
+                Outcome::RateLimited {
+                    until: t0 + 1.hour(),
+                },
+                t0,
+            )
+            .unwrap();
+
+        let t2 = t0 + 2.hours();
+        cache
+            .record(&url(), Outcome::NotModified(Validators::default()), t2)
+            .unwrap();
+
+        assert_eq!(
+            cache.plan(&url(), t2 + 1.second()),
+            Plan::Request(Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
             })
+        );
     }
 
-    // A `CacheValue` with arbitrary fields. All are optional except `timestamp`,
-    // and the retry span is kept within what jiff can represent.
-    #[hegel::composite]
-    fn cache_values(tc: &hegel::TestCase) -> CacheValue {
-        // retry_after only ever holds a time-only span in production, so we
-        // generate seconds rather than jiff_gs::spans(): its calendar-unit spans
-        // are out of domain and would trip the time-only `spans_equal`.
-        let retry_after = tc.draw(generators::optional(
-            generators::integers::<i64>()
-                .min_value(0)
-                .max_value(MAX_SPAN_SEC),
-        ));
-        // The string fields are opaque cache payloads; capping their length keeps
-        // per-case entropy modest when many values populate a collection, while
-        // still exercising escaping and unicode.
-        let text = || generators::optional(generators::text().max_size(64));
-        CacheValue {
-            timestamp: tc.draw(jiff_gs::timestamps()),
-            retry_after: retry_after.map(|secs| Span::new().seconds(secs)),
-            last_modified: tc.draw(text()),
-            etag: tc.draw(text()),
-            // Arbitrary bytes, exercising the base64 round-trip fully.
-            body: tc.draw(generators::optional(
-                generators::vecs(generators::integers::<u8>()).max_size(64),
-            )),
+    #[test]
+    fn a_missing_cache_file_starts_empty_without_a_warning() {
+        let fs = Fs::create_null([]);
+        let logs = warnings_logged(|| {
+            let cache = Cache::load(
+                &fs,
+                Path::new(CACHE_PATH),
+                Duration::MAX,
+                at("2026-01-01T00:00:00Z"),
+            );
+            assert_eq!(
+                cache.plan(&url(), at("2026-01-01T00:00:00Z")),
+                Plan::Request(Validators::default())
+            );
+        });
+        assert_eq!(logs, "");
+    }
+
+    // An entry whose stored body is empty, as only a hand-edited file holds,
+    // has nothing to serve: no Validators go out, and a Retry window cannot
+    // serve it.
+    #[test]
+    fn an_empty_stored_body_loads_as_no_body() {
+        let file = r#"{"https://feed.example/feed.xml":{"fetched_at":"2026-01-01T00:00:00Z","retry_until":"2027-01-01T00:00:00Z","last_modified":null,"etag":"\"v1\"","body":""}}"#;
+        let fs = Fs::create_null([(CACHE_PATH, file)]);
+        let now = at("2026-01-01T00:00:01Z");
+        let cache = Cache::load(&fs, Path::new(CACHE_PATH), Duration::MAX, now);
+        assert_eq!(
+            cache.plan(&url(), now),
+            Plan::Request(Validators::default())
+        );
+    }
+
+    // A cache written by an older version uses other field names. It fails
+    // to decode, so the run starts with an empty cache and refetches every
+    // Feed once.
+    #[test]
+    fn a_cache_in_an_older_format_is_discarded_with_a_warning() {
+        let old = r#"{"https://feed.example/feed.xml":{"timestamp":"2026-01-01T00:00:00Z","retry_after":null,"last_modified":null,"etag":"\"v1\"","body":"PHJzcy8+"}}"#;
+        let fs = Fs::create_null([(CACHE_PATH, old)]);
+        let logs = warnings_logged(|| {
+            let cache = Cache::load(
+                &fs,
+                Path::new(CACHE_PATH),
+                Duration::MAX,
+                at("2026-01-01T00:00:00Z"),
+            );
+            assert_eq!(
+                cache.plan(&url(), at("2026-01-01T00:00:00Z")),
+                Plan::Request(Validators::default())
+            );
+        });
+        assert!(logs.contains("Error while loading cache"), "{logs}");
+    }
+
+    #[test]
+    fn a_failed_save_warns_instead_of_failing() {
+        // The parent "directory" is a file, so the write cannot succeed.
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let path = blocker.path().join("cache.json");
+        let cache = Cache::default();
+        cache
+            .record(&url(), fresh("feed", None), at("2026-01-01T00:00:00Z"))
+            .unwrap();
+
+        let logs = warnings_logged(|| cache.save(&Fs::create(), &path));
+        assert!(logs.contains("Error while storing cache"), "{logs}");
+    }
+
+    #[test]
+    fn a_saved_cache_round_trips_through_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let now = at("2026-01-01T00:00:00Z");
+        let cache = Cache::default();
+        cache
+            .record(&url(), fresh("feed", Some("\"v1\"")), now)
+            .unwrap();
+
+        cache.save(&Fs::create(), &path);
+        let loaded = Cache::load(&Fs::create(), &path, Duration::MAX, now);
+        assert_eq!(
+            loaded
+                .record(&url(), Outcome::NotModified(Validators::default()), now)
+                .unwrap(),
+            body("feed")
+        );
+        // Prove the file holds JSON a person can read, with the body in
+        // base64 rather than one number per byte.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"fetched_at\""), "{text}");
+        assert!(text.contains("\"ZmVlZA==\""), "{text}");
+    }
+
+    // A model of the cache in plain terms, one entry per Feed, that the real
+    // cache must agree with after any sequence of answers, clock moves, and
+    // save-then-load round trips.
+    #[derive(Debug, Clone, PartialEq)]
+    struct ModelEntry {
+        fetched_at: Timestamp,
+        retry_until: Option<Timestamp>,
+        validators: Validators,
+        body: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Served {
+        Body(Vec<u8>),
+        Empty,
+        RateLimited,
+    }
+
+    fn served(result: Result<Body, OpenringError>) -> Served {
+        match result {
+            Ok(body) => Served::Body(body.to_vec()),
+            Err(OpenringError::EmptyFeedError(_)) => Served::Empty,
+            Err(OpenringError::RateLimitError(_)) => Served::RateLimited,
+            Err(e) => panic!("unexpected error {e:?}"),
         }
     }
 
-    // `spans_equal` agrees with integer-seconds equality across the full range of
-    // representable spans.
-    #[hegel::test]
-    fn spans_equal_behavior(tc: hegel::TestCase) {
-        let a_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(-MAX_SPAN_SEC)
-                .max_value(MAX_SPAN_SEC),
-        );
-        let b_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(-MAX_SPAN_SEC)
-                .max_value(MAX_SPAN_SEC),
-        );
-        let a = Span::new().seconds(a_secs);
-        let b = Span::new().seconds(b_secs);
-        assert_eq!(spans_equal(&a, &b), a_secs == b_secs);
-    }
-
-    // A value with all-None optional fields survives a store/load round-trip.
-    #[hegel::test]
-    fn round_trip_all_none_fields(tc: hegel::TestCase) {
-        let url = tc.draw(urls());
-        let cache: Cache = DashMap::new();
-        let cv = CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: None,
-            etag: None,
-            body: None,
-        };
-        cache.insert(url.clone(), cv.clone());
-
-        let tmp = NamedTempFile::new().expect("temp file");
-        cache.store(tmp.path()).expect("store succeeds");
-
-        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-        let loaded_val = loaded.get(&url).expect("key present after load");
-        assert_eq!(&*loaded_val, &cv);
-    }
-
-    // An enormous max_age is clamped rather than overflowing, so the entry loads.
-    #[hegel::test]
-    fn load_clamps_max_age(tc: hegel::TestCase) {
-        let url = tc.draw(urls());
-        let value = tc.draw(cache_values());
-        let cache: Cache = DashMap::new();
-        cache.insert(url.clone(), value);
-        let tmp = NamedTempFile::new().expect("temp file");
-        cache.store(tmp.path()).expect("store succeeds");
-
-        let loaded_large =
-            Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-        let loaded_clamped =
-            Cache::load(tmp.path(), MAX_SPAN_SEC as u64, Timestamp::now()).expect("load succeeds");
-
-        assert!(loaded_large.contains_key(&url));
-        assert!(loaded_clamped.contains_key(&url));
-    }
-
-    // Every entry round-trips identically through store/load. Iterating the cache
-    // (rather than the raw inputs) sidesteps any duplicate-key collisions. Fewer
-    // cases than the default since each one writes and reads a whole cache file.
-    #[hegel::test(test_cases = 25)]
-    fn round_trip_preserves_entries(tc: hegel::TestCase) {
-        let n = tc.draw(
-            generators::integers::<usize>()
-                .min_value(0)
-                .max_value(MAX_TEST_ENTRIES),
-        );
-        let cache: Cache = DashMap::new();
-        for _ in 0..n {
-            cache.insert(tc.draw(urls()), tc.draw(cache_values()));
-        }
-
-        let tmp = NamedTempFile::new().expect("temp file");
-        cache.store(tmp.path()).expect("store succeeds");
-
-        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-        for entry in &cache {
-            let loaded_val = loaded.get(entry.key()).expect("key present after load");
-            assert_eq!(&*loaded_val, entry.value());
-        }
-        assert_eq!(loaded.len(), cache.len());
-    }
-
-    // Loading discards exactly the entries older than max_age. Fewer cases than
-    // the default since each one writes and reads a whole cache file.
-    #[hegel::test(test_cases = 25)]
-    fn age_filter_discards_old_entries(tc: hegel::TestCase) {
-        let now_secs = tc.draw(
-            generators::integers::<i64>()
-                .min_value(10_000)
-                .max_value(Timestamp::MAX.as_second()),
-        );
-        let max_age = tc.draw(generators::integers::<u32>().min_value(0).max_value(10_000));
-        let n = tc.draw(
-            generators::integers::<usize>()
-                .min_value(0)
-                .max_value(MAX_TEST_ENTRIES),
-        );
-
-        let now = bounded_timestamp(now_secs);
-        let max_age_span = Span::new().seconds(i64::from(max_age));
-
-        let cache: Cache = DashMap::new();
-        for i in 0..n {
-            let url = tc.draw(urls());
-            let mut value = tc.draw(cache_values());
-            // Make every even-indexed entry older than max_age.
-            if i % 2 == 0 {
-                value.timestamp = now - max_age_span - Span::new().seconds(1);
-            } else {
-                value.timestamp = now;
-            }
-            cache.insert(url, value);
-        }
-
-        let tmp = NamedTempFile::new().expect("temp file");
-        cache.store(tmp.path()).expect("store succeeds");
-        let loaded = Cache::load(tmp.path(), max_age.into(), now).expect("load succeeds");
-
-        for entry in &cache {
-            let cutoff = now - max_age_span;
-            let should_keep = entry.value().timestamp > cutoff;
-            assert_eq!(loaded.contains_key(entry.key()), should_keep);
-        }
-    }
-
-    // Stateful model test: the cache (subject) must agree with a HashMap (model)
-    // after every insert, get, and store/reload. This is the highest-value check
-    // for a keyed data structure with persistence, exercising overwrite and
-    // round-trip paths the isolated property tests above cannot.
-    struct CacheModel {
+    struct CacheMachine {
         subject: Cache,
-        model: HashMap<Url, CacheValue>,
+        model: HashMap<Url, ModelEntry>,
         urls: Vec<Url>,
+        now: Timestamp,
+        fs: Fs,
     }
 
-    // Rule and invariant methods must take `TestCase` by value to match the
-    // fn-pointer type hegel's `Rule::new` expects, but `tc.draw()` only borrows it.
+    impl CacheMachine {
+        fn pick_url(&self, tc: &TestCase) -> Url {
+            let i = tc.draw(generators::integers::<usize>().max_value(self.urls.len() - 1));
+            self.urls[i].clone()
+        }
+
+        fn draw_validators(tc: &TestCase) -> Validators {
+            Validators {
+                etag: tc.draw(generators::optional(generators::text().max_size(16))),
+                last_modified: tc.draw(generators::optional(generators::text().max_size(16))),
+            }
+        }
+    }
+
+    // Rule methods take `TestCase` by value to match the fn-pointer type
+    // hegel's `Rule::new` expects, but `tc.draw()` only borrows it.
     #[hegel::state_machine]
     #[expect(clippy::needless_pass_by_value)]
-    impl CacheModel {
+    impl CacheMachine {
         #[rule]
-        fn insert(&mut self, tc: TestCase) {
-            let i = tc.draw(
-                generators::integers::<usize>()
+        fn advance_the_clock(&mut self, tc: TestCase) {
+            // Up to three days, so Retry windows and the maximum age both
+            // open and close during a run of rules.
+            let secs = tc.draw(
+                generators::integers::<i64>()
                     .min_value(0)
-                    .max_value(self.urls.len() - 1),
+                    .max_value(3 * 86_400),
             );
-            let url = self.urls[i].clone();
-            let value = tc.draw(cache_values());
-            self.subject.insert(url.clone(), value.clone());
-            self.model.insert(url, value);
+            self.now += SignedDuration::from_secs(secs);
         }
 
         #[rule]
-        fn get(&mut self, tc: TestCase) {
-            let i = tc.draw(
-                generators::integers::<usize>()
-                    .min_value(0)
-                    .max_value(self.urls.len() - 1),
+        fn record_fresh(&mut self, tc: TestCase) {
+            let url = self.pick_url(&tc);
+            let body = tc.draw(generators::vecs(generators::integers::<u8>()).max_size(16));
+            let validators = Self::draw_validators(&tc);
+            let got = served(self.subject.record(
+                &url,
+                Outcome::Fresh {
+                    body: body.clone(),
+                    validators: validators.clone(),
+                },
+                self.now,
+            ));
+
+            let body = (!body.is_empty()).then_some(body);
+            let expected = body.clone().map_or(Served::Empty, Served::Body);
+            self.model.insert(
+                url,
+                ModelEntry {
+                    fetched_at: self.now,
+                    retry_until: None,
+                    validators,
+                    body,
+                },
             );
-            let url = &self.urls[i];
-            let from_subject = self.subject.get(url).map(|e| e.value().clone());
-            let from_model = self.model.get(url).cloned();
-            assert_eq!(from_subject, from_model);
+            assert_eq!(got, expected);
         }
 
         #[rule]
-        fn store_reload(&mut self, _tc: TestCase) {
-            let tmp = NamedTempFile::new().expect("temp file");
-            self.subject.store(tmp.path()).expect("store succeeds");
-            // u64::MAX keeps every entry, so a reload should be a pure round-trip.
-            let reloaded =
-                Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-            self.subject = reloaded;
+        fn record_not_modified(&mut self, tc: TestCase) {
+            let url = self.pick_url(&tc);
+            let validators = Self::draw_validators(&tc);
+            let got = served(self.subject.record(
+                &url,
+                Outcome::NotModified(validators.clone()),
+                self.now,
+            ));
+
+            let expected = match self.model.get_mut(&url) {
+                Some(entry) if entry.body.is_some() => {
+                    entry.fetched_at = self.now;
+                    entry.retry_until = None;
+                    if validators.etag.is_some() {
+                        entry.validators.etag = validators.etag;
+                    }
+                    if validators.last_modified.is_some() {
+                        entry.validators.last_modified = validators.last_modified;
+                    }
+                    Served::Body(entry.body.clone().unwrap())
+                }
+                _ => Served::Empty,
+            };
+            assert_eq!(got, expected);
         }
 
-        #[invariant]
-        fn agrees_with_model(&mut self, _tc: TestCase) {
-            assert_eq!(self.subject.len(), self.model.len());
-            for (url, value) in &self.model {
-                let got = self.subject.get(url).expect("model key present in subject");
-                assert_eq!(&*got, value);
+        #[rule]
+        fn record_rate_limited(&mut self, tc: TestCase) {
+            let url = self.pick_url(&tc);
+            // A window that may already be over, as a Retry-After date in
+            // the past gives.
+            let secs = tc.draw(
+                generators::integers::<i64>()
+                    .min_value(-3_600)
+                    .max_value(36_000),
+            );
+            let until = self.now + SignedDuration::from_secs(secs);
+            let got = served(
+                self.subject
+                    .record(&url, Outcome::RateLimited { until }, self.now),
+            );
+
+            let expected = match self.model.get_mut(&url) {
+                Some(entry) => {
+                    entry.fetched_at = self.now;
+                    entry.retry_until = Some(until);
+                    entry.body.clone().map_or(Served::Empty, Served::Body)
+                }
+                None => Served::RateLimited,
+            };
+            assert_eq!(got, expected);
+        }
+
+        #[rule]
+        fn plan(&mut self, tc: TestCase) {
+            let url = self.pick_url(&tc);
+            let expected = match self.model.get(&url) {
+                Some(ModelEntry {
+                    body: Some(body),
+                    retry_until: Some(until),
+                    ..
+                }) if *until > self.now => Plan::Serve(Arc::new(body.clone())),
+                Some(ModelEntry {
+                    body: Some(_),
+                    validators,
+                    ..
+                }) => Plan::Request(validators.clone()),
+                _ => Plan::Request(Validators::default()),
+            };
+            assert_eq!(self.subject.plan(&url, self.now), expected);
+        }
+
+        #[rule]
+        fn save_and_load(&mut self, tc: TestCase) {
+            let max_age = tc.draw(hegel::one_of!(
+                generators::integers::<u64>()
+                    .min_value(1)
+                    .max_value(4 * 86_400)
+                    .map(Duration::from_secs),
+                generators::just(Duration::MAX)
+            ));
+            let path = Path::new(CACHE_PATH);
+            self.subject.save(&self.fs, path);
+            self.subject = Cache::load(&self.fs, path, max_age, self.now);
+
+            // The model keeps an entry only while its server answered less
+            // than `max_age` ago.
+            if let Ok(age) = SignedDuration::try_from(max_age) {
+                let now = self.now;
+                self.model
+                    .retain(|_, entry| entry.fetched_at.duration_until(now) < age);
             }
         }
     }
 
     #[hegel::test]
-    fn cache_matches_hashmap_model(tc: hegel::TestCase) {
-        let urls = vec![
-            Url::parse("https://a.example/").unwrap(),
-            Url::parse("https://b.example/").unwrap(),
-            Url::parse("https://c.example/feed").unwrap(),
-            Url::parse("https://d.example/atom").unwrap(),
-        ];
-        let machine = CacheModel {
-            subject: DashMap::new(),
+    fn the_cache_agrees_with_its_model(tc: TestCase) {
+        let machine = CacheMachine {
+            subject: Cache::default(),
             model: HashMap::new(),
-            urls,
+            urls: vec![
+                Url::parse("https://a.example/feed.xml").unwrap(),
+                Url::parse("https://b.example/atom").unwrap(),
+                Url::parse("https://c.example/").unwrap(),
+            ],
+            // Whole seconds between 2000 and 2100, so a day of clock moves
+            // never leaves the range jiff can represent.
+            now: Timestamp::from_second(
+                tc.draw(
+                    generators::integers::<i64>()
+                        .min_value(946_684_800)
+                        .max_value(4_102_444_800),
+                ),
+            )
+            .unwrap(),
+            fs: Fs::create_null([]),
         };
         hegel::stateful::machine(machine).run(tc);
-    }
-
-    #[test]
-    fn store_waits_for_readers_instead_of_truncating_under_them() {
-        let url = Url::parse("https://example.test/").unwrap();
-        let value = CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: None,
-            etag: None,
-            body: Some(b"body".to_vec()),
-        };
-        let cache = Cache::new();
-        cache.insert(url.clone(), value);
-
-        let tmp = NamedTempFile::new().expect("temp file");
-        cache.store(tmp.path()).expect("initial store");
-
-        // A concurrent reader mid-read: holds the shared lock.
-        let reader = File::open(tmp.path()).expect("open for read");
-        reader.lock_shared().expect("shared lock");
-
-        // A second store must block on the lock without having touched the
-        // file; truncating first would yank the data out from under readers.
-        let path = tmp.path().to_path_buf();
-        let writer = std::thread::spawn(move || {
-            let cache = Cache::new();
-            cache.insert(
-                Url::parse("https://other.test/").unwrap(),
-                CacheValue {
-                    timestamp: Timestamp::now(),
-                    retry_after: None,
-                    last_modified: None,
-                    etag: None,
-                    body: None,
-                },
-            );
-            cache.store(&path).expect("store after readers release");
-        });
-
-        // Give the writer ample time to reach its truncation.
-        sleep(StdDuration::from_millis(200));
-        let len = fs::metadata(tmp.path()).expect("metadata").len();
-        assert!(
-            len > 0,
-            "store truncated the file while a reader held the lock"
-        );
-
-        drop(reader);
-        writer.join().expect("writer thread");
-
-        // After the lock was released the new contents landed intact.
-        let loaded = Cache::load(tmp.path(), u64::MAX, Timestamp::now()).expect("load succeeds");
-        assert!(loaded.contains_key(&Url::parse("https://other.test/").unwrap()));
-        assert!(!loaded.contains_key(&url));
-    }
-
-    #[test]
-    fn store_cache_swallows_write_failures() {
-        let cache = Cache::new();
-        cache.insert(
-            Url::parse("https://example.test/").unwrap(),
-            CacheValue {
-                timestamp: Timestamp::now(),
-                retry_after: None,
-                last_modified: None,
-                etag: None,
-                body: None,
-            },
-        );
-        // The parent "directory" is a file, so every write attempt fails. The
-        // cache is an optimization: failure must not propagate to the run.
-        let blocker = NamedTempFile::new().expect("temp file");
-        let path = blocker.path().join("sub").join("cache.json");
-        super::store_cache(&cache, false, CachePath::Path(&path));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn store_cache_respects_no_cache_and_writes_otherwise() {
-        let cache = Cache::new();
-        let url = Url::parse("https://example.test/").unwrap();
-        let value = CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: None,
-            etag: None,
-            body: Some(b"body".to_vec()),
-        };
-        cache.insert(url.clone(), value.clone());
-
-        let tmpdir = TempDir::new().expect("tempdir");
-        let path = tmpdir.path().join("cache.json");
-
-        super::store_cache(&cache, true, CachePath::Path(&path));
-        assert!(!path.exists(), "no_cache must not write anything");
-
-        super::store_cache(&cache, false, CachePath::Path(&path));
-        let loaded = Cache::load(&path, u64::MAX, Timestamp::now()).expect("load succeeds");
-        assert_eq!(&*loaded.get(&url).expect("key present"), &value);
-    }
-
-    #[test]
-    fn load_cache_discards_old_format_plain_text_bodies() {
-        let tmp = NamedTempFile::new().expect("temp file");
-        // A cache written by versions that stored the body as plain text. The
-        // body is not valid base64, so the whole file is discarded and the
-        // run continues cacheless instead of erroring.
-        let old = r#"{"https://example.test/":{"timestamp":"2026-01-01T00:00:00Z","retry_after":null,"last_modified":null,"etag":null,"body":"<?xml version=\"1.0\"?><rss/>"}}"#;
-        fs::write(tmp.path(), old).expect("write old cache");
-
-        let args = Args {
-            no_cache: false,
-            max_cache_age: Duration::from_hours(24),
-            ..Default::default()
-        };
-        assert!(super::load_cache(&args, CachePath::Path(tmp.path())).is_none());
-    }
-
-    #[test]
-    fn load_cache_returns_none_when_cache_disabled() {
-        let tmp_cache_path = NamedTempFile::new().expect("temp file");
-        let mut args = Args {
-            no_cache: true,
-            ..Default::default()
-        };
-        args.no_cache = true;
-        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).is_none());
-    }
-
-    #[test]
-    fn load_cache_returns_none_when_no_file() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let tmp_cache_path = tmpdir.path().join("nonexistent");
-        let args = Args {
-            no_cache: false,
-            ..Default::default()
-        };
-        // Ensure no cache file exists
-        let _ = fs::remove_file(&tmp_cache_path);
-        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.as_path())).is_none());
-    }
-
-    #[test]
-    fn load_cache_discards_too_old_file_and_returns_none() {
-        let tmp_cache_path = NamedTempFile::new().expect("temp file");
-        File::create(&tmp_cache_path).expect("create cache file");
-
-        // Ensure the file's mtime is at least in the past relative to the check
-        sleep(StdDuration::from_millis(10));
-
-        // Use a max_cache_age smaller than the sleep to make the file "too old"
-        let args = Args {
-            no_cache: false,
-            max_cache_age: Duration::from_millis(1),
-            ..Default::default()
-        };
-
-        // Should detect file too old and return None
-        assert!(super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).is_none());
-    }
-
-    #[test]
-    fn load_cache_uses_recent_file_and_loads_entries() {
-        let tmp_cache_path = NamedTempFile::new().expect("temp file");
-
-        // Prepare a real cache JSON under the expected filename
-        let url = Url::parse("https://example.test/").unwrap();
-        let value = CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
-            etag: Some("etag".into()),
-            body: Some(b"body".to_vec()),
-        };
-        let cache = Cache::new();
-        cache.insert(url.clone(), value.clone());
-        cache.store(&tmp_cache_path).expect("store");
-
-        let args = Args {
-            no_cache: false,
-            max_cache_age: Duration::from_hours(24),
-            ..Default::default()
-        };
-
-        // Should return Some(Cache) and contain our entry
-        let loaded =
-            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
-        assert!(loaded.contains_key(&url));
-        let loaded_val = loaded.get(&url).expect("get");
-        assert_eq!(&*loaded_val, &value);
-    }
-
-    #[test]
-    fn cache_round_trip_prunes_entries_that_are_old() {
-        let tmp_cache_path = NamedTempFile::new().expect("temp file");
-
-        // Prepare a real cache JSON under the expected filename
-        let cache = Cache::new();
-        let valid_url = Url::parse("https://example.test/").unwrap();
-        let valid_value = CacheValue {
-            timestamp: Timestamp::now(),
-            retry_after: None,
-            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
-            etag: Some("etag".into()),
-            body: Some(b"body".to_vec()),
-        };
-        cache.insert(valid_url.clone(), valid_value.clone());
-
-        // To old, should be filtered
-        let expired_url = Url::parse("https://example2.test/").unwrap();
-        let expired_value = CacheValue {
-            timestamp: Timestamp::now() - Duration::from_hours(48),
-            retry_after: None,
-            last_modified: Some("Mon, 01 Jan 2000 00:00:00 GMT".into()),
-            etag: Some("etag".into()),
-            body: Some(b"body".to_vec()),
-        };
-        cache.insert(expired_url.clone(), expired_value.clone());
-        cache.store(&tmp_cache_path).expect("store");
-
-        let args = Args {
-            no_cache: false,
-            max_cache_age: Duration::from_hours(24),
-            ..Default::default()
-        };
-
-        // Should return Some(Cache) and contain only the valid entry
-        let loaded =
-            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
-        assert!(loaded.contains_key(&valid_url));
-        assert!(!loaded.contains_key(&expired_url));
-        let loaded_val = loaded.get(&valid_url).expect("get");
-        assert_eq!(&*loaded_val, &valid_value);
-
-        // After loading with the config, storing again should prune old entries
-        loaded.store(&tmp_cache_path).expect("store");
-        let loaded =
-            super::load_cache(&args, CachePath::Path(tmp_cache_path.path())).expect("some cache");
-        assert!(loaded.contains_key(&valid_url));
-        assert!(!loaded.contains_key(&expired_url));
     }
 }

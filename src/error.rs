@@ -15,9 +15,6 @@ pub enum OpenringError {
     #[error(transparent)]
     HttpError(#[from] crate::http::TransportError),
     #[error(transparent)]
-    #[diagnostic(code(openring::cache_error))]
-    SerdeJsonError(#[from] serde_json::Error),
-    #[error(transparent)]
     #[diagnostic(transparent)]
     FeedUrlError(#[from] FeedUrlError),
     #[error(transparent)]
