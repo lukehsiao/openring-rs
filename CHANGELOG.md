@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.6.5
+
+### Patch Changes
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`be6e5ea`](https://github.com/lukehsiao/openring-rs/commit/be6e5ea0d6fa6d9f451719d11fab24cffdd659b1) - **fix**: never render an article or source with an empty title.
+  
+  A feed title made only of spaces, no-break spaces, or markup used to render as a blank source name, and an entry with such a title rendered as an article with no title. The source name now falls back to the feed's host, and such an entry is skipped like one with no title.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`e7512c6`](https://github.com/lukehsiao/openring-rs/commit/e7512c6d465e0ffc134b16ac14d4f29bb7411a3e) - **refactor**: rework the cache around one module, with a new file format.
+  
+  The cache now records, as absolute times, when each feed's server last sent, confirmed, or rate-limited it, and when a rate limit ends. The first run after upgrading cannot read the old file, logs `Error while loading cache`, and fetches every feed in full once. Later runs use the new file as before. The whole-file age check is gone; entries still expire individually after `--max-cache-age`. A `Retry-After` delay now counts from the start of the run rather than from the moment the 429 arrived, so on a run with many feeds a rate limit can end up to a few minutes early. `OpenringError::SerdeJsonError` is gone, since a cache that cannot be read or written only logs a warning.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`bd4227b`](https://github.com/lukehsiao/openring-rs/commit/bd4227b4228dcbda6f2ad5ae68d140a69126bd33) - **fix**: name the feed or page whose fetch task crashed.
+  
+  A fetch or summary task that panicked used to be reported without saying which URL it was working on, and stayed listed as in progress. It now shows an `Error` line naming the URL, and logs a warning. Fetch and summary warnings outside a terminal now carry the `openring::fan_out` target instead of `openring`.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`1cd658a`](https://github.com/lukehsiao/openring-rs/commit/1cd658a13dcdd396d7049b567f04ca95aa42fc24) - **fix**: nothing inside a fetched feed can fail the whole run anymore.
+  
+  A feed whose homepage link could not be parsed, or an entry dated outside the range openring can represent, used to abort the run for every feed. A bad homepage link now falls back to the next candidate link and finally to the feed URL. An entry whose published date is out of range uses its updated date instead, and an entry with no usable date is skipped like any other entry missing its link, title, or date. The warning that a feed contributed no articles now fires only when none of its entries is complete, not when `--before` filtered them all out. `OpenringError::UrlParseError` is gone, since nothing raises it.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`300209e`](https://github.com/lukehsiao/openring-rs/commit/300209e847ce72dfccd5649bbace442d1bd5d46a) - **fix**: point at the offending weight when a feed is listed with two weights across `-s` and the urls file.
+  
+  A conflict between two `-s` values, or between `-s` and the urls file, used to print only the URL and both weights. It now shows the same labeled diagnostic as a conflict inside the urls file, pointing at the second weight and naming the first. `OpenringError::ConflictingWeightError` is gone from the library.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`2b4350f`](https://github.com/lukehsiao/openring-rs/commit/2b4350f203d2892f8e157cb35bb21dbc15e61ca1) - **fix**: say why a request failed, and replace `OpenringError::ReqwestError` with `OpenringError::HttpError`.
+  
+  A failed fetch used to say only "error sending request for url (…)". The message now continues with the cause, such as "tcp connect error: Connection refused" or "dns error: failed to lookup address information". The library also no longer exposes `reqwest` types in its errors.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`0f8e4e0`](https://github.com/lukehsiao/openring-rs/commit/0f8e4e07be1441efa476cb9d2f2560fc73b57f37) - **fix**: name the file openring could not read.
+  
+  A missing or unreadable template or urls file reported only "Failed to open file.", which did not say which file. The error now names the path. A failure to write the rendered output now says so instead of claiming a file failed to open. `OpenringError::IoError` is replaced by `ReadFileError` and `OutputError`.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`6f7574b`](https://github.com/lukehsiao/openring-rs/commit/6f7574b50c88ed369c3b831c041102041cd4b6a7) - **fix**: respect `NO_COLOR` in the progress bars and status lines.
+  
+  Log lines already turned color off when `NO_COLOR` was set, but the bar labels and the `Fetched`, `Stale`, and `Error` words stayed colored. They now follow the same rule: any non-empty `NO_COLOR` turns color off.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`b2c8631`](https://github.com/lukehsiao/openring-rs/commit/b2c8631b0b934cce77d77676d3dfeac30deb893c) - **fix**: keep a seeded build stable when another weighted feed is down, and bound the cost of a huge weight.
+  
+  Every weighted feed drew from one shared random stream, in URL order, so one weighted feed failing to fetch changed the picks of every weighted feed after it, breaking `--seed "$(date +%Y%m%d)"` builds that should be stable within a day. Each weighted feed now draws from its own stream, derived from the seed and its URL. The picks for a given seed therefore change once with this release.
+  
+  A very large `--per-source` combined with a very large weight also no longer allocates memory in proportion to the weight.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`36be1cf`](https://github.com/lukehsiao/openring-rs/commit/36be1cfb76179513f3e3c7a6a65511a672bbf7dd) - **refactor**: make the `cache`, `feedfetcher`, and `summarize` modules and the `Article` type private.
+  
+  They were public by accident and never formed a library interface: `Article` had no public fields and no public function took or returned it. The library now exposes only `run`, `args`, `error`, and `terminal`, which is what the `openring` binary uses.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`9ebc8b5`](https://github.com/lukehsiao/openring-rs/commit/9ebc8b56e0f862442e2474c4a4dafc3e0d038a44) - **refactor**: `run` now takes the `Terminal` that shows progress, and `progress::SuspendingStderr` is now `terminal::SuspendingStderr`, which `Terminal::log_writer` returns.
+  
+  The binary builds one `Terminal` and shares it between the progress bars and the log writer, in place of a process-wide static. What the terminal shows is unchanged.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`c565c9c`](https://github.com/lukehsiao/openring-rs/commit/c565c9c39ab417edb62d24f4519ae63496231d1c) - **fix(security)**: a feed can no longer inject script into the rendered page through a link or title.
+  
+  A feed could set an article or homepage link to a `javascript:` or `data:` URL, and the bundled template writes links through `| safe`, so a crafted link could break out of the `href` attribute and run script on your site. Only `http` and `https` links are now used; any other link is skipped like a missing one, and a `'` in a link is percent-encoded, so links are safe in single-quoted attributes too. Titles now also escape quotes, so templates may put them inside quoted attributes. A template that renders `article.title` or `article.source_title` without `| safe` now shows an apostrophe as `&[#39](https://github.com/lukehsiao/openring-rs/issues/39);` and a double quote as `&quot;`, as it already showed `&` as `&amp;`; add `| safe`, as the bundled template does.
+  
+  Link choice is stricter as well. An empty link or one that points back at the feed itself is skipped. Comment, edit, enclosure, hub, and paging links are never used as an article or homepage link, and a broken first link falls back to the next one.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`946af57`](https://github.com/lukehsiao/openring-rs/commit/946af576cf4da6b63f18661d338121a33810fdb0) - **feat**: serve the cached copy of a feed when fetching it fails.
+  
+  A network error, any error status other than `404`, `410`, or `429`, or a response that is empty, too large, or not a feed no longer drops the feed from the output. The cached copy renders instead, with a yellow `Stale` line in a terminal or a warning in the log. A `404` or `410` still skips the feed with an error, because only you can fix a feed that is gone. A `429` uses the cached copy without a stale warning and opens a retry window. A body that is empty or not a feed also no longer replaces a good cached copy. Stale copies age out after `--max-cache-age`, counted from when the server last sent, confirmed, or rate-limited the feed.
+
+- [#197](https://github.com/lukehsiao/openring-rs/pull/197) [`3e4f238`](https://github.com/lukehsiao/openring-rs/commit/3e4f2384a6a50860c71b080bfbf58c418ba80e5a) - **fix**: shorten log lines in a terminal and drop color codes outside one.
+  
+  In a terminal, warnings and debug lines no longer carry a timestamp or module path, so they stop wrapping beside the progress list. `NO_COLOR` still turns color off. Outside a terminal, for example in cron or CI logs, lines keep their timestamps but no longer contain ANSI escape codes.
+
+<pre>
+$ git-stats v0.6.4..v0.6.5
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao       18             93       +7373      -5534  +1839
+Total            18             93       +7373      -5534  +1839
+</pre>
+
 ## 0.6.4
 
 ### Patch Changes
