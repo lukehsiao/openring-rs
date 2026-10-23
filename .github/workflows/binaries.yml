@@ -14,12 +14,18 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: binaries-${{ inputs.tag }}
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Cross builds compile the full dependency tree without a cache.
+    timeout-minutes: 90
     permissions:
       contents: write
     strategy:

@@ -154,5 +154,11 @@ When a fetch fails for a reason that may pass, such as a network error, a server
 A `404` or `410` means the feed is gone, so it is reported as an error and never covered up by the cache.
 A cached copy is dropped once `--max-cache-age` (30 days by default) has passed since its server last sent, confirmed, or rate-limited it, so a dead feed eventually leaves the output.
 
+## Development checks
+Install [jactionlint](https://github.com/jdx/jactionlint) 2.3.0 and ShellCheck, then run `just check` for Clippy and workflow linting with jactionlint's defaults.
+CI uses the default jactionlint profile with online checks and GitHub annotations.
+Errors fail the job; warnings and notices do not.
+No findings are uploaded to GitHub code scanning.
+
 ## Why a Rust port?
 Just for fun.

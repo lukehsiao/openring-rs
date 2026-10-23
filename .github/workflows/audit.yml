@@ -7,11 +7,17 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
   security_audit:
     runs-on: ubuntu-latest
+    # Allow a cold tool install and advisory database download.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:

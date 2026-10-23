@@ -13,6 +13,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    # Allow tool installation and release metadata generation.
+    timeout-minutes: 30
     permissions:
       actions: write
       contents: write
@@ -30,7 +32,7 @@ jobs:
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: latest
-          cache: true
+          cache: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
@@ -56,6 +58,8 @@ jobs:
     if: needs.release.outputs.published == 'true'
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    # Leave time for cargo publish to build and verify the crate.
+    timeout-minutes: 60
     environment: release
     permissions:
       contents: read
@@ -88,6 +92,8 @@ jobs:
     if: needs.release.outputs.published == 'true'
     name: AUR (${{ matrix.pkgname }})
     runs-on: ubuntu-latest
+    # Allow release downloads and the Arch container pull.
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -107,7 +113,9 @@ jobs:
 
       - name: Trust AUR host key and configure git
         run: |
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          # Verified against the fingerprint at https://aur.archlinux.org/.
+          install -d -m 700 ~/.ssh
+          printf '%s\n' 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' >> ~/.ssh/known_hosts
           git config --global user.name  'Luke Hsiao'
           git config --global user.email 'luke@hsiao.dev'
 
@@ -148,7 +156,7 @@ jobs:
         run: |
           # makepkg only runs on Arch and refuses root, so use a one-shot container
           # with a build user.
-          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:base-devel bash -c '
+          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:base-devel@sha256:3cbf69d2d5958d6a294f3722c5668e6187c4df8e00fa27f72352f0bf83e495e1 bash -c '
             useradd -m b && chown -R b:b /pkg &&
             su b -c "makepkg --printsrcinfo"
           ' > .SRCINFO

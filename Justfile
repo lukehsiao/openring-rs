@@ -7,7 +7,7 @@ _default:
 [group('dev')]
 check:
     cargo clippy --all-targets --all-features --locked -- -W clippy::pedantic -D warnings
-    zizmor .
+    jactionlint
 
 # Runs the test suite
 [group('dev')]

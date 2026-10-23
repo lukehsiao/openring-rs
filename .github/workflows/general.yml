@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 env:
@@ -17,6 +21,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Allow a full build when the Rust cache is empty.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -36,6 +42,8 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    # Formatting only needs toolchain installation and a source scan.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -52,6 +60,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # Allow a full dependency check without a Rust cache.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -68,6 +78,8 @@ jobs:
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
+    # Instrumented builds need more time than a normal test run.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -92,6 +104,8 @@ jobs:
   mutation:
     name: Mutation testing
     runs-on: ubuntu-latest
+    # Mutation testing rebuilds and tests many source variants.
+    timeout-minutes: 180
     permissions:
       contents: read
     steps:
