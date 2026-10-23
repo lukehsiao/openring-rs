@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use jiff::{Timestamp, tz::TimeZone};
-use rand::{SeedableRng, rngs::StdRng};
+use rand::RngExt;
 use serde::Serialize;
 use tera::Tera;
 use tracing::debug;
@@ -203,16 +203,13 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
     // Entropy by default: rotating the weighted picks between runs is the
     // point. A fixed seed reproduces the same picks for tests and stable
     // site builds.
-    let mut rng = match args.seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::from_rng(&mut rand::rng()),
-    };
+    let seed = args.seed.unwrap_or_else(|| rand::rng().random());
     let policy = select::Policy {
         per_source: args.per_source,
         num_articles: args.num_articles,
         cutoff,
     };
-    let mut articles = select::select(sources, &policy, &mut rng);
+    let mut articles = select::select(sources, &policy, seed);
 
     // Feeds that ship no summary get one derived from the article page
     // itself. Deferred until here so only the articles that will render
