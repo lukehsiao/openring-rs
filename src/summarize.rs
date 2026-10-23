@@ -176,7 +176,7 @@ mod tests {
     use hegel::generators;
 
     use super::*;
-    use crate::http::Answer;
+    use crate::{http::Answer, test_support::block_on};
 
     #[test]
     fn is_html_accepts_html_content_types() {
@@ -325,10 +325,7 @@ mod tests {
 
     fn summarize(answer: Answer) -> Option<String> {
         let http = Http::create_null([(post_url(), answer)]);
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(fetch_summary(&http, &post_url()))
+        block_on(fetch_summary(&http, &post_url()))
     }
 
     #[test]

@@ -13,7 +13,7 @@ mod source;
 mod summarize;
 pub mod terminal;
 #[cfg(test)]
-mod test_logs;
+mod test_support;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -279,7 +279,7 @@ mod tests {
     use url::Url;
 
     use super::{Article, write_output};
-    use crate::test_logs::warnings_logged;
+    use crate::test_support::{block_on, warnings_logged};
 
     // A writer that always fails with the given kind, standing in for a stdout
     // that has gone away.
@@ -353,14 +353,30 @@ mod tests {
         requests: Vec<crate::http::Request>,
     }
 
+    // Deps over a nulled Http, a file system holding `files`, a frozen
+    // clock, and one cache file that later runs share.
+    fn nulled_deps<'a>(
+        http: crate::http::Http,
+        files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> super::Deps {
+        use crate::{clock::Clock, fs::Fs};
+
+        super::Deps {
+            http,
+            fs: Fs::create_null(files),
+            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+            cache_path: Some("/cache/cache.json".into()),
+        }
+    }
+
     async fn run_nulled(
         args: crate::args::Args,
         template: Option<&str>,
         urls_file: Option<&str>,
         answers: Vec<(&str, crate::http::Answer)>,
     ) -> RunOutcome {
-        use super::{Deps, run_with};
-        use crate::{clock::Clock, fs::Fs, http::Http, terminal::Terminal};
+        use super::run_with;
+        use crate::{http::Http, terminal::Terminal};
 
         let files = [(TEMPLATE_PATH, template), (URLS_PATH, urls_file)];
         let http = Http::create_null(
@@ -369,16 +385,12 @@ mod tests {
                 .map(|(url, answer)| (Url::parse(url).unwrap(), answer)),
         );
         let requests = http.track_requests();
-        let deps = Deps {
+        let deps = nulled_deps(
             http,
-            fs: Fs::create_null(
-                files
-                    .into_iter()
-                    .filter_map(|(path, text)| Some((path, text?))),
-            ),
-            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
-            cache_path: Some("/cache/cache.json".into()),
-        };
+            files
+                .into_iter()
+                .filter_map(|(path, text)| Some((path, text?))),
+        );
         let mut rendered = Vec::new();
         let result = run_with(&deps, &Terminal::create_null(false), args, &mut rendered).await;
         RunOutcome {
@@ -478,15 +490,22 @@ mod tests {
         assert_eq!(outcome.rendered, "Old\n\n");
     }
 
+    fn cached_args(url: &Url) -> crate::args::Args {
+        crate::args::Args {
+            no_cache: false,
+            // `Args::default()` keeps nothing; the binary defaults to 30 days.
+            max_cache_age: std::time::Duration::from_hours(30 * 24),
+            ..run_args(&[url.as_str()])
+        }
+    }
+
     // The cache carries Validators from one run to the next through the
     // file system, so the second run asks "has it changed?" and renders the
     // cached feed when the server says no.
     #[tokio::test]
     async fn a_second_run_revalidates_with_what_the_first_run_cached() {
-        use super::{Deps, run_with};
+        use super::run_with;
         use crate::{
-            clock::Clock,
-            fs::Fs,
             http::{Answer, Http, Request},
             terminal::Terminal,
         };
@@ -500,24 +519,18 @@ mod tests {
             ],
         )]);
         let requests = http.track_requests();
-        let deps = Deps {
-            http,
-            fs: Fs::create_null([(TEMPLATE_PATH, TITLES_TEMPLATE)]),
-            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
-            cache_path: Some("/cache/cache.json".into()),
-        };
-        let args = || crate::args::Args {
-            no_cache: false,
-            // `Args::default()` keeps nothing; the binary defaults to 30 days.
-            max_cache_age: std::time::Duration::from_hours(30 * 24),
-            ..run_args(&[url.as_str()])
-        };
+        let deps = nulled_deps(http, [(TEMPLATE_PATH, TITLES_TEMPLATE)]);
 
         for run in ["first", "second"] {
             let mut rendered = Vec::new();
-            run_with(&deps, &Terminal::create_null(false), args(), &mut rendered)
-                .await
-                .unwrap_or_else(|e| panic!("{run} run failed: {e}"));
+            run_with(
+                &deps,
+                &Terminal::create_null(false),
+                cached_args(&url),
+                &mut rendered,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{run} run failed: {e}"));
             assert_eq!(String::from_utf8(rendered).unwrap(), "Mock Article\n\n");
         }
         assert_eq!(
@@ -536,41 +549,34 @@ mod tests {
     }
 
     // Two runs over one cache: the first gets the feed, the second finds
-    // the server down. Returns what the second run rendered.
-    async fn run_with_server_down_the_second_time(terminal: &crate::terminal::Terminal) -> String {
-        use super::{Deps, run_with};
+    // the server down. Returns what the second run rendered and everything
+    // either run logged.
+    fn run_with_server_down_the_second_time(
+        terminal: &crate::terminal::Terminal,
+    ) -> (String, String) {
+        use super::run_with;
         use crate::{
-            clock::Clock,
-            fs::Fs,
             http::{Answer, Http},
+            terminal::Terminal,
         };
 
         let url = Url::parse("https://feed.example/feed.xml").unwrap();
-        let deps = Deps {
-            http: Http::create_null([(
-                url.clone(),
-                vec![Answer::ok(MOCK_RSS), Answer::status(503)],
-            )]),
-            fs: Fs::create_null([(TEMPLATE_PATH, TITLES_TEMPLATE)]),
-            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
-            cache_path: Some("/cache/cache.json".into()),
-        };
-        let args = || crate::args::Args {
-            no_cache: false,
-            // `Args::default()` keeps nothing; the binary defaults to 30 days.
-            max_cache_age: std::time::Duration::from_hours(30 * 24),
-            ..run_args(&[url.as_str()])
-        };
-
-        let quiet = crate::terminal::Terminal::create_null(false);
-        run_with(&deps, &quiet, args(), std::io::sink())
-            .await
-            .expect("first run");
+        let http =
+            Http::create_null([(url.clone(), vec![Answer::ok(MOCK_RSS), Answer::status(503)])]);
+        let deps = nulled_deps(http, [(TEMPLATE_PATH, TITLES_TEMPLATE)]);
         let mut rendered = Vec::new();
-        run_with(&deps, terminal, args(), &mut rendered)
-            .await
-            .expect("second run");
-        String::from_utf8(rendered).unwrap()
+        let logs = warnings_logged(|| {
+            block_on(async {
+                let quiet = Terminal::create_null(false);
+                run_with(&deps, &quiet, cached_args(&url), std::io::sink())
+                    .await
+                    .expect("first run");
+                run_with(&deps, terminal, cached_args(&url), &mut rendered)
+                    .await
+                    .expect("second run");
+            });
+        });
+        (String::from_utf8(rendered).unwrap(), logs)
     }
 
     // Without a terminal, a feed served from the cache still renders, and
@@ -579,14 +585,7 @@ mod tests {
     fn a_stale_feed_renders_and_warns_when_nobody_watches() {
         let terminal = crate::terminal::Terminal::create_null(false);
         let lines = terminal.track_lines();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut rendered = String::new();
-        let logs = warnings_logged(|| {
-            rendered = rt.block_on(run_with_server_down_the_second_time(&terminal));
-        });
+        let (rendered, logs) = run_with_server_down_the_second_time(&terminal);
 
         assert_eq!(rendered, "Mock Article\n\n");
         assert!(logs.contains("serving cached feed: fetch failed"), "{logs}");
@@ -605,14 +604,7 @@ mod tests {
 
         let terminal = Terminal::create_null(true);
         let lines = terminal.track_lines();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut rendered = String::new();
-        let logs = warnings_logged(|| {
-            rendered = rt.block_on(run_with_server_down_the_second_time(&terminal));
-        });
+        let (rendered, logs) = run_with_server_down_the_second_time(&terminal);
 
         assert_eq!(rendered, "Mock Article\n\n");
         assert_eq!(logs, "");

@@ -163,7 +163,7 @@ mod tests {
     use super::{MAX_IN_FLIGHT, Outcome, Words, fan_out};
     use crate::{
         terminal::{Line, Terminal, Tone},
-        test_logs::warnings_logged,
+        test_support::{block_on, warnings_logged},
     };
 
     const WORDS: Words = Words {
@@ -185,13 +185,6 @@ mod tests {
 
     fn url(i: usize) -> Url {
         Url::parse(&format!("https://item{i}.example/")).unwrap()
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(future)
     }
 
     #[hegel::composite]
