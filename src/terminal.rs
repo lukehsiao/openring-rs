@@ -37,16 +37,20 @@ pub(crate) struct Line {
 pub struct Terminal {
     multi: MultiProgress,
     visible: bool,
+    color: bool,
     lines: OutputListener<Line>,
 }
 
 impl Terminal {
-    /// The real stderr. Bars draw only when stderr is a terminal.
+    /// The real stderr. Bars draw only when stderr is a terminal, and use
+    /// color unless `NO_COLOR` is set to anything but an empty string, as
+    /// <https://no-color.org> asks.
     #[must_use]
     pub fn create() -> Self {
         let multi = MultiProgress::new();
         Self {
             visible: !multi.is_hidden(),
+            color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             multi,
             lines: OutputListener::default(),
         }
@@ -77,9 +81,14 @@ impl Terminal {
                 .expect("the template is valid"),
             ),
         );
-        pb.set_prefix(prefix.bold().to_string());
+        pb.set_prefix(if self.color {
+            prefix.bold().to_string()
+        } else {
+            prefix.to_owned()
+        });
         Bar {
             pb,
+            color: self.color,
             lines: self.lines.clone(),
         }
     }
@@ -89,6 +98,7 @@ impl Terminal {
 #[derive(Debug)]
 pub(crate) struct Bar {
     pb: ProgressBar,
+    color: bool,
     lines: OutputListener<Line>,
 }
 
@@ -97,12 +107,8 @@ impl Bar {
     /// by `tone`, then `detail`.
     pub(crate) fn status(&self, word: &'static str, tone: Tone, detail: impl Display) {
         let detail = detail.to_string();
-        let styled = match tone {
-            Tone::Good => word.bold().green(),
-            Tone::Warn => word.bold().yellow(),
-            Tone::Bad => word.bold().red(),
-        };
-        self.pb.println(format!("{styled:>8} {detail}"));
+        self.pb
+            .println(status_line(word, tone, &detail, self.color));
         self.lines.emit(|| Line { word, tone, detail });
     }
 
@@ -118,6 +124,20 @@ impl Bar {
     pub(crate) fn finish_and_clear(&self) {
         self.pb.finish_and_clear();
     }
+}
+
+/// A status line as stderr shows it: `word` right-aligned in eight columns,
+/// then `detail`, with the word colored by `tone` only when `color` is on.
+fn status_line(word: &str, tone: Tone, detail: &str, color: bool) -> String {
+    if !color {
+        return format!("{word:>8} {detail}");
+    }
+    let styled = match tone {
+        Tone::Good => word.bold().green(),
+        Tone::Warn => word.bold().yellow(),
+        Tone::Bad => word.bold().red(),
+    };
+    format!("{styled:>8} {detail}")
 }
 
 /// An [`io::Write`] for tracing that clears the active progress bars, writes
@@ -142,6 +162,7 @@ impl Terminal {
         Self {
             multi: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
             visible,
+            color: false,
             lines: OutputListener::default(),
         }
     }
@@ -156,7 +177,26 @@ impl Terminal {
 mod tests {
     use std::io::Write;
 
-    use super::{Line, Terminal, Tone};
+    use super::{Line, Terminal, Tone, status_line};
+
+    // With color off, a status line holds no escape code at all, and the
+    // word still lines up in eight columns.
+    #[test]
+    fn a_status_line_without_color_is_plain_text() {
+        for tone in [Tone::Good, Tone::Warn, Tone::Bad] {
+            assert_eq!(
+                status_line("Stale", tone, "https://a.example/", false),
+                "   Stale https://a.example/"
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_line_with_color_paints_only_the_word() {
+        let line = status_line("Error", Tone::Bad, "https://a.example/", true);
+        assert!(line.contains('\u{1b}'), "{line:?}");
+        assert!(line.ends_with(" https://a.example/"), "{line:?}");
+    }
 
     // The suspend wrapper must hand every byte through to stderr, with or
     // without an active bar; swallowed log lines would be far worse than the
