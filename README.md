@@ -128,6 +128,12 @@ Notably, `linebreaksbr` is now `newlines_to_br`.
 On top of Tera's built-ins, `openring-rs` registers the `date`, `striptags`, `urlencode`, and `urlencode_strict` filters and the `now()` function from [tera-contrib](https://crates.io/crates/tera-contrib), since Tera 2.0 moved them out of core.
 `date` takes a strftime `format` (default `%Y-%m-%d`) and an IANA `timezone` (default UTC), e.g. `{{ article.timestamp | date(format="%B %d, %Y") }}`.
 
+Feed text arrives already made safe for HTML, so render it with `| safe`, as the bundled `in.html` does.
+`article.title` and `article.source_title` are plain text with `&`, `<`, `>`, `"`, and `'` escaped, so they are safe in element content and in quoted attributes.
+`article.summary` is HTML reduced to a safe set of tags, but only as a whole and as element content: apply `striptags` before `truncate` or any other filter that cuts text, as `in.html` does, and never put it inside an attribute.
+`article.link` and `article.source_link` are `http` or `https` URLs with quotes, `<`, `>`, and spaces escaped, so they are safe in quoted attributes.
+Without `| safe`, Tera escapes the text a second time, and an apostrophe shows as `&#39;` and a double quote as `&quot;`.
+
 ## Caching
 We use OS-standard locations for caching.
 
