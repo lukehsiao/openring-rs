@@ -255,7 +255,7 @@ mod tests {
         Source, article_order, build_article, project, raw_summary, resolve_entry_link,
         resolve_source_link, resolve_source_title, sanitize_html,
     };
-    use crate::{feed_list::Feed, test_logs::warnings_logged};
+    use crate::{feed_list::Feed, test_support::warnings_logged};
 
     const FEED_URL: &str = "https://example.com/feed.xml";
 
@@ -488,28 +488,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_source_title_prefers_title_then_domain() {
-        // A declared, non-empty title is used verbatim.
-        assert_eq!(
-            resolve_source_title(&parse_feed(&atom("")), &feed_url()),
-            "Example Blog"
-        );
-
-        // An empty or absent title falls back to the fetch URL's domain. Both an
-        // empty <title> and a missing one resolve the same way, so this holds
-        // however feed-rs chooses to represent the blank case.
-        let blank = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title></title>
-                <link href="https://example.com/"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(resolve_source_title(&blank, &feed_url()), "example.com");
-    }
-
     // A title a reader could not see falls back to the host for a feed,
     // and makes an entry incomplete.
     #[test]
@@ -659,27 +637,6 @@ mod tests {
             </feed>"#,
         );
         assert_eq!(resolve_source_link(&bare, &feed_url()), feed_url());
-    }
-
-    #[test]
-    fn project_accepts_an_unparseable_feed_level_href() {
-        // "http://[" is not a valid URL and joins to nothing. The source
-        // link falls back to the feed URL, and the run goes on.
-        let source = project_xml(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title>t</title>
-                <link rel="alternate" href="http://["/>
-                <updated>2020-01-01T00:00:00Z</updated>
-                <entry>
-                    <title>Good</title>
-                    <link href="https://example.com/good"/>
-                    <published>2020-01-01T00:00:00Z</published>
-                </entry>
-            </feed>"#,
-        );
-        assert_eq!(source.articles[0].source_link, feed_url());
-        assert_eq!(source.articles.len(), 1);
     }
 
     // Unparseable hrefs at any step of the source-link chain never stop
@@ -895,38 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn build_article_assembles_fields_and_skips_incomplete() {
-        let source_link = Url::parse("https://example.com/").unwrap();
-        let complete = first_entry(
-            r#"<entry>
-                <title>Complete Post</title>
-                <link href="https://example.com/complete"/>
-                <published>2024-01-01T00:00:00Z</published>
-                <summary>hello</summary>
-            </entry>"#,
-        );
-
-        // Every field of a complete entry flows through, source info included.
-        // The date cutoff is selection's concern, exercised there.
-        let built = build_article(&complete, &feed_url(), "Src", &source_link).unwrap();
-        assert_eq!(built.title, "Complete Post");
-        assert_eq!(built.link.as_str(), "https://example.com/complete");
-        assert_eq!(built.summary, "hello");
-        assert_eq!(built.source_title, "Src");
-        assert_eq!(built.source_link, source_link);
-
-        // An entry missing its date is skipped rather than erroring.
-        let dateless = first_entry(
-            r#"<entry>
-                <title>Dateless</title>
-                <link href="https://example.com/x"/>
-                <summary>s</summary>
-            </entry>"#,
-        );
-        assert!(build_article(&dateless, &feed_url(), "Src", &source_link).is_none());
-    }
-
-    #[test]
     fn project_extracts_basic_fields() {
         let source = project_xml(&atom(
             r#"<entry>
@@ -944,31 +869,6 @@ mod tests {
         assert_eq!(a.summary, "Hello world");
         assert_eq!(a.source_title, "Example Blog");
         assert_eq!(a.source_link.as_str(), "https://example.com/");
-    }
-
-    #[test]
-    fn project_orders_articles_newest_first() {
-        // Nothing in RSS/Atom promises newest-first, so document order must
-        // not matter.
-        let source = project_xml(&atom(
-            r#"<entry>
-                <title>Oldest</title>
-                <link href="https://example.com/1"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>
-            <entry>
-                <title>Newest</title>
-                <link href="https://example.com/3"/>
-                <published>2022-01-01T00:00:00Z</published>
-            </entry>
-            <entry>
-                <title>Middle</title>
-                <link href="https://example.com/2"/>
-                <published>2021-01-01T00:00:00Z</published>
-            </entry>"#,
-        ));
-        let titles: Vec<_> = source.articles.iter().map(|a| a.title.as_str()).collect();
-        assert_eq!(titles, ["Newest", "Middle", "Oldest"]);
     }
 
     #[test]

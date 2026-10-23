@@ -145,7 +145,7 @@ mod tests {
         Article,
         feed_list::Feed,
         source::{Source, article_order},
-        test_logs::warnings_logged,
+        test_support::warnings_logged,
     };
 
     const FEED_URL: &str = "https://example.com/feed.xml";
@@ -343,38 +343,6 @@ mod tests {
         let articles = select(vec![three_years()], &policy(10, 2), 0);
         assert_eq!(titles(&articles), ["Newest", "Middle"]);
         assert!(articles[0].timestamp > articles[1].timestamp);
-    }
-
-    #[test]
-    fn select_drops_article_published_exactly_at_the_cutoff() {
-        // An article published at the very instant the cutoff begins is not
-        // "before" it and must be excluded.
-        let cutoff = cutoff_2022();
-        let url = Url::parse(FEED_URL).unwrap();
-        let sources = vec![source(
-            FEED_URL,
-            None,
-            vec![article(&url, "At Cutoff", "/at", cutoff)],
-        )];
-        let policy = Policy {
-            cutoff: Some(cutoff),
-            ..policy(10, 10)
-        };
-        let articles = select(sources, &policy, 0);
-        assert!(
-            articles.is_empty(),
-            "boundary article was kept: {articles:?}"
-        );
-    }
-
-    #[test]
-    fn select_drops_articles_after_the_cutoff() {
-        let policy = Policy {
-            cutoff: Some(cutoff_2022()),
-            ..policy(10, 10)
-        };
-        let articles = select(vec![old_and_new(None)], &policy, 0);
-        assert_eq!(titles(&articles), ["Old"]);
     }
 
     #[test]

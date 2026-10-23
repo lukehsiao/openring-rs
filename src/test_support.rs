@@ -1,9 +1,19 @@
-//! Log capture for tests, shared by every module that needs to assert what
-//! openring warned about.
+//! Helpers shared by the test modules: log capture, and running a future
+//! to completion from a plain `#[test]`.
 
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
+
+/// Run `future` to completion on a fresh single-threaded runtime. For
+/// tests that must stay sync, such as hegel properties and tests that wrap
+/// a run in [`warnings_logged`].
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime builds")
+        .block_on(future)
+}
 
 /// Capture everything openring logs at warn level and above while `f` runs,
 /// on this thread, through tracing's own subscriber machinery.

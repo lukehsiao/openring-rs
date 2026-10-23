@@ -461,6 +461,7 @@ mod tests {
     };
 
     use super::{Answer, Http, ReadError, Request, StatusCode, USER_AGENT};
+    use crate::test_support::block_on;
 
     // Narrow integration tests: the real client against a local server.
     // They record how reqwest behaves, which is what the stub must match.
@@ -669,13 +670,6 @@ mod tests {
             }
             (other, expected) => panic!("got {other:?}, expected stop at {expected:?}"),
         }
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(future)
     }
 
     // A body that stops arriving is a transfer failure, unless the bytes

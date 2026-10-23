@@ -241,6 +241,7 @@ mod tests {
         cache::{Cache, Outcome, Plan, Validators},
         error::OpenringError,
         http::{Answer, Http, Request, StatusCode},
+        test_support::block_on,
     };
 
     // A valid RSS 2.0 feed with a parameterized title, for the tests that
@@ -752,13 +753,6 @@ mod tests {
             matches!(&res, Err(OpenringError::UnexpectedStatusError { status, .. }) if status == "503"),
             "{res:?}"
         );
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(future)
     }
 
     #[tokio::test]

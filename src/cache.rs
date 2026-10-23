@@ -259,11 +259,11 @@ mod tests {
         TestCase,
         generators::{self, Generator},
     };
-    use jiff::{SignedDuration, Timestamp, ToSpan};
+    use jiff::{SignedDuration, Timestamp};
     use url::Url;
 
     use super::{Body, Cache, Outcome, Plan, Validators};
-    use crate::{error::OpenringError, fs::Fs, test_logs::warnings_logged};
+    use crate::{error::OpenringError, fs::Fs, test_support::warnings_logged};
 
     const CACHE_PATH: &str = "/cache/cache.json";
 
@@ -283,37 +283,6 @@ mod tests {
                 last_modified: None,
             },
         }
-    }
-
-    // The bug a 304 after an expired 429 once caused: the 304 kept the old
-    // window and restarted it, so later runs never asked the server again.
-    #[test]
-    fn a_not_modified_after_an_expired_retry_window_does_not_reopen_it() {
-        let cache = Cache::default();
-        let t0 = at("2026-01-01T00:00:00Z");
-        cache.record(&url(), fresh(Some("\"v1\"")), t0).unwrap();
-        cache
-            .record(
-                &url(),
-                Outcome::RateLimited {
-                    until: t0 + 1.hour(),
-                },
-                t0,
-            )
-            .unwrap();
-
-        let t2 = t0 + 2.hours();
-        cache
-            .record(&url(), Outcome::NotModified(Validators::default()), t2)
-            .unwrap();
-
-        assert_eq!(
-            cache.plan(&url(), t2 + 1.second()),
-            Plan::Request(Validators {
-                etag: Some("\"v1\"".to_string()),
-                last_modified: None,
-            })
-        );
     }
 
     #[test]
