@@ -87,7 +87,7 @@ pub(crate) mod logic {
         },
         /// 304 with an existing entry: keep the cached body, refreshing the
         /// validators with any the response carried (RFC 7232 allows a 304 to
-        /// rotate them).
+        /// rotate them) and clearing any retry window.
         Reuse {
             etag: Option<String>,
             last_modified: Option<String>,
@@ -264,6 +264,9 @@ fn apply_disposition(
             .get_mut(url)
             .and_then(|mut cv| {
                 cv.timestamp = now;
+                // A 304 is a normal answer, so it ends any 429 retry window
+                // just as a 2xx does.
+                cv.retry_after = None;
                 // Absent headers leave the stored validators untouched.
                 if etag.is_some() {
                     cv.etag = etag;
@@ -832,6 +835,41 @@ mod tests {
             cache.get(&url).expect("entry present").etag.as_deref(),
             Some(new_etag.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn a_304_after_an_expired_retry_window_does_not_reopen_it() {
+        let server = MockServer::start().await;
+        // Two runs, two requests: a 304 ends the rate limit just as a 200
+        // does, so the second run must ask the server again.
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&server.uri()).unwrap();
+        let cache = Arc::new(Cache::new());
+        // An earlier 429 opened a one-hour window two hours ago, so it has
+        // already closed.
+        cache.insert(
+            url.clone(),
+            CacheValue {
+                timestamp: Timestamp::now() - 2.hours(),
+                retry_after: Some(1.hour()),
+                last_modified: None,
+                etag: Some(normalize_etag("cached")),
+                body: Some(get_valid_rss_feed("cached").into_bytes()),
+            },
+        );
+
+        let client = build_client().unwrap();
+        for run in ["first", "second"] {
+            url.fetch_feed(&client, &cache)
+                .await
+                .unwrap_or_else(|e| panic!("{run} run served cache on 304: {e}"));
+        }
     }
 
     #[tokio::test]
