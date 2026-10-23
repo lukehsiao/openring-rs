@@ -35,6 +35,9 @@ async fn warns_on_stderr_when_a_feed_fails_without_a_terminal() {
             template.path().to_str().unwrap(),
             "--no-cache",
         ])
+        // tracing paints log lines unless NO_COLOR is set, so leave it unset
+        // to prove the binary turns color off by itself off a terminal.
+        .env_remove("NO_COLOR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -49,4 +52,8 @@ async fn warns_on_stderr_when_a_feed_fails_without_a_terminal() {
     assert!(stderr.contains("WARN"), "{stderr}");
     assert!(stderr.contains(&feed_url), "{stderr}");
     assert!(stderr.contains("HTTP 500"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "escape codes off a terminal: {stderr:?}"
+    );
 }
