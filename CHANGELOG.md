@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.6.6
+
+### Patch Changes
+
+- [`5652379`](https://github.com/lukehsiao/openring-rs/commit/5652379f18d9e47936e1e3b6baa3a8930985189c) - **fix**: say what failed when the `--before` date cannot start in the local time zone.
+  
+  The error said "Failed to parse civil date.", but clap parses the date. The error only comes from finding the first instant of that date in the local time zone, so it now says that. `OpenringError` no longer converts from any `jiff::Error`, so the message cannot show up for some other date error.
+
+- [`5c93827`](https://github.com/lukehsiao/openring-rs/commit/5c938272c8a85bea5c19fdc8811292d80dc48c17) - **fix**: write plain log lines on a terminal that cannot draw progress bars.
+  
+  With `TERM=dumb`, as in Emacs `M-x shell`, openring hid its progress bars but still wrote log lines in the compact, colored form meant for someone watching those bars. Log lines now follow the bars: when the bars are hidden, each line carries a timestamp and no escape codes.
+
+- [`125a0c2`](https://github.com/lukehsiao/openring-rs/commit/125a0c2f071e8a8f6810c5dab1009c9a7bd4e41a) - **fix**: say why a feed fetch failed without repeating its URL.
+  
+  A Stale or Error line, and the warning logged when progress bars are hidden, already name the feed, but the reason after it named the URL again, as in "The request feed at `…` received an unexpected error (HTTP 503)." The reason is now short, such as "server answered HTTP 503", "the body is empty", or "rate limited (HTTP 429) with nothing cached". Network errors no longer repeat the feed URL either, but when a redirect fails, such as a redirect loop, they name the URL where it stopped. A server that answers 304 for a feed with nothing cached now says so, instead of claiming the feed was empty.
+  
+  `OpenringError` no longer has the `EmptyFeedError`, `FeedTooLargeError`, `RateLimitError`, `UnexpectedStatusError`, and `ParseFeedError` variants. They only ever described a single feed's fetch, which never ends a run.
+
+- [`998d235`](https://github.com/lukehsiao/openring-rs/commit/998d235cc83fda69f25fda9ee6bc789fcb66317f) - **fix**: say "Failed to render the template." when a template fails while rendering.
+  
+  A template that parsed but then failed, for example on a variable that does not exist, reported "Failed to parse tera template." It now reports a render failure with the `openring::render_error` code, and Tera's own message still follows. A template that does not parse now reads "Failed to parse the template." `OpenringError` gains a `RenderError` variant, and `TemplateError` no longer converts from every `tera::Error`.
+
+<pre>
+$ git-stats v0.6.5..v0.6.6
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao       10             37       +1244       -830   +414
+Total            10             37       +1244       -830   +414
+</pre>
+
 ## 0.6.5
 
 ### Patch Changes
