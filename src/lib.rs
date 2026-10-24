@@ -78,10 +78,12 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
     // One instant for the whole run, so cache pruning and every fetch agree
     // on which entries are too old and which retry windows are open.
     let now = deps.clock.now();
-    let cache_path = deps.cache_path.as_deref().filter(|_| !args.no_cache);
-    let cache = cache_path.map_or_else(Cache::default, |path| {
-        Cache::load(&deps.fs, path, args.max_cache_age, now)
-    });
+    let cache = Cache::open(
+        &deps.fs,
+        deps.cache_path.as_deref().filter(|_| !args.no_cache),
+        args.max_cache_age,
+        now,
+    );
 
     // The Feed list from -s values and the urls file. Repeated listings
     // collapse and contradictory weights fail fast, before any fetch.
@@ -106,9 +108,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
 
     let sources = feedfetcher::fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
 
-    if let Some(path) = cache_path {
-        cache.save(&deps.fs, path);
-    }
+    cache.save(&deps.fs);
 
     // Entropy by default: rotating the weighted picks between runs is the
     // point. A fixed seed reproduces the same picks for tests and stable
@@ -455,6 +455,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // --no-cache neither reads the cache file nor writes it. A cached run
+    // before or after it learns no Validators from it, and it uses none.
+    #[tokio::test]
+    async fn a_no_cache_run_neither_reads_nor_writes_the_cache() {
+        use super::run_with;
+        use crate::{
+            http::{Answer, Http},
+            terminal::Terminal,
+        };
+
+        let url = Url::parse("https://feed.example/feed.xml").unwrap();
+        let no_cache = || run_args(&[url.as_str()]);
+        let tagged = || Answer::ok(MOCK_RSS).header("etag", "\"v1\"");
+        for runs in [
+            [cached_args(&url), no_cache()],
+            [no_cache(), cached_args(&url)],
+        ] {
+            let http = Http::create_null([(url.clone(), vec![tagged(), tagged()])]);
+            let requests = http.track_requests();
+            let deps = nulled_deps(http, [(TEMPLATE_PATH, TITLES_TEMPLATE)]);
+            for args in runs {
+                run_with(&deps, &Terminal::create_null(false), args, std::io::sink())
+                    .await
+                    .expect("run succeeds");
+            }
+            let headers: Vec<_> = requests.data().into_iter().map(|r| r.headers).collect();
+            assert_eq!(headers, [vec![], vec![]]);
+        }
     }
 
     // Two runs over one cache: the first gets the feed, the second finds

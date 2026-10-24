@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    cache::{Cache, Outcome, Plan, Validators},
+    cache::{Body, Cache, Outcome, Plan, Validators},
     error::OpenringError,
     fan_out::{self, Words, fan_out},
     feed_list::Feed,
@@ -128,6 +128,19 @@ enum Failure {
     Passing(OpenringError),
 }
 
+/// The feed to serve when the server answered, or was not asked.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one short-lived value per fetch, so boxing would only add an allocation"
+)]
+enum Served {
+    /// A new body, parsed before the cache stored it.
+    Fresh(Document),
+    /// The cached body, still current: the server confirmed it, or asked
+    /// us to keep using it for a while.
+    Cached(Body),
+}
+
 /// Fetch the feed at `url` through `http`, using and updating the `cache`.
 /// Every cache decision and every timestamp written uses `now`.
 ///
@@ -136,54 +149,59 @@ enum Failure {
 ///
 /// # Errors
 ///
-/// Returns the failure when the feed is gone, or when it failed and the
-/// cache holds nothing to serve.
+/// Returns the failure when the feed is gone, when it failed and the cache
+/// holds nothing to serve, or when a cached body that is still current no
+/// longer parses.
 async fn fetch_feed(
     url: &Url,
     http: &Http,
     cache: &Cache,
     now: Timestamp,
 ) -> Result<Fetched, OpenringError> {
-    let validators = match cache.plan(url, now) {
-        Plan::Serve(body) => {
-            return Ok(Fetched {
-                document: parser::parse(body.as_slice())?,
-                stale_because: None,
-            });
-        }
-        Plan::Request(validators) => validators,
+    let served = match cache.plan(url, now) {
+        Plan::Serve(body) => Ok(Served::Cached(body)),
+        Plan::Request(validators) => fetch_from_server(url, http, cache, &validators, now).await,
     };
-    match fetch_from_server(url, http, cache, &validators, now).await {
-        Ok(document) => Ok(Fetched {
-            document,
-            stale_because: None,
-        }),
-        Err(Failure::Gone(e)) => Err(e),
+    let document = match served {
+        Ok(Served::Fresh(document)) => document,
+        // The server sent no new body, so a cached body that no longer
+        // parses leaves nothing to serve. During a Retry window, asking the
+        // server anyway would ignore what it asked for.
+        Ok(Served::Cached(body)) => parse(&body)?,
+        Err(Failure::Gone(e)) => return Err(e),
         // A cached copy that does not parse cannot fill in, and the failure
         // that sent us to the cache is the one worth reporting.
-        Err(Failure::Passing(e)) => match cache
-            .record(url, Outcome::Failed, now)
-            .ok()
-            .and_then(|body| parser::parse(body.as_slice()).ok())
-        {
-            Some(document) => Ok(Fetched {
-                document,
-                stale_because: Some(e),
-            }),
-            None => Err(e),
-        },
-    }
+        Err(Failure::Passing(e)) => {
+            return match cache.fallback(url).and_then(|body| parse(&body).ok()) {
+                Some(document) => Ok(Fetched {
+                    document,
+                    stale_because: Some(e),
+                }),
+                None => Err(e),
+            };
+        }
+    };
+    Ok(Fetched {
+        document,
+        stale_because: None,
+    })
 }
 
-/// Ask the server for the feed, record its answer in the cache, and parse
-/// the body the answer leaves to serve.
+/// Parse a feed body. A body passes this before the cache records it, but
+/// a body loaded from disk may not parse, as after a parser upgrade.
+fn parse(body: &[u8]) -> Result<Document, OpenringError> {
+    Ok(parser::parse(body)?)
+}
+
+/// Ask the server for the feed, record its answer in the cache, and say
+/// which feed the answer leaves to serve.
 async fn fetch_from_server(
     url: &Url,
     http: &Http,
     cache: &Cache,
     validators: &Validators,
     now: Timestamp,
-) -> Result<Document, Failure> {
+) -> Result<Served, Failure> {
     let passing = Failure::Passing;
     let mut headers = Vec::with_capacity(2);
     if let Some(last_modified) = &validators.last_modified {
@@ -250,11 +268,11 @@ async fn fetch_from_server(
                 url.as_str().to_string(),
             )));
         }
-        let document = parser::parse(body.as_slice()).map_err(|e| passing(e.into()))?;
+        let document = parse(&body).map_err(passing)?;
         cache
             .record(url, Outcome::Fresh { body, validators }, now)
             .map_err(passing)?;
-        return Ok(document);
+        return Ok(Served::Fresh(document));
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         Outcome::RateLimited {
             until: retry_deadline(resp.header("retry-after"), now),
@@ -273,7 +291,7 @@ async fn fetch_from_server(
         );
     };
     let body = cache.record(url, outcome, now).map_err(passing)?;
-    parser::parse(body.as_slice()).map_err(|e| passing(e.into()))
+    Ok(Served::Cached(body))
 }
 
 #[cfg(test)]
@@ -913,6 +931,33 @@ mod tests {
             .await
             .expect("served the cache");
         assert_eq!(title(&feed), "cached");
+        assert_eq!(requests.data(), []);
+    }
+
+    // A cached body that no longer parses, as after a parser upgrade, fails
+    // the fetch during a Retry window. The server asked not to be asked, so
+    // no request goes out.
+    #[tokio::test]
+    async fn an_open_retry_window_over_an_unparseable_body_fails_without_a_request() {
+        let cache = Cache::default();
+        let body = b"not a feed".to_vec();
+        let fresh = Outcome::Fresh {
+            body,
+            validators: Validators::default(),
+        };
+        cache.record(&feed_url(), fresh, now()).unwrap();
+        let until = now() + 1.hour();
+        cache
+            .record(&feed_url(), Outcome::RateLimited { until }, now())
+            .unwrap();
+        let http = Http::create_null::<Answer>([]);
+        let requests = http.track_requests();
+
+        let res = fetch_feed(&feed_url(), &http, &cache, now() + 30.minutes()).await;
+        assert!(
+            matches!(res, Err(OpenringError::ParseFeedError(_))),
+            "{res:?}"
+        );
         assert_eq!(requests.data(), []);
     }
 
