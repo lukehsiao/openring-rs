@@ -33,7 +33,10 @@ pub(crate) enum Outcome<T> {
     Failed(String),
 }
 
-/// The words one fan-out uses on the bar and in the log.
+/// The words one fan-out uses on the bar and in the log. Every caller gives
+/// all of them, even words its tasks never trigger. One shape for both
+/// callers keeps the reporting rule in one place, and a struct per caller
+/// would need the same fields.
 #[derive(Debug)]
 pub(crate) struct Words {
     /// The bar's label, such as "Fetching".

@@ -248,15 +248,22 @@ mod tests {
             </channel>
         </rss>"#;
 
+    // Args as the binary parses them from `argv`, with the test template.
+    // clap supplies every other default, the same ones a user gets.
+    fn parse_args(argv: &[&str]) -> crate::args::Args {
+        use clap::Parser;
+
+        let fixed = ["openring", "--template-file", TEMPLATE_PATH];
+        crate::args::Args::try_parse_from(fixed.iter().chain(argv).copied())
+            .expect("test argv parses")
+    }
+
     fn run_args(feeds: &[&str]) -> crate::args::Args {
-        crate::args::Args {
-            url: feeds.iter().map(ToString::to_string).collect(),
-            template_file: TEMPLATE_PATH.into(),
-            no_cache: true,
-            num_articles: 3,
-            per_source: 1,
-            ..Default::default()
+        let mut argv = vec!["--no-cache"];
+        for feed in feeds {
+            argv.extend(["--url", feed]);
         }
+        parse_args(&argv)
     }
 
     struct RunOutcome {
@@ -446,12 +453,7 @@ mod tests {
     }
 
     fn cached_args(url: &Url) -> crate::args::Args {
-        crate::args::Args {
-            no_cache: false,
-            // `Args::default()` keeps nothing; the binary defaults to 30 days.
-            max_cache_age: std::time::Duration::from_hours(30 * 24),
-            ..run_args(&[url.as_str()])
-        }
+        parse_args(&["--url", url.as_str()])
     }
 
     // The cache carries Validators from one run to the next through the
@@ -749,14 +751,17 @@ mod tests {
         // weighted feed must not take down the run.
         let urls_file = "https://feed.example/feed.xml 3\nhttps://feed.example/missing.xml 2\n";
         let run = || async {
-            let args = crate::args::Args {
-                // The same feed also arrives via -s with the same weight: the
-                // CLI value and the file line must merge instead of
-                // conflicting.
-                url_file: Some(URLS_PATH.into()),
-                seed: Some(42),
-                ..run_args(&["https://feed.example/feed.xml 3"])
-            };
+            // The same feed also arrives via -s with the same weight: the
+            // CLI value and the file line must merge instead of conflicting.
+            let args = parse_args(&[
+                "--no-cache",
+                "--url",
+                "https://feed.example/feed.xml 3",
+                "--url-file",
+                URLS_PATH,
+                "--seed",
+                "42",
+            ]);
             run_nulled(
                 args,
                 Some(TITLES_TEMPLATE),

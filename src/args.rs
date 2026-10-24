@@ -17,7 +17,7 @@ Examples:
       openring -s 'https://daily.example/feed.xml 7' -t in.html
 ";
 
-#[derive(Parser, Debug, Default)]
+#[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_long_help = AFTER_LONG_HELP)]
 pub struct Args {
     /// Total number of articles to fetch
@@ -115,11 +115,13 @@ mod test {
 
     #[test]
     fn warnings_are_visible_by_default() {
+        use clap::Parser;
         use tracing_log::AsTrace;
         // Warnings (failed fetches, skipped entries, cache failures,
         // redirected feeds) are actionable and must not require -v to see.
+        let args = Args::try_parse_from(["openring", "--template-file", "t.html"]).unwrap();
         assert_eq!(
-            Args::default().verbose.log_level_filter().as_trace(),
+            args.verbose.log_level_filter().as_trace(),
             tracing::level_filters::LevelFilter::WARN
         );
     }
