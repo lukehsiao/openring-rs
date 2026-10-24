@@ -18,7 +18,6 @@ mod test_support;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use jiff::tz::TimeZone;
 use rand::RngExt;
 use tera::Tera;
 use tracing::debug;
@@ -99,12 +98,13 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
             .zip(urls_text.as_deref())
             .map(|(path, text)| UrlsFile { path, text }),
     )?;
-    // The cutoff as an instant, computed once: midnight at the start of
-    // `before` in the system timezone.
+    // The cutoff as an instant, computed once: the start of the `before`
+    // date in the clock's time zone.
     let cutoff = args
         .before
-        .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
-        .transpose()?;
+        .map(|date| deps.clock.start_of(date))
+        .transpose()
+        .map_err(OpenringError::CivilDateError)?;
 
     let sources = feedfetcher::fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
 
@@ -273,7 +273,10 @@ mod tests {
         super::Deps {
             http,
             fs: Fs::create_null(files),
-            clock: Clock::create_null("2026-01-01T00:00:00Z".parse().unwrap()),
+            clock: Clock::create_null(
+                "2026-01-01T00:00:00Z".parse().unwrap(),
+                jiff::tz::TimeZone::UTC,
+            ),
             cache_path: Some("/cache/cache.json".into()),
         }
     }
@@ -370,33 +373,44 @@ mod tests {
         assert_eq!(outcome.rendered, "Mock Article\n\n");
     }
 
-    // --before reaches selection: only articles dated before that day
-    // render. The dates sit years apart, so the system timezone that sets
-    // midnight cannot move either across the cutoff.
+    // --before reaches selection as the first instant of that date in the
+    // clock's time zone, and an Article at exactly that instant is out.
+    // UTC would let both Articles through, so the test runs at UTC+9.
     #[tokio::test]
-    async fn run_renders_only_articles_before_the_before_date() {
+    async fn run_renders_only_articles_before_the_start_of_the_before_date() {
+        use super::run_with;
+        use crate::{
+            clock::Clock,
+            http::{Answer, Http},
+            terminal::Terminal,
+        };
+
         let url = "https://feed.example/feed.xml";
+        // Midnight on 2024-01-02 at UTC+9 is 15:00 UTC the day before.
         let feed = r#"<?xml version="1.0"?>
             <rss version="2.0"><channel><title>t</title><link>https://feed.example/</link>
-                <item><title>Old</title><link>https://feed.example/old</link>
-                    <pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate></item>
-                <item><title>New</title><link>https://feed.example/new</link>
-                    <pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate></item>
+                <item><title>Last</title><link>https://feed.example/last</link>
+                    <pubDate>Mon, 01 Jan 2024 14:59:59 GMT</pubDate></item>
+                <item><title>Out</title><link>https://feed.example/out</link>
+                    <pubDate>Mon, 01 Jan 2024 15:00:00 GMT</pubDate></item>
             </channel></rss>"#;
+        let http = Http::create_null([(Url::parse(url).unwrap(), Answer::ok(feed))]);
+        let mut deps = nulled_deps(http, [(TEMPLATE_PATH, TITLES_TEMPLATE)]);
+        deps.clock = Clock::create_null(
+            deps.clock.now(),
+            jiff::tz::TimeZone::fixed(jiff::tz::offset(9)),
+        );
         let args = crate::args::Args {
-            before: Some(jiff::civil::date(2022, 1, 1)),
+            before: Some(jiff::civil::date(2024, 1, 2)),
             per_source: 10,
             ..run_args(&[url])
         };
-        let outcome = run_nulled(
-            args,
-            Some(TITLES_TEMPLATE),
-            None,
-            vec![(url, crate::http::Answer::ok(feed))],
-        )
-        .await;
-        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
-        assert_eq!(outcome.rendered, "Old\n\n");
+
+        let mut rendered = Vec::new();
+        run_with(&deps, &Terminal::create_null(false), args, &mut rendered)
+            .await
+            .expect("run succeeds");
+        assert_eq!(String::from_utf8(rendered).unwrap(), "Last\n\n");
     }
 
     fn cached_args(url: &Url) -> crate::args::Args {

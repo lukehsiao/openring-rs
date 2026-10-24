@@ -10,8 +10,8 @@ pub(crate) type Result<T> = result::Result<T, OpenringError>;
 pub enum OpenringError {
     #[error("No feed urls were provided. Provide feeds with -s or -S <FILE>.")]
     FeedMissing,
-    #[error("Failed to parse civil date.")]
-    CivilDateError(#[from] jiff::Error),
+    #[error("Failed to find when the `--before` date starts in the local time zone.")]
+    CivilDateError(#[source] jiff::Error),
     #[error(transparent)]
     HttpError(#[from] crate::http::TransportError),
     #[error(transparent)]
