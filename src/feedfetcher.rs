@@ -1,7 +1,8 @@
-//! The feed fetch module: HTTP for one Feed. It asks the cache what to do,
-//! sends the request, turns the response into an [`Outcome`], and parses
-//! the body the cache hands back. Every rule about what the cache stores
-//! lives in the cache module.
+//! The feed fetch module: turn the Feed list into Sources. For each Feed it
+//! asks the cache what to do, sends the request, turns the response into a
+//! cache [`Outcome`], parses the body the cache hands back, and reports how
+//! the fetch went. Every rule about what the cache stores lives in the
+//! cache module.
 
 use feed_rs::{model::Feed as Document, parser};
 use jiff::{SignedDuration, Timestamp};
@@ -11,8 +12,53 @@ use url::Url;
 use crate::{
     cache::{Cache, Outcome, Plan, Validators},
     error::OpenringError,
+    fan_out::{self, Words, fan_out},
+    feed_list::Feed,
     http::{Http, ReadError, Response, StatusCode},
+    source::{self, Source},
+    terminal::Terminal,
 };
+
+const FETCH_WORDS: Words = Words {
+    progress: "Fetching",
+    done: "Fetched",
+    stale_log: "serving cached feed: fetch failed",
+    failed_log: "skipping feed: fetch failed",
+    panic_log: "feed fetch task failed",
+};
+
+/// Fetch every Feed through the shared `http` client as of `now`, and
+/// project each fetched document onto its Source, with progress on
+/// `terminal`. A Feed served from the cache because the server failed shows
+/// as stale. A Feed that is gone (404 or 410), or that fails with nothing
+/// cached to fall back on, is reported and skipped.
+pub(crate) async fn fetch_sources(
+    http: &Http,
+    terminal: &Terminal,
+    feeds: Vec<Feed>,
+    cache: &Cache,
+    now: Timestamp,
+) -> Vec<Source> {
+    let items = feeds.into_iter().map(|f| (f.url.clone(), f)).collect();
+    fan_out(terminal, &FETCH_WORDS, items, |url, feed| {
+        // Both are cheap handles to shared state.
+        let (http, cache) = (http.clone(), cache.clone());
+        async move {
+            match fetch_feed(&url, &http, &cache, now).await {
+                Ok(Fetched {
+                    document,
+                    stale_because: None,
+                }) => fan_out::Outcome::Done(source::project(&document, feed)),
+                Ok(Fetched {
+                    document,
+                    stale_because: Some(e),
+                }) => fan_out::Outcome::Stale(source::project(&document, feed), e.to_string()),
+                Err(e) => fan_out::Outcome::Failed(e.to_string()),
+            }
+        }
+    })
+    .await
+}
 
 /// The largest response body accepted as a feed. Even full-content,
 /// full-history feeds run single-digit MiB; anything bigger is almost
@@ -65,12 +111,12 @@ fn response_validators(resp: &Response) -> Validators {
 
 /// A parsed feed document for this run.
 #[derive(Debug)]
-pub(crate) struct Fetched {
-    pub(crate) document: Document,
+struct Fetched {
+    document: Document,
     /// Why the server could not be used, when the feed came from the cache
     /// instead. `None` when the feed counts as current: the server sent or
     /// confirmed it, or a Retry window covers it.
-    pub(crate) stale_because: Option<OpenringError>,
+    stale_because: Option<OpenringError>,
 }
 
 /// Why the server did not give a usable feed.
@@ -92,7 +138,7 @@ enum Failure {
 ///
 /// Returns the failure when the feed is gone, or when it failed and the
 /// cache holds nothing to serve.
-pub(crate) async fn fetch_feed(
+async fn fetch_feed(
     url: &Url,
     http: &Http,
     cache: &Cache,
@@ -710,6 +756,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Across the whole Feed list, a gone Feed yields no Source and an Error
+    // line, though the cache holds a copy.
+    #[tokio::test]
+    async fn a_gone_feed_shows_an_error_and_yields_no_source() {
+        use crate::{
+            feed_list::Feed,
+            terminal::{Terminal, Tone},
+        };
+
+        let cache = cache_holding("cached", Validators::default());
+        let http = Http::create_null([(feed_url(), Answer::status(404))]);
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+        let feeds = vec![Feed {
+            url: feed_url(),
+            weight: None,
+        }];
+
+        let sources = super::fetch_sources(&http, &terminal, feeds, &cache, now()).await;
+
+        assert!(sources.is_empty(), "{sources:?}");
+        let lines = lines.data();
+        let [line] = lines.as_slice() else {
+            panic!("expected one status line: {lines:?}");
+        };
+        assert_eq!((line.word, line.tone), ("Error", Tone::Bad));
+        assert!(line.detail.starts_with(feed_url().as_str()), "{line:?}");
     }
 
     // A 429 that announces a huge body is still a rate limit: the cache

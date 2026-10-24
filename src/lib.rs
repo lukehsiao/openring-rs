@@ -18,7 +18,7 @@ mod test_support;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use jiff::{Timestamp, tz::TimeZone};
+use jiff::tz::TimeZone;
 use rand::RngExt;
 use tera::Tera;
 use tracing::debug;
@@ -28,53 +28,11 @@ use crate::{
     cache::Cache,
     clock::Clock,
     error::{OpenringError, Result},
-    fan_out::{Outcome, Words, fan_out},
-    feed_list::{Feed, UrlsFile},
-    feedfetcher::{Fetched, fetch_feed},
+    feed_list::UrlsFile,
     fs::Fs,
     http::Http,
-    source::Source,
     terminal::Terminal,
 };
-
-const FETCH_WORDS: Words = Words {
-    progress: "Fetching",
-    done: "Fetched",
-    stale_log: "serving cached feed: fetch failed",
-    failed_log: "skipping feed: fetch failed",
-    panic_log: "feed fetch task failed",
-};
-
-/// Fetch every Feed through the shared `http` client as of `now`, and
-/// project each fetched document onto its Source. A Feed that is gone (404
-/// or 410), or that fails with nothing cached to fall back on, is skipped.
-async fn fetch_sources(
-    http: &Http,
-    terminal: &Terminal,
-    feeds: Vec<Feed>,
-    cache: &Cache,
-    now: Timestamp,
-) -> Vec<Source> {
-    let items = feeds.into_iter().map(|f| (f.url.clone(), f)).collect();
-    fan_out(terminal, &FETCH_WORDS, items, |url, feed| {
-        // Both are cheap handles to shared state.
-        let (http, cache) = (http.clone(), cache.clone());
-        async move {
-            match fetch_feed(&url, &http, &cache, now).await {
-                Ok(Fetched {
-                    document,
-                    stale_because: None,
-                }) => Outcome::Done(source::project(&document, feed)),
-                Ok(Fetched {
-                    document,
-                    stale_because: Some(e),
-                }) => Outcome::Stale(source::project(&document, feed), e.to_string()),
-                Err(e) => Outcome::Failed(e.to_string()),
-            }
-        }
-    })
-    .await
-}
 
 /// The edges a run talks to the outside world through. Tests build them
 /// nulled, so a whole run executes without network, disk, or clock.
@@ -146,7 +104,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         .map(|date| date.to_zoned(TimeZone::system()).map(|z| z.timestamp()))
         .transpose()?;
 
-    let sources = fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
+    let sources = feedfetcher::fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
 
     if let Some(path) = cache_path {
         cache.save(&deps.fs, path);
