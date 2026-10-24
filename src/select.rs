@@ -7,10 +7,7 @@ use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use tracing::debug;
 use url::Url;
 
-use crate::{
-    Article,
-    source::{Source, article_order},
-};
+use crate::source::{Article, Source, article_order};
 
 /// The user's limits on what renders.
 #[derive(Debug)]
@@ -40,18 +37,18 @@ pub(crate) fn select(mut sources: Vec<Source>, policy: &Policy, seed: u64) -> Ve
     // Articles from different Sources can tie on date and link, so a fixed
     // Source order keeps the output the same whatever order the caller
     // passes the Sources in.
-    sources.sort_unstable_by(|a, b| a.feed.url.cmp(&b.feed.url));
+    sources.sort_unstable_by(|a, b| a.feed().url.cmp(&b.feed().url));
     let mut articles = Vec::new();
     for source in sources {
-        let mut from_feed = source.articles;
+        let (feed, mut from_feed) = source.into_parts();
         if let Some(cutoff) = policy.cutoff {
-            from_feed.retain(|a| a.timestamp < cutoff);
+            from_feed.retain(|a| a.timestamp() < cutoff);
         }
-        match source.feed.weight {
+        match feed.weight {
             None => from_feed.truncate(policy.per_source),
             Some(weight) => {
                 let eligible = from_feed.len();
-                let mut rng = feed_rng(seed, &source.feed.url);
+                let mut rng = feed_rng(seed, &feed.url);
                 let ranks = draw_weighted_ranks(weight, policy.per_source, eligible, &mut rng);
                 // The ranks come out ascending, so one pass pairs them with
                 // the newest-first articles.
@@ -64,7 +61,7 @@ pub(crate) fn select(mut sources: Vec<Source>, policy: &Policy, seed: u64) -> Ve
                 });
                 if eligible > 0 && from_feed.is_empty() {
                     debug!(
-                        source = source.feed.url.as_str(),
+                        source = feed.url.as_str(),
                         weight = weight.get(),
                         eligible,
                         "weighted feed drew only empty slots and sits out this run"
@@ -142,9 +139,8 @@ mod tests {
 
     use super::{Policy, draw_weighted_ranks, select};
     use crate::{
-        Article,
         feed_list::Feed,
-        source::{Source, article_order},
+        source::{Article, Source},
         test_support::warnings_logged,
     };
 
@@ -161,27 +157,16 @@ mod tests {
     }
 
     fn article(url: &Url, title: &str, link: &str, timestamp: Timestamp) -> Article {
-        Article {
-            link: url.join(link).expect("fixture link is valid"),
-            title: title.to_owned(),
-            summary: None,
-            source_link: url.clone(),
-            source_title: url.host_str().unwrap_or_default().to_owned(),
-            timestamp,
-        }
+        let link = url.join(link).expect("fixture link is valid");
+        Article::fixture(url, title, link, timestamp)
     }
 
-    // A Source at `url` holding `articles`, sorted the way projection
-    // leaves them.
-    fn source(url: &str, weight: Option<usize>, mut articles: Vec<Article>) -> Source {
-        articles.sort_unstable_by(article_order);
-        Source {
-            feed: Feed {
-                url: Url::parse(url).unwrap(),
-                weight: weight.map(|w| NonZeroUsize::new(w).expect("weight is non-zero")),
-            },
-            articles,
-        }
+    fn source(url: &str, weight: Option<usize>, articles: Vec<Article>) -> Source {
+        let feed = Feed {
+            url: Url::parse(url).unwrap(),
+            weight: weight.map(|w| NonZeroUsize::new(w).expect("weight is non-zero")),
+        };
+        Source::fixture(feed, articles)
     }
 
     // A Source at `url` with `k` articles, where article `rank` (0-based)
@@ -265,11 +250,11 @@ mod tests {
     }
 
     fn titles(articles: &[Article]) -> Vec<String> {
-        articles.iter().map(|a| a.title.clone()).collect()
+        articles.iter().map(|a| a.title().to_owned()).collect()
     }
 
     fn links(articles: &[Article]) -> Vec<String> {
-        articles.iter().map(|a| a.link.to_string()).collect()
+        articles.iter().map(|a| a.link().to_string()).collect()
     }
 
     // Up to three Sources on distinct hosts, each optionally weighted, with
@@ -342,7 +327,7 @@ mod tests {
         // num_articles = 2 keeps the two newest, sorted newest-first.
         let articles = select(vec![three_years()], &policy(10, 2), 0);
         assert_eq!(titles(&articles), ["Newest", "Middle"]);
-        assert!(articles[0].timestamp > articles[1].timestamp);
+        assert!(articles[0].timestamp() > articles[1].timestamp());
     }
 
     #[test]
@@ -484,8 +469,8 @@ mod tests {
         let ours_only = |articles: Vec<Article>| -> Vec<String> {
             articles
                 .into_iter()
-                .filter(|a| a.source_link.as_str() == "https://m.example/feed.xml")
-                .map(|a| a.link.to_string())
+                .filter(|a| a.source_link().as_str() == "https://m.example/feed.xml")
+                .map(|a| a.link().to_string())
                 .collect()
         };
         let wide = policy(3, usize::MAX);
@@ -595,8 +580,8 @@ mod tests {
             let from = |host: &str| -> Vec<String> {
                 articles
                     .iter()
-                    .filter(|a| a.source_link.host_str() == Some(host))
-                    .map(|a| a.title.clone())
+                    .filter(|a| a.source_link().host_str() == Some(host))
+                    .map(|a| a.title().to_owned())
                     .collect()
             };
             (from("a.example"), from("b.example"))
@@ -633,16 +618,16 @@ mod tests {
             .iter()
             .map(|s| {
                 let cap = s
-                    .feed
+                    .feed()
                     .weight
                     .map_or(policy.per_source, |w| policy.per_source.min(w.get()));
-                (s.feed.url.clone(), cap)
+                (s.feed().url.clone(), cap)
             })
             .collect();
 
         let articles = select(sources, &policy, seed);
         for (link, cap) in caps {
-            let count = articles.iter().filter(|a| a.source_link == link).count();
+            let count = articles.iter().filter(|a| *a.source_link() == link).count();
             assert!(count <= cap, "{link} contributed {count}, cap {cap}");
         }
     }
@@ -655,8 +640,8 @@ mod tests {
 
         let articles = select(sources, &policy, seed);
         assert!(articles.windows(2).all(|w| {
-            w[0].timestamp > w[1].timestamp
-                || (w[0].timestamp == w[1].timestamp && w[0].link <= w[1].link)
+            w[0].timestamp() > w[1].timestamp()
+                || (w[0].timestamp() == w[1].timestamp() && w[0].link() <= w[1].link())
         }));
     }
 
@@ -668,7 +653,7 @@ mod tests {
 
         let articles = select(sources, &policy, seed);
         if let Some(cutoff) = policy.cutoff {
-            assert!(articles.iter().all(|a| a.timestamp < cutoff));
+            assert!(articles.iter().all(|a| a.timestamp() < cutoff));
         }
     }
 
@@ -681,7 +666,7 @@ mod tests {
             match articles.as_slice() {
                 [] => sat_out_seed = Some(seed),
                 [only] => {
-                    assert_eq!(only.title, "0", "the only eligible article is rank 0");
+                    assert_eq!(only.title(), "0", "the only eligible article is rank 0");
                     contributed += 1;
                 }
                 more => panic!("one eligible article cannot yield {} picks", more.len()),

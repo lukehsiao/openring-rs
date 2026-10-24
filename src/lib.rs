@@ -20,10 +20,8 @@ use std::path::PathBuf;
 
 use jiff::{Timestamp, tz::TimeZone};
 use rand::RngExt;
-use serde::Serialize;
 use tera::Tera;
 use tracing::debug;
-use url::Url;
 
 use crate::{
     args::Args,
@@ -38,33 +36,6 @@ use crate::{
     source::Source,
     terminal::Terminal,
 };
-
-#[derive(Serialize, Debug)]
-pub(crate) struct Article {
-    link: Url,
-    title: String,
-    /// `None` until a summary is found, from the feed or from the
-    /// Article's own page.
-    #[serde(serialize_with = "summary_or_empty")]
-    summary: Option<String>,
-    source_link: Url,
-    source_title: String,
-    timestamp: Timestamp,
-}
-
-/// Templates see a missing summary as an empty string. Filters such as
-/// `newlines_to_br` fail on a null, so a `None` would break the summary
-/// pipeline that `in.html` and the README show.
-#[expect(
-    clippy::ref_option,
-    reason = "serde passes the field to serialize_with by reference"
-)]
-fn summary_or_empty<S: serde::Serializer>(
-    summary: &Option<String>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.serialize_str(summary.as_deref().unwrap_or_default())
-}
 
 const FETCH_WORDS: Words = Words {
     progress: "Fetching",
@@ -258,7 +229,7 @@ fn read_file(fs: &Fs, path: &std::path::Path) -> Result<String> {
 mod tests {
     use url::Url;
 
-    use super::{Article, write_output};
+    use super::write_output;
     use crate::test_support::{block_on, warnings_logged};
 
     // A writer that always fails with the given kind, standing in for a stdout
@@ -642,31 +613,71 @@ mod tests {
     // tera-contrib `date` and `striptags` we register plus tera's own
     // built-ins), so it parsing and rendering is what pins template
     // compatibility across tera upgrades.
-    #[test]
-    fn bundled_template_renders_an_article() {
-        use super::{TEMPLATE_NAME, template_engine};
+    #[tokio::test]
+    async fn bundled_template_renders_an_article() {
+        use crate::http::Answer;
 
-        let tera = template_engine(include_str!("../in.html")).expect("bundled template parses");
-        let articles = vec![Article {
-            link: Url::parse("https://example.com/post").unwrap(),
-            title: "Hello World".to_string(),
-            // Sanitized summaries keep safe tags and escaped entities,
-            // exactly what the template's summary pipeline must flatten.
-            summary: Some("<p>First line</p>\n<p>Second &amp; last</p>".to_string()),
-            source_link: Url::parse("https://example.com/").unwrap(),
-            source_title: "Example Blog".to_string(),
-            timestamp: "2003-06-10T04:00:00Z".parse().unwrap(),
-        }];
-        let mut context = tera::Context::new();
-        context.insert("articles", &articles);
-        let out = tera
-            .render(TEMPLATE_NAME, &context)
-            .expect("bundled template renders");
+        // The summary keeps safe tags and escaped entities after
+        // sanitizing, exactly what the template's summary pipeline must
+        // flatten.
+        let feed = r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>Example Blog</title>
+                <link>https://example.com/</link>
+                <item><title>Hello World</title><link>https://example.com/post</link>
+                    <description><![CDATA[<p>First line</p>
+<p>Second &amp; last</p>]]></description>
+                    <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some(include_str!("../in.html")),
+            None,
+            vec![("https://feed.example/feed.xml", Answer::ok(feed))],
+        )
+        .await;
+
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let out = outcome.rendered;
         assert!(out.contains("Hello World"), "{out}");
         assert!(out.contains("June 10, 2003"), "{out}");
         // newlines_to_br and replace turn the newline into a space, and
         // striptags drops the <p> wrappers.
         assert!(out.contains("First line Second &amp; last"), "{out}");
+    }
+
+    // A summary derived from a hostile page shows its markup as text, even
+    // through `| safe`, which the README allows for element content.
+    #[tokio::test]
+    async fn a_hostile_page_cannot_inject_script_through_a_derived_summary() {
+        use crate::http::Answer;
+
+        let feed = r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>t</title><link>https://feed.example/</link>
+                <item><title>No summary</title><link>https://feed.example/post</link>
+                    <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        let page = r#"<html><head>
+            <meta name="description" content="&lt;script&gt;alert(1)&lt;/script&gt; &amp; more">
+            </head></html>"#;
+        let outcome = run_nulled(
+            run_args(&["https://feed.example/feed.xml"]),
+            Some("{% for a in articles %}{{ a.summary | safe }}{% endfor %}"),
+            None,
+            vec![
+                ("https://feed.example/feed.xml", Answer::ok(feed)),
+                (
+                    "https://feed.example/post",
+                    Answer::ok(page).header("content-type", "text/html"),
+                ),
+            ],
+        )
+        .await;
+
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(
+            outcome.rendered,
+            "&lt;script&gt;alert(1)&lt;/script&gt; &amp; more\n"
+        );
     }
 
     // The bundled template doesn't use urlencode or now(), so their

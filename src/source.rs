@@ -1,22 +1,120 @@
-//! Projection of a fetched document onto its Source and Articles.
+//! Projection of a fetched document onto its Source and Articles, and the
+//! rules every Article keeps: its text is safe to embed in HTML, and a
+//! Source holds its Articles newest first.
 //!
 //! Nothing in a fetched document can fail the run. A bad link falls back,
 //! and an Entry that cannot become an Article is skipped and counted.
 
 use feed_rs::model::{Entry, Feed as Document, Link};
 use jiff::Timestamp;
+use serde::Serialize;
 use tracing::{debug, info, warn};
 use url::{Position, Url};
 
-use crate::{Article, feed_list::Feed};
+use crate::feed_list::Feed;
 
 /// A fetched Feed with every complete Entry as an Article. Each Article
 /// carries the Source's display title and homepage link.
 #[derive(Debug)]
 pub(crate) struct Source {
-    pub(crate) feed: Feed,
+    feed: Feed,
     /// Newest first by [`article_order`].
-    pub(crate) articles: Vec<Article>,
+    articles: Vec<Article>,
+}
+
+impl Source {
+    pub(crate) fn feed(&self) -> &Feed {
+        &self.feed
+    }
+
+    /// The Feed and its Articles, newest first by [`article_order`].
+    pub(crate) fn into_parts(self) -> (Feed, Vec<Article>) {
+        (self.feed, self.articles)
+    }
+}
+
+/// One Article as templates see it. Every text field is safe to embed in
+/// HTML through `| safe`, as the README promises: titles in quoted
+/// attributes too, the summary only as element content.
+#[derive(Serialize, Debug)]
+pub(crate) struct Article {
+    link: Url,
+    title: String,
+    /// `None` until a summary is found, from the feed or from the
+    /// Article's own page.
+    #[serde(serialize_with = "summary_or_empty")]
+    summary: Option<String>,
+    source_link: Url,
+    source_title: String,
+    timestamp: Timestamp,
+}
+
+impl Article {
+    pub(crate) fn link(&self) -> &Url {
+        &self.link
+    }
+
+    pub(crate) fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub(crate) fn has_summary(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    /// Give the Article a summary from plain text, such as text derived from
+    /// its page. The text is escaped here, so markup in it shows as text.
+    pub(crate) fn fill_summary(&mut self, plain_text: &str) {
+        self.summary = Some(html_escape::encode_text(plain_text).into_owned());
+    }
+}
+
+/// Templates see a missing summary as an empty string. Filters such as
+/// `newlines_to_br` fail on a null, so a `None` would break the summary
+/// pipeline that `in.html` and the README show.
+#[expect(
+    clippy::ref_option,
+    reason = "serde passes the field to serialize_with by reference"
+)]
+fn summary_or_empty<S: serde::Serializer>(
+    summary: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(summary.as_deref().unwrap_or_default())
+}
+
+#[cfg(test)]
+impl Source {
+    /// A Source for `feed` holding `articles`, sorted as projection sorts
+    /// them.
+    pub(crate) fn fixture(feed: Feed, mut articles: Vec<Article>) -> Self {
+        articles.sort_unstable_by(article_order);
+        Self { feed, articles }
+    }
+}
+
+#[cfg(test)]
+impl Article {
+    /// An Article at `link` with no summary, from the Source whose homepage
+    /// is `source_link`. `title` must already be safe to embed.
+    pub(crate) fn fixture(source_link: &Url, title: &str, link: Url, timestamp: Timestamp) -> Self {
+        Self {
+            link,
+            title: title.to_owned(),
+            summary: None,
+            source_link: source_link.clone(),
+            source_title: source_link.host_str().unwrap_or_default().to_owned(),
+            timestamp,
+        }
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn source_link(&self) -> &Url {
+        &self.source_link
+    }
 }
 
 /// Project a fetched `document` for `feed` onto its Source.

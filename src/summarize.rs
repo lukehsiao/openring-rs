@@ -7,9 +7,9 @@ use tracing::debug;
 use url::Url;
 
 use crate::{
-    Article,
     fan_out::{Outcome, Words, fan_out},
     http::Http,
+    source::Article,
     terminal::Terminal,
 };
 
@@ -47,8 +47,8 @@ pub(crate) async fn fill_missing_summaries(
     let items = articles
         .iter()
         .enumerate()
-        .filter(|(_, a)| a.summary.is_none())
-        .map(|(i, a)| (a.link.clone(), i))
+        .filter(|(_, a)| !a.has_summary())
+        .map(|(i, a)| (a.link().clone(), i))
         .collect();
     let summaries = fan_out(terminal, &SUMMARY_WORDS, items, |url, i| {
         let http = http.clone();
@@ -61,7 +61,7 @@ pub(crate) async fn fill_missing_summaries(
     })
     .await;
     for (i, summary) in summaries {
-        articles[i].summary = Some(summary);
+        articles[i].fill_summary(&summary);
     }
 }
 
@@ -70,8 +70,8 @@ pub(crate) async fn fill_missing_summaries(
 /// `None` simply means no summary could be derived (network failure, a
 /// non-HTML link, or a page with nothing quotable), which the caller renders
 /// exactly like a feed that offered no summary, so nothing here can fail the
-/// run. The returned text is plain text with HTML special characters
-/// escaped, safe to embed even through the template's `| safe` filter.
+/// run. The returned text is plain text: [`Article::fill_summary`] escapes
+/// it.
 async fn fetch_summary(http: &Http, url: &Url) -> Option<String> {
     let resp = match http.get(url, &[]).await {
         Ok(resp) => resp,
@@ -123,16 +123,15 @@ fn is_html(content_type: Option<&str>) -> bool {
     mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
 }
 
-/// Derive a display-ready summary from an HTML page: the page's own meta
+/// Derive a plain-text summary from an HTML page: the page's own meta
 /// description when it carries one, otherwise its leading paragraphs.
 ///
-/// Output is whitespace-normalized plain text, cut to [`MAX_SUMMARY_CHARS`],
-/// with HTML special characters escaped so it is safe to embed even through
-/// the template's `| safe` filter.
+/// Output is whitespace-normalized plain text, cut to [`MAX_SUMMARY_CHARS`].
+/// It is not escaped for HTML.
 fn extract_summary(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
     let text = meta_description(&doc).or_else(|| leading_paragraphs(&doc))?;
-    Some(html_escape::encode_text(&truncate_chars(text, MAX_SUMMARY_CHARS)).into_owned())
+    Some(truncate_chars(text, MAX_SUMMARY_CHARS))
 }
 
 /// The page's own summary of itself, from standard description metadata.
@@ -307,17 +306,6 @@ mod tests {
             <p>Readable text.</p>
             </body></html>";
         assert_eq!(extract_summary(html).as_deref(), Some("Readable text."));
-    }
-
-    #[test]
-    fn html_special_characters_are_escaped() {
-        let html = r#"<html><head>
-            <meta name="description" content="Tom &amp; Jerry <friends>">
-            </head><body></body></html>"#;
-        assert_eq!(
-            extract_summary(html).as_deref(),
-            Some("Tom &amp; Jerry &lt;friends&gt;")
-        );
     }
 
     #[test]
