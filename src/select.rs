@@ -164,7 +164,7 @@ mod tests {
         Article {
             link: url.join(link).expect("fixture link is valid"),
             title: title.to_owned(),
-            summary: String::new(),
+            summary: None,
             source_link: url.clone(),
             source_title: url.host_str().unwrap_or_default().to_owned(),
             timestamp,

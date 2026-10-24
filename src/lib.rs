@@ -43,10 +43,27 @@ use crate::{
 pub(crate) struct Article {
     link: Url,
     title: String,
-    summary: String,
+    /// `None` until a summary is found, from the feed or from the
+    /// Article's own page.
+    #[serde(serialize_with = "summary_or_empty")]
+    summary: Option<String>,
     source_link: Url,
     source_title: String,
     timestamp: Timestamp,
+}
+
+/// Templates see a missing summary as an empty string. Filters such as
+/// `newlines_to_br` fail on a null, so a `None` would break the summary
+/// pipeline that `in.html` and the README show.
+#[expect(
+    clippy::ref_option,
+    reason = "serde passes the field to serialize_with by reference"
+)]
+fn summary_or_empty<S: serde::Serializer>(
+    summary: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(summary.as_deref().unwrap_or_default())
 }
 
 const FETCH_WORDS: Words = Words {
@@ -86,43 +103,6 @@ async fn fetch_sources(
         }
     })
     .await
-}
-
-const SUMMARY_WORDS: Words = Words {
-    progress: "Summarizing",
-    done: "Summary",
-    stale_log: "using a fallback summary",
-    failed_log: "could not derive a summary",
-    panic_log: "summary fetch task failed",
-};
-
-/// Derive summaries for the chosen `articles` whose feeds provided none, by
-/// fetching each article's own page (see [`summarize::fetch_summary`]).
-///
-/// Runs after selection so only the articles that will render trigger a page
-/// fetch, and mutates `articles` in place. An article whose page yields
-/// nothing keeps its empty summary, exactly as if the feed had one that was
-/// blank, so nothing here can fail the run.
-async fn fill_missing_summaries(http: &Http, terminal: &Terminal, articles: &mut [Article]) {
-    let items = articles
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.summary.is_empty())
-        .map(|(i, a)| (a.link.clone(), i))
-        .collect();
-    let summaries = fan_out(terminal, &SUMMARY_WORDS, items, |url, i| {
-        let http = http.clone();
-        async move {
-            // A page with nothing quotable is routine, not worth a report.
-            summarize::fetch_summary(&http, &url)
-                .await
-                .map_or(Outcome::Skipped, |summary| Outcome::Done((i, summary)))
-        }
-    })
-    .await;
-    for (i, summary) in summaries {
-        articles[i].summary = summary;
-    }
 }
 
 /// The edges a run talks to the outside world through. Tests build them
@@ -215,7 +195,7 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
     // Feeds that ship no summary get one derived from the article page
     // itself. Deferred until here so only the articles that will render
     // trigger a page fetch.
-    fill_missing_summaries(&deps.http, terminal, &mut articles).await;
+    summarize::fill_missing_summaries(&deps.http, terminal, &mut articles).await;
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
@@ -672,7 +652,7 @@ mod tests {
             title: "Hello World".to_string(),
             // Sanitized summaries keep safe tags and escaped entities,
             // exactly what the template's summary pipeline must flatten.
-            summary: "<p>First line</p>\n<p>Second &amp; last</p>".to_string(),
+            summary: Some("<p>First line</p>\n<p>Second &amp; last</p>".to_string()),
             source_link: Url::parse("https://example.com/").unwrap(),
             source_title: "Example Blog".to_string(),
             timestamp: "2003-06-10T04:00:00Z".parse().unwrap(),
@@ -836,12 +816,72 @@ mod tests {
         assert_eq!(outcome.rendered, "Derived for the Atom entry.\n");
     }
 
+    // Only Articles that render and lack a summary send a page request. A
+    // feed summary is used as is, and an Article that selection drops is
+    // never summarized.
+    #[tokio::test]
+    async fn run_fetches_pages_only_for_selected_articles_missing_a_summary() {
+        use crate::http::Answer;
+
+        // Each derived summary must land on its own Article, even when an
+        // earlier page yields nothing.
+        let feed = r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>t</title><link>https://feed.example/</link>
+                <item><title>Has summary</title><link>https://feed.example/has</link>
+                    <description>From the feed.</description>
+                    <pubDate>Thu, 04 Jan 2024 00:00:00 GMT</pubDate></item>
+                <item><title>Page fails</title><link>https://feed.example/fails</link>
+                    <pubDate>Wed, 03 Jan 2024 00:00:00 GMT</pubDate></item>
+                <item><title>Page works</title><link>https://feed.example/works</link>
+                    <pubDate>Tue, 02 Jan 2024 00:00:00 GMT</pubDate></item>
+                <item><title>Dropped</title><link>https://feed.example/dropped</link>
+                    <pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        let page =
+            r#"<html><head><meta name="description" content="From the page."></head></html>"#;
+        let args = crate::args::Args {
+            num_articles: 3,
+            per_source: 10,
+            ..run_args(&["https://feed.example/feed.xml"])
+        };
+        let outcome = run_nulled(
+            args,
+            Some("{% for a in articles %}{{ a.title }}: {{ a.summary }}\n{% endfor %}"),
+            None,
+            vec![
+                ("https://feed.example/feed.xml", Answer::ok(feed)),
+                ("https://feed.example/fails", Answer::status(404)),
+                ("https://feed.example/works", Answer::ok(page)),
+            ],
+        )
+        .await;
+
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(
+            outcome.rendered,
+            "Has summary: From the feed.\nPage fails: \nPage works: From the page.\n\n"
+        );
+        let mut urls: Vec<&str> = outcome.requests.iter().map(|r| r.url.as_str()).collect();
+        // Page fetches run concurrently, so their order is not fixed.
+        urls.sort_unstable();
+        assert_eq!(
+            urls,
+            [
+                "https://feed.example/fails",
+                "https://feed.example/feed.xml",
+                "https://feed.example/works"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn run_leaves_summary_empty_when_page_fetch_fails() {
         use crate::http::Answer;
 
         // The item's link 404s, so no summary can be derived and the run
-        // must still succeed with an empty one.
+        // must still succeed with an empty one. Filters such as
+        // `newlines_to_br` reject a null, so the empty summary must reach
+        // the template as a string.
         let feed = r#"<?xml version="1.0"?>
             <rss version="2.0">
                 <channel>
@@ -858,7 +898,7 @@ mod tests {
 
         let outcome = run_nulled(
             run_args(&["https://feed.example/feed.xml"]),
-            Some("{% for a in articles %}[{{ a.summary }}]{% endfor %}"),
+            Some("{% for a in articles %}[{{ a.summary | newlines_to_br }}]{% endfor %}"),
             None,
             vec![
                 ("https://feed.example/feed.xml", Answer::ok(feed)),

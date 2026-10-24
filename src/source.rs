@@ -225,13 +225,18 @@ fn build_article(
         return None;
     };
 
-    let summary = raw_summary(entry).map_or_else(
-        || {
-            info!(?link, ?source_link, "no summary or content provided.");
-            String::new()
-        },
-        sanitize_html,
-    );
+    // A summary with nothing safe left after sanitizing is missing too: the
+    // reader would see nothing either way, and the page may say more.
+    let summary = raw_summary(entry)
+        .map(sanitize_html)
+        .filter(|summary| !summary.is_empty());
+    if summary.is_none() {
+        info!(
+            ?link,
+            ?source_link,
+            "feed has no usable summary or content."
+        );
+    }
 
     Some(Article {
         link,
@@ -866,9 +871,24 @@ mod tests {
         let a = &source.articles[0];
         assert_eq!(a.link.as_str(), "https://example.com/first");
         assert_eq!(a.title, "First Post");
-        assert_eq!(a.summary, "Hello world");
+        assert_eq!(a.summary.as_deref(), Some("Hello world"));
         assert_eq!(a.source_title, "Example Blog");
         assert_eq!(a.source_link.as_str(), "https://example.com/");
+    }
+
+    // A summary with nothing safe left after sanitizing counts as missing,
+    // so the Article's page gets a chance to supply one.
+    #[test]
+    fn a_summary_with_nothing_safe_left_is_missing() {
+        let source = project_xml(&atom(
+            r#"<entry>
+                <title>Only script</title>
+                <link href="https://example.com/first"/>
+                <published>2020-01-01T00:00:00Z</published>
+                <summary>&lt;script&gt;alert(1)&lt;/script&gt;</summary>
+            </entry>"#,
+        ));
+        assert_eq!(source.articles[0].summary, None);
     }
 
     #[test]

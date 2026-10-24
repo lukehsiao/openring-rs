@@ -1,10 +1,17 @@
-//! Derive a summary for an article whose feed provided none, by fetching the
-//! article's own page and reading the page's description of itself.
+//! Derive summaries for the Articles that will render but whose feed gave
+//! none, by fetching each Article's own page and reading the page's
+//! description of itself.
 
-use crate::http::Http;
 use scraper::{Html, Selector};
 use tracing::debug;
 use url::Url;
+
+use crate::{
+    Article,
+    fan_out::{Outcome, Words, fan_out},
+    http::Http,
+    terminal::Terminal,
+};
 
 /// The largest page body worth downloading for a summary. Article pages run
 /// well under 1 MiB of HTML; anything bigger is almost certainly media or a
@@ -16,6 +23,48 @@ const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// entry stays a teaser rather than a reprint.
 const MAX_SUMMARY_CHARS: usize = 500;
 
+/// The words the summary fan-out shows. A page that yields nothing is
+/// skipped without a report, so the stale and failed words are never used.
+const SUMMARY_WORDS: Words = Words {
+    progress: "Summarizing",
+    done: "Summary",
+    stale_log: "using a fallback summary",
+    failed_log: "could not derive a summary",
+    panic_log: "summary fetch task failed",
+};
+
+/// Give each of `articles` that has no summary one derived from its own
+/// page, through the shared `http` client, with progress on `terminal`.
+///
+/// Pass only the Articles that will render: each missing summary costs a
+/// page fetch. An Article whose page yields nothing keeps no summary, and
+/// nothing here can fail the run.
+pub(crate) async fn fill_missing_summaries(
+    http: &Http,
+    terminal: &Terminal,
+    articles: &mut [Article],
+) {
+    let items = articles
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.summary.is_none())
+        .map(|(i, a)| (a.link.clone(), i))
+        .collect();
+    let summaries = fan_out(terminal, &SUMMARY_WORDS, items, |url, i| {
+        let http = http.clone();
+        async move {
+            // A page with nothing quotable is routine, not worth a report.
+            fetch_summary(&http, &url)
+                .await
+                .map_or(Outcome::Skipped, |summary| Outcome::Done((i, summary)))
+        }
+    })
+    .await;
+    for (i, summary) in summaries {
+        articles[i].summary = Some(summary);
+    }
+}
+
 /// Fetch `url` and derive a summary from the page itself.
 ///
 /// `None` simply means no summary could be derived (network failure, a
@@ -23,7 +72,7 @@ const MAX_SUMMARY_CHARS: usize = 500;
 /// exactly like a feed that offered no summary, so nothing here can fail the
 /// run. The returned text is plain text with HTML special characters
 /// escaped, safe to embed even through the template's `| safe` filter.
-pub(crate) async fn fetch_summary(http: &Http, url: &Url) -> Option<String> {
+async fn fetch_summary(http: &Http, url: &Url) -> Option<String> {
     let resp = match http.get(url, &[]).await {
         Ok(resp) => resp,
         Err(e) => {
