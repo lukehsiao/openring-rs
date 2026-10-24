@@ -39,3 +39,11 @@ _Avoid_: cache headers, conditional headers
 **Retry window**:
 The time after a server answers "too many requests" during which openring serves the cached Feed without asking again.
 _Avoid_: backoff, rate limit, cooldown
+
+**Stale**:
+A Feed served from its cached copy because the fetch failed for a reason that may pass.
+_Avoid_: outdated, fallback
+
+**Gone**:
+A Feed whose server says it no longer exists, so no cached copy covers it.
+_Avoid_: dead, missing

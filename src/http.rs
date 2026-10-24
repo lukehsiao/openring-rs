@@ -16,26 +16,50 @@ use crate::nullable::OutputListener;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// A request could not be built, sent, or read to the end. The message
-/// carries the whole chain of causes, such as "error sending request for
-/// url (…): client error (Connect): tcp connect error: Connection refused".
+/// carries the whole chain of causes, such as "error sending request:
+/// client error (Connect): tcp connect error: Connection refused". It
+/// leaves out the URL the caller requested, which the caller already
+/// names. When the redirect policy stops a request, the URL where it
+/// stopped stays, because nothing else names it.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct TransportError(String);
 
 impl From<reqwest::Error> for TransportError {
     fn from(e: reqwest::Error) -> Self {
-        use std::{error::Error as _, fmt::Write as _};
+        Self(causes(&e.without_url()))
+    }
+}
 
-        // reqwest's own message names only what failed; why it failed lives
-        // in the source chain.
-        let mut text = e.to_string();
-        let mut cause = e.source();
-        while let Some(c) = cause {
-            let _ = write!(text, ": {c}");
-            cause = c.source();
-        }
+impl TransportError {
+    /// `e` from sending a request for `requested`. reqwest names the
+    /// requested URL for most failures, even on a later redirect hop. Only
+    /// a failure of the redirect policy names another URL: the last one
+    /// reached after too many redirects, or a target that is not HTTP.
+    /// Only that other URL stays in the message.
+    fn from_request(e: reqwest::Error, requested: &Url) -> Self {
+        let elsewhere = e
+            .url()
+            .filter(|&failed| failed != requested)
+            .map(|failed| format!(" at {failed}"));
+        let mut text = causes(&e.without_url());
+        text.extend(elsewhere);
         Self(text)
     }
+}
+
+/// `e`'s message followed by each cause in its source chain. reqwest's own
+/// message names only what failed; why it failed lives in the chain.
+fn causes(e: &reqwest::Error) -> String {
+    use std::{error::Error as _, fmt::Write as _};
+
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let _ = write!(text, ": {c}");
+        cause = c.source();
+    }
+    text
 }
 
 /// Why [`Response::read_capped`] gave up on a body.
@@ -172,7 +196,11 @@ impl Client {
                 for &(name, value) in headers {
                     request = request.header(name, value);
                 }
-                Ok(RawResponse::Real(request.send().await?))
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| TransportError::from_request(e, url))?;
+                Ok(RawResponse::Real(response))
             }
             #[cfg(test)]
             Self::Stubbed(client) => client.get(url).map(RawResponse::Stubbed),
@@ -545,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_closed_port_is_a_transport_error() {
+    async fn a_closed_port_is_a_transport_error_without_the_url() {
         // Bind, note the port, and close it again, so nothing listens there.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -559,6 +587,35 @@ mod tests {
         assert!(text.starts_with("error sending request"), "{text}");
         // The cause from deeper in reqwest's chain reaches the message.
         assert!(text.to_lowercase().contains("connect"), "{text}");
+        // The caller names the URL, so the message does not repeat it.
+        assert!(!text.contains(url.as_str()), "{text}");
+    }
+
+    // reqwest names the URL its redirect policy stopped at, which is not
+    // the one the caller asked for. Only the message can say where that
+    // was.
+    #[tokio::test]
+    async fn a_redirect_loop_names_where_it_stopped() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/loop"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
+            .mount(&server)
+            .await;
+        let start = Url::parse(&format!("{}/start", server.uri())).unwrap();
+
+        let err = Http::create().unwrap().get(&start, &[]).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.ends_with(&format!(" at {}/loop", server.uri())),
+            "{text}"
+        );
+        assert!(!text.contains(start.as_str()), "{text}");
     }
 
     fn url(s: &str) -> Url {

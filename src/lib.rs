@@ -566,7 +566,7 @@ mod tests {
             [Line {
                 word: "Stale",
                 tone: Tone::Warn,
-                detail: "https://feed.example/feed.xml (The request feed at `https://feed.example/feed.xml` received an unexpected error (HTTP 503).)".to_string(),
+                detail: "https://feed.example/feed.xml (server answered HTTP 503)".to_string(),
             }]
         );
     }

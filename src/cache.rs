@@ -8,7 +8,7 @@
 //! once. Before a fetch, [`Cache::plan`] says whether to serve the cached
 //! Feed or send a request, and with which Validators. After the server
 //! answers, [`Cache::record`] takes the [`Outcome`] and returns the body to
-//! parse. When the fetch fails for a reason that may pass,
+//! parse, if it has one. When the fetch fails for a reason that may pass,
 //! [`Cache::fallback`] gives the cached body. No question touches HTTP, so
 //! tests replay whole sequences of outcomes against a stopped clock.
 //!
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::{error::OpenringError, fs::Fs};
+use crate::fs::Fs;
 
 /// A Feed's raw document, shared rather than copied between the cache and
 /// the fetch that serves it. It stays bytes, not text: the feed parser must
@@ -201,20 +201,9 @@ impl Cache {
     }
 
     /// Record what the server said about the Feed at `url` at `now`, and
-    /// return the body to parse.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OpenringError::EmptyFeedError`] when the server says the
-    /// body has not changed but the cache holds none, and
-    /// [`OpenringError::RateLimitError`] when the server is rate limiting a
-    /// Feed the cache knows nothing about.
-    pub(crate) fn record(
-        &self,
-        url: &Url,
-        outcome: Outcome,
-        now: Timestamp,
-    ) -> Result<Body, OpenringError> {
+    /// return the body to parse. `None` when the server confirmed or rate
+    /// limited a Feed the cache holds nothing for.
+    pub(crate) fn record(&self, url: &Url, outcome: Outcome, now: Timestamp) -> Option<Body> {
         match outcome {
             Outcome::Fresh { body, validators } => {
                 let body = Arc::new(body);
@@ -228,13 +217,10 @@ impl Cache {
                         body: Arc::clone(&body),
                     },
                 );
-                Ok(body)
+                Some(body)
             }
             Outcome::NotModified(validators) => {
-                let mut entry = self
-                    .entries
-                    .get_mut(url)
-                    .ok_or_else(|| OpenringError::EmptyFeedError(url.as_str().to_string()))?;
+                let mut entry = self.entries.get_mut(url)?;
                 entry.fetched_at = now;
                 // "Not modified" is a normal answer too, so it ends any Retry
                 // window just as a fresh body does.
@@ -247,16 +233,13 @@ impl Cache {
                 if validators.last_modified.is_some() {
                     entry.validators.last_modified = validators.last_modified;
                 }
-                Ok(Arc::clone(&entry.body))
+                Some(Arc::clone(&entry.body))
             }
             Outcome::RateLimited { until } => {
-                let mut entry = self
-                    .entries
-                    .get_mut(url)
-                    .ok_or_else(|| OpenringError::RateLimitError(url.as_str().to_string()))?;
+                let mut entry = self.entries.get_mut(url)?;
                 entry.fetched_at = now;
                 entry.retry_until = Some(until);
-                Ok(Arc::clone(&entry.body))
+                Some(Arc::clone(&entry.body))
             }
         }
     }
@@ -281,7 +264,7 @@ mod tests {
     use url::Url;
 
     use super::{Body, Cache, Outcome, Plan, Validators};
-    use crate::{error::OpenringError, fs::Fs, test_support::warnings_logged};
+    use crate::{fs::Fs, test_support::warnings_logged};
 
     const CACHE_PATH: &str = "/cache/cache.json";
 
@@ -413,20 +396,8 @@ mod tests {
         body: Vec<u8>,
     }
 
-    #[derive(Debug, PartialEq)]
-    enum Served {
-        Body(Vec<u8>),
-        Empty,
-        RateLimited,
-    }
-
-    fn served(result: Result<Body, OpenringError>) -> Served {
-        match result {
-            Ok(body) => Served::Body(body.to_vec()),
-            Err(OpenringError::EmptyFeedError(_)) => Served::Empty,
-            Err(OpenringError::RateLimitError(_)) => Served::RateLimited,
-            Err(e) => panic!("unexpected error {e:?}"),
-        }
+    fn served(body: Option<Body>) -> Option<Vec<u8>> {
+        body.map(|body| body.to_vec())
     }
 
     struct CacheMachine {
@@ -496,7 +467,7 @@ mod tests {
                     body: body.clone(),
                 },
             );
-            assert_eq!(got, Served::Body(body));
+            assert_eq!(got, Some(body));
         }
 
         #[rule]
@@ -509,20 +480,17 @@ mod tests {
                 self.now,
             ));
 
-            let expected = match self.model.get_mut(&url) {
-                Some(entry) => {
-                    entry.fetched_at = self.now;
-                    entry.retry_until = None;
-                    if validators.etag.is_some() {
-                        entry.validators.etag = validators.etag;
-                    }
-                    if validators.last_modified.is_some() {
-                        entry.validators.last_modified = validators.last_modified;
-                    }
-                    Served::Body(entry.body.clone())
+            let expected = self.model.get_mut(&url).map(|entry| {
+                entry.fetched_at = self.now;
+                entry.retry_until = None;
+                if validators.etag.is_some() {
+                    entry.validators.etag = validators.etag;
                 }
-                None => Served::Empty,
-            };
+                if validators.last_modified.is_some() {
+                    entry.validators.last_modified = validators.last_modified;
+                }
+                entry.body.clone()
+            });
             assert_eq!(got, expected);
         }
 
@@ -542,14 +510,11 @@ mod tests {
                     .record(&url, Outcome::RateLimited { until }, self.now),
             );
 
-            let expected = match self.model.get_mut(&url) {
-                Some(entry) => {
-                    entry.fetched_at = self.now;
-                    entry.retry_until = Some(until);
-                    Served::Body(entry.body.clone())
-                }
-                None => Served::RateLimited,
-            };
+            let expected = self.model.get_mut(&url).map(|entry| {
+                entry.fetched_at = self.now;
+                entry.retry_until = Some(until);
+                entry.body.clone()
+            });
             assert_eq!(got, expected);
         }
 

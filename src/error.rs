@@ -20,21 +20,6 @@ pub enum OpenringError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     FeedWeightError(#[from] FeedWeightError),
-    #[error("The feed at `{0}` was empty.")]
-    #[diagnostic(code(openring::empty_feed_error))]
-    EmptyFeedError(String),
-    #[error("The feed at `{url}` is too large ({bytes} bytes).")]
-    #[diagnostic(code(openring::feed_too_large_error))]
-    FeedTooLargeError { url: String, bytes: u64 },
-    #[error("The request feed at `{0}` was rate limited (HTTP 429).")]
-    #[diagnostic(code(openring::rate_limit_error))]
-    RateLimitError(String),
-    #[error("The request feed at `{url}` received an unexpected error (HTTP {status}).")]
-    #[diagnostic(code(openring::unexpected_status_error))]
-    UnexpectedStatusError { url: String, status: String },
-    #[error(transparent)]
-    #[diagnostic(code(openring::parse_feed_error))]
-    ParseFeedError(#[from] feed_rs::parser::ParseFeedError),
     #[error("Failed to read `{path}`.")]
     #[diagnostic(code(openring::read_file_error))]
     ReadFileError {
