@@ -42,8 +42,9 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// The real stderr. Bars draw only when stderr is a terminal, and use
-    /// color unless `NO_COLOR` is set to anything but an empty string, as
+    /// The real stderr. Bars draw only when stderr is a terminal that can
+    /// draw them: `TERM` is set and is not `dumb`. They use color unless
+    /// `NO_COLOR` is set to anything but an empty string, as
     /// <https://no-color.org> asks.
     #[must_use]
     pub fn create() -> Self {
@@ -67,7 +68,8 @@ impl Terminal {
 
     /// Whether a person can see the bars. When they cannot, the bars and
     /// their status lines vanish, so failures must go to the log instead.
-    pub(crate) fn is_visible(&self) -> bool {
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
         self.visible
     }
 

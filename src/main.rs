@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use clap::Parser;
 use miette::Result;
 use tracing_log::AsTrace;
@@ -20,7 +18,10 @@ async fn main() -> Result<()> {
         // Suspends any active progress bar around each log line, so the two
         // don't splice on a tty.
         .with_writer(move || log_terminal.log_writer());
-    if std::io::stderr().is_terminal() {
+    // Ask the Terminal, so log lines and bars agree on whether a person
+    // watches. Its answer also covers `TERM=dumb`, which a plain
+    // `is_terminal()` check would miss.
+    if terminal.is_visible() {
         // A person reads these lines beside the progress list. A timestamp
         // and module path make each line wrap and add nothing for them.
         // ANSI stays at the default, so NO_COLOR still turns color off.
