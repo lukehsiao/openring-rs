@@ -30,9 +30,12 @@ pub enum OpenringError {
     #[error("Failed to write the output.")]
     #[diagnostic(code(openring::output_error))]
     OutputError(#[source] std::io::Error),
-    #[error("Failed to parse tera template.")]
+    #[error("Failed to parse the template.")]
     #[diagnostic(code(openring::template_error))]
-    TemplateError(#[from] tera::Error),
+    TemplateError(#[source] tera::Error),
+    #[error("Failed to render the template.")]
+    #[diagnostic(code(openring::render_error))]
+    RenderError(#[source] tera::Error),
 }
 
 #[derive(Error, Diagnostic, Debug)]

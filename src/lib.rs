@@ -128,7 +128,9 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
 
     let mut context = tera::Context::new();
     context.insert("articles", &articles);
-    let output = tera.render(TEMPLATE_NAME, &context)?;
+    let output = tera
+        .render(TEMPLATE_NAME, &context)
+        .map_err(OpenringError::RenderError)?;
     write_output(out, &output)
 }
 
@@ -158,7 +160,8 @@ fn template_engine(template: &str) -> Result<Tera> {
         tera_contrib::urlencode::urlencode_strict,
     );
     tera.register_function("now", tera_contrib::dates::now);
-    tera.add_raw_template(TEMPLATE_NAME, template)?;
+    tera.add_raw_template(TEMPLATE_NAME, template)
+        .map_err(OpenringError::TemplateError)?;
     Ok(tera)
 }
 
@@ -323,11 +326,40 @@ mod tests {
             vec![],
         )
         .await;
-        assert!(outcome.result.is_err());
+        assert!(
+            matches!(
+                outcome.result,
+                Err(crate::error::OpenringError::TemplateError(_))
+            ),
+            "{:?}",
+            outcome.result
+        );
         assert_eq!(
             outcome.requests,
             [],
             "feeds were fetched despite a template that can never render"
+        );
+    }
+
+    // A template that parses but fails while rendering says so, instead of
+    // claiming it failed to parse.
+    #[tokio::test]
+    async fn run_reports_a_template_that_fails_to_render() {
+        let url = "https://feed.example/feed.xml";
+        let outcome = run_nulled(
+            run_args(&[url]),
+            Some("{{ not_in_the_context }}"),
+            None,
+            vec![(url, crate::http::Answer::ok(MOCK_RSS))],
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome.result,
+                Err(crate::error::OpenringError::RenderError(_))
+            ),
+            "{:?}",
+            outcome.result
         );
     }
 
