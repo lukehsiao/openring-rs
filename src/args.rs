@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, builder::ValueHint};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
-use jiff::civil::Date;
+use jiff::{Span, SpanRelativeTo, civil::Date};
 
 const AFTER_LONG_HELP: &str = "\
 Examples:
@@ -69,7 +69,7 @@ pub struct Args {
     /// sent, confirmed, or rate-limited it
     #[arg(
         long,
-        value_parser = humantime::parse_duration,
+        value_parser = parse_duration,
         default_value = "30d"
     )]
     pub max_cache_age: Duration,
@@ -87,13 +87,52 @@ pub struct Args {
     pub verbose: Verbosity<WarnLevel>,
 }
 
+/// Parse a non-negative human-readable duration (such as `30d`, `2w`, or
+/// `1d 12h`) using 24-hour days.
+fn parse_duration(input: &str) -> Result<Duration, String> {
+    let span: Span = input.parse().map_err(|e| format!("{e}"))?;
+    let signed = span
+        .to_duration(SpanRelativeTo::days_are_24_hours())
+        .map_err(|e| format!("{e}"))?;
+    Duration::try_from(signed).map_err(|_| "duration cannot be negative".to_owned())
+}
+
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use crate::*;
     #[test]
     fn verify_app() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn max_cache_age_parses_friendly_durations_and_rejects_invalid_ones() {
+        use clap::Parser;
+
+        let default = Args::try_parse_from(["openring", "-t", "t.html"]).unwrap();
+        assert_eq!(default.max_cache_age, Duration::from_hours(30 * 24));
+
+        for (raw, expected) in [
+            ("2w", Duration::from_hours(14 * 24)),
+            ("1d 12h", Duration::from_hours(36)),
+            ("2 hours 30 minutes", Duration::from_mins(150)),
+            ("0s", Duration::ZERO),
+        ] {
+            let args =
+                Args::try_parse_from(["openring", "-t", "t.html", "--max-cache-age", raw]).unwrap();
+            assert_eq!(args.max_cache_age, expected, "{raw:?}");
+        }
+
+        for invalid in ["-1d", "1y", "not-a-duration"] {
+            assert!(
+                Args::try_parse_from(["openring", "-t", "t.html", "--max-cache-age", invalid])
+                    .is_err(),
+                "expected {invalid:?} to fail"
+            );
+        }
     }
 
     #[test]
