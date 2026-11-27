@@ -7,7 +7,7 @@
 //! and an Entry that cannot become an Article is skipped and counted.
 
 use feed_rs::model::{Entry, Feed as Document, Link};
-use jiff::Timestamp;
+use jiff::{Timestamp, ZonedDateTime};
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -320,8 +320,8 @@ fn sanitize_text(raw: &str) -> String {
 /// already be sanitized.
 ///
 /// Returns `None` exactly when the entry is incomplete: missing a usable
-/// link, a title a reader can see, or a date jiff can represent. Selection
-/// policy (date cutoff, per-source caps) belongs to [`crate::select`].
+/// link, a title a reader can see, or a usable date. Selection policy (date
+/// cutoff, per-source caps) belongs to [`crate::select`].
 fn build_article(
     entry: &Entry,
     feed_url: &Url,
@@ -331,12 +331,11 @@ fn build_article(
     let (Some(link), Some(title), Some(timestamp)) = (
         resolve_entry_link(entry, feed_url),
         entry.title.as_ref().and_then(|t| visible_text(&t.content)),
-        // The first date jiff can represent, so an out-of-range published
-        // date does not hide a usable updated one.
-        [entry.published, entry.updated]
-            .into_iter()
-            .flatten()
-            .find_map(|date| Timestamp::from_second(date.timestamp()).ok()),
+        entry
+            .published
+            .as_ref()
+            .or(entry.updated.as_ref())
+            .map(ZonedDateTime::timestamp),
     ) else {
         // Routine for third-party feeds and recurring every run, so the
         // per-entry detail stays at debug; project warns once per feed
@@ -892,30 +891,28 @@ mod tests {
     // makes an Entry incomplete.
     #[test]
     fn invisible_titles_count_as_missing() {
-        for title in [
-            "   ",
-            "&lt;b&gt;&lt;/b&gt;",
-            "&lt;script&gt;x&lt;/script&gt;",
-            "&amp;nbsp;",
-        ] {
-            let source = parse_xml(&format!(
-                r#"<?xml version="1.0"?>
-                <feed xmlns="http://www.w3.org/2005/Atom">
-                    <title>{title}</title>
-                    <link href="https://example.com/"/>
-                    <updated>2020-01-01T00:00:00Z</updated>
-                    <entry>
-                        <title>{title}</title>
-                        <link href="https://example.com/hidden"/>
-                        <published>2020-01-02T00:00:00Z</published>
-                    </entry>
-                    <entry>
-                        <title>Visible</title>
-                        <link href="https://example.com/visible"/>
-                        <published>2020-01-01T00:00:00Z</published>
-                    </entry>
-                </feed>"#
-            ));
+        for title in ["   ", "<b></b>", "<script>x</script>", "&nbsp;"] {
+            let feed_json = serde_json::json!({
+                "version": "https://jsonfeed.org/version/1.1",
+                "title": title,
+                "home_page_url": "https://example.com/",
+                "items": [
+                    {
+                        "id": "hidden",
+                        "title": title,
+                        "url": "https://example.com/hidden",
+                        "date_published": "2020-01-02T00:00:00Z",
+                    },
+                    {
+                        "id": "visible",
+                        "title": "Visible",
+                        "url": "https://example.com/visible",
+                        "date_published": "2020-01-01T00:00:00Z",
+                    },
+                ],
+            })
+            .to_string();
+            let source = parse_xml(&feed_json);
             let [article] = source.articles() else {
                 panic!(
                     "expected only the visible entry for {title:?}: {:?}",
@@ -944,7 +941,6 @@ mod tests {
         let xml = format!(
             r#"<?xml version="1.0"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
-                <title></title>
                 <link href="https://example.com/"/>
                 <updated>2020-01-01T00:00:00Z</updated>
                 {SAMPLE_ENTRY}
@@ -956,8 +952,8 @@ mod tests {
 
     #[test]
     fn an_out_of_range_published_date_falls_back_to_updated() {
-        // The RSS date parser accepts a five-digit year, past the end of
-        // jiff's range in year 9999.
+        // A five-digit year is past jiff's range in year 9999, so projection
+        // uses the Entry's updated date instead.
         let source = parse_xml(
             r#"<?xml version="1.0"?>
             <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
