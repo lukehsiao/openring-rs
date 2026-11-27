@@ -1,5 +1,4 @@
 pub mod args;
-mod cache;
 mod clock;
 pub mod error;
 mod fan_out;
@@ -24,10 +23,10 @@ use tracing::debug;
 
 use crate::{
     args::Args,
-    cache::Cache,
     clock::Clock,
     error::{OpenringError, Result},
     feed_list::UrlsFile,
+    feedfetcher::CacheConfig,
     fs::Fs,
     http::Http,
     terminal::Terminal,
@@ -62,7 +61,7 @@ pub async fn run(args: Args, terminal: &Terminal, out: impl Write) -> Result<()>
         http: Http::create()?,
         fs: Fs::create(),
         clock: Clock::create(),
-        cache_path: Cache::default_path(),
+        cache_path: feedfetcher::default_cache_path(),
     };
     run_with(&deps, terminal, args, out).await
 }
@@ -73,16 +72,6 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
     // Read and parse the template before anything else: a wrong path or a
     // syntax error should fail in milliseconds, not after fetching every feed.
     let tera = template_engine(&read_file(&deps.fs, &args.template_file)?)?;
-
-    // One instant for the whole run, so cache pruning and every fetch agree
-    // on which entries are too old and which retry windows are open.
-    let now = deps.clock.now();
-    let cache = Cache::open(
-        &deps.fs,
-        deps.cache_path.as_deref().filter(|_| !args.no_cache),
-        args.max_cache_age,
-        now,
-    );
 
     // The Feed list from -s values and the urls file. Repeated listings
     // collapse and contradictory weights fail fast, before any fetch.
@@ -106,9 +95,19 @@ async fn run_with(deps: &Deps, terminal: &Terminal, args: Args, out: impl Write)
         .transpose()
         .map_err(OpenringError::CivilDateError)?;
 
-    let sources = feedfetcher::fetch_sources(&deps.http, terminal, feed_list, &cache, now).await;
-
-    cache.save(&deps.fs);
+    // One instant for the whole run, so cache pruning and every fetch agree
+    // on which entries are too old and which Retry windows are open.
+    let now = deps.clock.now();
+    let cache = deps
+        .cache_path
+        .as_deref()
+        .filter(|_| !args.no_cache)
+        .map(|path| CacheConfig {
+            path,
+            max_age: args.max_cache_age,
+        });
+    let sources =
+        feedfetcher::fetch_sources(&deps.http, &deps.fs, terminal, feed_list, cache, now).await;
 
     // Entropy by default: rotating the weighted picks between runs is the
     // point. A fixed seed reproduces the same picks for tests and stable
@@ -396,6 +395,81 @@ mod tests {
         let outcome = run_nulled(args, Some(TITLES_TEMPLATE), None, vec![]).await;
         let err = outcome.result.expect_err("no urls file to read");
         assert_eq!(err.to_string(), format!("Failed to read `{URLS_PATH}`."));
+    }
+
+    // Invalid user input fails before opening the cache file, so a corrupt
+    // cache produces no warning on a doomed run.
+    #[test]
+    fn run_fails_fast_on_bad_input_without_reading_a_corrupt_cache() {
+        use super::run_with;
+        use crate::{
+            args::Args, clock::Clock, error::OpenringError, http::Http, terminal::Terminal,
+        };
+
+        struct Case {
+            label: &'static str,
+            args: Args,
+            zone: jiff::tz::TimeZone,
+            is_expected_err: fn(&OpenringError) -> bool,
+        }
+
+        let cases = [
+            Case {
+                label: "invalid feed listing",
+                args: parse_args(&["--url", "not-a-url"]),
+                zone: jiff::tz::TimeZone::UTC,
+                is_expected_err: |e| matches!(e, OpenringError::FeedList(_)),
+            },
+            Case {
+                label: "missing urls file",
+                args: parse_args(&["--url-file", URLS_PATH]),
+                zone: jiff::tz::TimeZone::UTC,
+                is_expected_err: |e| matches!(e, OpenringError::ReadFileError { .. }),
+            },
+            Case {
+                label: "out-of-range before date",
+                args: Args {
+                    before: Some(jiff::civil::Date::MIN),
+                    ..parse_args(&["--url", "https://feed.example/feed.xml"])
+                },
+                zone: jiff::tz::TimeZone::fixed(jiff::tz::offset(1)),
+                is_expected_err: |e| matches!(e, OpenringError::CivilDateError(_)),
+            },
+        ];
+
+        for case in cases {
+            let mut deps = nulled_deps(
+                Http::create_null::<crate::http::Answer>([]),
+                [
+                    (TEMPLATE_PATH, TITLES_TEMPLATE),
+                    ("/cache/cache.json", "{corrupt"),
+                ],
+            );
+            deps.clock = Clock::create_null(deps.clock.now(), case.zone);
+
+            let mut result = None;
+            let logs = warnings_logged(|| {
+                result = Some(block_on(run_with(
+                    &deps,
+                    &Terminal::create_null(false),
+                    case.args,
+                    std::io::sink(),
+                )));
+            });
+            let Err(err) = result.unwrap() else {
+                panic!("{}: expected input validation error", case.label);
+            };
+            assert!(
+                (case.is_expected_err)(&err),
+                "{}: unexpected error {err:?}",
+                case.label
+            );
+            assert_eq!(
+                logs, "",
+                "{}: cache was opened before input validation failed",
+                case.label
+            );
+        }
     }
 
     #[tokio::test]

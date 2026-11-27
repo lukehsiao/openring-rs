@@ -1,21 +1,44 @@
-//! The feed fetch module: turn the Feed list into Sources. For each Feed it
-//! asks the cache what to do, sends the request, turns the response into a
-//! cache [`Outcome`], parses the body into a [`Source`], and reports how
-//! the fetch went. Every rule about what the cache stores lives in the
-//! cache module.
+//! The feed fetch module: turn the Feed list into Sources. It opens the
+//! private feed cache once per run, asks the cache what to do for each Feed,
+//! sends the request, records the [`Outcome`], parses the body into a
+//! [`Source`], reports how the fetch went, and saves the cache on exit.
+//! Every rule about what the cache stores lives in the private `cache`
+//! submodule.
 
+mod cache;
+
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use directories::ProjectDirs;
 use jiff::{SignedDuration, Timestamp};
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use self::cache::{Body, Cache, Outcome, Plan, Validators};
 use crate::{
-    cache::{Body, Cache, Outcome, Plan, Validators},
     fan_out::{self, Words, fan_out},
     feed_list::Feed,
+    fs::Fs,
     http::{Http, ReadError, Response, StatusCode, TransportError},
     source::{self, ParseError, Source},
     terminal::Terminal,
 };
+
+/// Where the feed cache lives on disk and how long entries remain valid.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheConfig<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) max_age: Duration,
+}
+
+/// Where the feed cache lives by default, if the platform has a cache
+/// directory.
+pub(crate) fn default_cache_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "hsiao", "openring").map(|dirs| dirs.cache_dir().join("cache.json"))
+}
 
 const FETCH_WORDS: Words = Words {
     progress: "Fetching",
@@ -26,24 +49,34 @@ const FETCH_WORDS: Words = Words {
 };
 
 /// Fetch every Feed through the shared `http` client as of `now`, and
-/// parse each fetched body into its Source, with progress on `terminal`. A
-/// Feed served from the cache because the server failed shows as stale. A
-/// Feed that is gone (404 or 410), or that fails with nothing cached to
-/// fall back on, is reported and skipped.
+/// parse each fetched body into its Source, with progress on `terminal`.
+/// When `feeds` is empty, this returns immediately without reading or
+/// writing the cache. Otherwise, when `cache` is `Some`, this opens the
+/// cache file through `fs` before fetching and saves it afterward. A Feed
+/// served from the cache because the server failed shows as stale. A Feed
+/// that is gone (404 or 410), or that fails with nothing cached to fall
+/// back on, is reported and skipped.
 pub(crate) async fn fetch_sources(
     http: &Http,
+    fs: &Fs,
     terminal: &Terminal,
     feeds: Vec<Feed>,
-    cache: &Cache,
+    cache: Option<CacheConfig<'_>>,
     now: Timestamp,
 ) -> Vec<Source> {
+    if feeds.is_empty() {
+        return Vec::new();
+    }
+    let cache = Cache::open(fs, cache, now);
     let items = feeds.into_iter().map(|f| (f.url.clone(), f)).collect();
-    fan_out(terminal, &FETCH_WORDS, items, |_, feed| {
+    let sources = fan_out(terminal, &FETCH_WORDS, items, |_, feed| {
         // Both are cheap handles to shared state.
         let (http, cache) = (http.clone(), cache.clone());
         async move { fetch_feed(&feed, &http, &cache, now).await }
     })
-    .await
+    .await;
+    cache.save(fs);
+    sources
 }
 
 /// The largest response body accepted as a feed. Even full-content,
@@ -254,11 +287,15 @@ mod tests {
     use jiff::{SignedDuration, Timestamp, ToSpan};
     use url::Url;
 
-    use super::{DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES, fetch_feed, normalize_etag, retry_deadline};
-    use crate::{
+    use super::{
+        CacheConfig, DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES,
         cache::{Cache, Outcome, Plan, Validators},
+        fetch_feed, normalize_etag, retry_deadline,
+    };
+    use crate::{
         fan_out,
         feed_list::Feed,
+        fs::Fs,
         http::{Answer, Http, Request},
         source::Source,
         test_support::block_on,
@@ -713,15 +750,37 @@ mod tests {
     // line, though the cache holds a copy.
     #[tokio::test]
     async fn a_gone_feed_shows_an_error_and_yields_no_source() {
+        use std::{path::Path, time::Duration};
+
         use crate::terminal::{Terminal, Tone};
 
-        let cache = cache_holding("cached", Validators::default());
-        let http = Http::create_null([(feed_url(), Answer::status(404))]);
+        let fs = Fs::create_null([]);
+        let cache = Some(CacheConfig {
+            path: Path::new("/cache/cache.json"),
+            max_age: Duration::MAX,
+        });
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("cached")),
+                Answer::status(404),
+            ],
+        )]);
+
+        let first = super::fetch_sources(
+            &http,
+            &fs,
+            &Terminal::create_null(false),
+            vec![feed()],
+            cache,
+            now(),
+        )
+        .await;
+        assert_eq!(first.len(), 1);
+
         let terminal = Terminal::create_null(true);
         let lines = terminal.track_lines();
-        let feeds = vec![feed()];
-
-        let sources = super::fetch_sources(&http, &terminal, feeds, &cache, now()).await;
+        let sources = super::fetch_sources(&http, &fs, &terminal, vec![feed()], cache, now()).await;
 
         assert!(sources.is_empty(), "{sources:?}");
         let lines = lines.data();
@@ -921,5 +980,50 @@ mod tests {
         let http = Http::create_null([(feed_url(), Answer::status(500))]);
         let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
         assert_eq!(cause, "server answered HTTP 500");
+    }
+
+    // An empty Feed list returns immediately without reading or writing the
+    // cache file.
+    #[test]
+    fn fetch_sources_with_no_feeds_skips_cache_disk_io() {
+        use std::{io, path::Path, time::Duration};
+
+        use crate::{terminal::Terminal, test_support::warnings_logged};
+
+        let cache_path = Path::new("/cache/cache.json");
+        let cache = Some(CacheConfig {
+            path: cache_path,
+            max_age: Duration::MAX,
+        });
+
+        let corrupt_fs = Fs::create_null([("/cache/cache.json", "{corrupt")]);
+        let logs = warnings_logged(|| {
+            let sources = block_on(super::fetch_sources(
+                &Http::create_null::<Answer>([]),
+                &corrupt_fs,
+                &Terminal::create_null(false),
+                Vec::new(),
+                cache,
+                now(),
+            ));
+            assert!(sources.is_empty());
+        });
+        assert_eq!(logs, "");
+        assert_eq!(corrupt_fs.read_locked(cache_path).unwrap(), "{corrupt");
+
+        let empty_fs = Fs::create_null([]);
+        let sources = block_on(super::fetch_sources(
+            &Http::create_null::<Answer>([]),
+            &empty_fs,
+            &Terminal::create_null(false),
+            Vec::new(),
+            cache,
+            now(),
+        ));
+        assert!(sources.is_empty());
+        assert_eq!(
+            empty_fs.read_locked(cache_path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }
