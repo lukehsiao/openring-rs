@@ -331,12 +331,38 @@ mod tests {
         )
     }
 
+    // Map Hegel's temporal instants into jiff 1.x timestamps across jiff's
+    // full representable range.
+    fn timestamps() -> impl hegel::PrintableGenerator<Timestamp> {
+        use generators::{Generator as _, temporal};
+
+        const NANOS_PER_SECOND: i128 = 1_000_000_000;
+        let to_instant = |ts: Timestamp| {
+            let nanos = ts.as_nanosecond();
+            temporal::Instant::new(
+                i64::try_from(nanos.div_euclid(NANOS_PER_SECOND)).expect("fits in i64"),
+                u32::try_from(nanos.rem_euclid(NANOS_PER_SECOND)).expect("fits in u32"),
+            )
+        };
+
+        temporal::instants()
+            .min_value(to_instant(Timestamp::MIN))
+            .max_value(to_instant(Timestamp::MAX))
+            .map(|t| {
+                Timestamp::new(
+                    t.second,
+                    i32::try_from(t.nanosecond).expect("sub-second nanos fit in i32"),
+                )
+                .expect("instant stays within jiff Timestamp bounds")
+            })
+    }
+
     // Whatever the header holds and whenever it arrives, the deadline is an
     // instant, never a panic.
     #[hegel::test]
     fn retry_deadline_never_panics(tc: hegel::TestCase) {
         let header = tc.draw(generators::optional(generators::text()));
-        let now = tc.draw(hegel::extras::jiff::timestamps());
+        let now = tc.draw(timestamps());
         let _ = retry_deadline(header.as_deref(), now);
     }
 
@@ -345,7 +371,7 @@ mod tests {
     #[hegel::test]
     fn retry_deadline_counts_integer_seconds_from_now(tc: hegel::TestCase) {
         let secs = tc.draw(generators::integers::<i64>());
-        let now = tc.draw(hegel::extras::jiff::timestamps());
+        let now = tc.draw(timestamps());
         let deadline = retry_deadline(Some(&secs.to_string()), now);
         // Nanoseconds, since `now` may fall between whole seconds.
         let expected = now.as_nanosecond() + i128::from(secs) * 1_000_000_000;
@@ -405,9 +431,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let now = tc.draw(hegel::extras::jiff::timestamps());
-        let header =
-            jiff::fmt::rfc2822::to_string(&date.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
+        let now = tc.draw(timestamps());
+        let header = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(&date)
+            .unwrap();
         assert_eq!(retry_deadline(Some(&header), now), date);
     }
 
@@ -1030,8 +1057,9 @@ mod tests {
     async fn a_429_with_an_http_date_waits_until_that_date() {
         // RFC 9110 allows Retry-After to be an HTTP-date as well as seconds.
         let until = now() + 600.seconds();
-        let header =
-            jiff::fmt::rfc2822::to_string(&until.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
+        let header = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(&until)
+            .unwrap();
         let fs = Fs::create_null([]);
         let http = Http::create_null([(
             feed_url(),
