@@ -1,24 +1,19 @@
 //! The feed fetch module: turn the Feed list into Sources. For each Feed it
 //! asks the cache what to do, sends the request, turns the response into a
-//! cache [`Outcome`], parses the body the cache hands back, and reports how
+//! cache [`Outcome`], parses the body into a [`Source`], and reports how
 //! the fetch went. Every rule about what the cache stores lives in the
 //! cache module.
 
-use feed_rs::{
-    model::Feed as Document,
-    parser::{self, ParseFeedError},
-};
 use jiff::{SignedDuration, Timestamp};
 use thiserror::Error;
 use tracing::{debug, warn};
-use url::Url;
 
 use crate::{
     cache::{Body, Cache, Outcome, Plan, Validators},
     fan_out::{self, Words, fan_out},
     feed_list::Feed,
     http::{Http, ReadError, Response, StatusCode, TransportError},
-    source::{self, Source},
+    source::{self, ParseError, Source},
     terminal::Terminal,
 };
 
@@ -31,10 +26,10 @@ const FETCH_WORDS: Words = Words {
 };
 
 /// Fetch every Feed through the shared `http` client as of `now`, and
-/// project each fetched document onto its Source, with progress on
-/// `terminal`. A Feed served from the cache because the server failed shows
-/// as stale. A Feed that is gone (404 or 410), or that fails with nothing
-/// cached to fall back on, is reported and skipped.
+/// parse each fetched body into its Source, with progress on `terminal`. A
+/// Feed served from the cache because the server failed shows as stale. A
+/// Feed that is gone (404 or 410), or that fails with nothing cached to
+/// fall back on, is reported and skipped.
 pub(crate) async fn fetch_sources(
     http: &Http,
     terminal: &Terminal,
@@ -43,22 +38,10 @@ pub(crate) async fn fetch_sources(
     now: Timestamp,
 ) -> Vec<Source> {
     let items = feeds.into_iter().map(|f| (f.url.clone(), f)).collect();
-    fan_out(terminal, &FETCH_WORDS, items, |url, feed| {
+    fan_out(terminal, &FETCH_WORDS, items, |_, feed| {
         // Both are cheap handles to shared state.
         let (http, cache) = (http.clone(), cache.clone());
-        async move {
-            match fetch_feed(&url, &http, &cache, now).await {
-                Ok(Fetched {
-                    document,
-                    stale_because: None,
-                }) => fan_out::Outcome::Done(source::project(&document, feed)),
-                Ok(Fetched {
-                    document,
-                    stale_because: Some(e),
-                }) => fan_out::Outcome::Stale(source::project(&document, feed), e.to_string()),
-                Err(e) => fan_out::Outcome::Failed(e.to_string()),
-            }
-        }
+        async move { fetch_feed(&feed, &http, &cache, now).await }
     })
     .await
 }
@@ -112,16 +95,6 @@ fn response_validators(resp: &Response) -> Validators {
     }
 }
 
-/// A parsed feed document for this run.
-#[derive(Debug)]
-struct Fetched {
-    document: Document,
-    /// Why the server could not be used, when the Feed is Stale. `None`
-    /// when the feed counts as current: the server sent or confirmed it, or
-    /// a Retry window covers it.
-    stale_because: Option<FetchFailure>,
-}
-
 /// Why a fetch gave no usable feed from the server. The text goes on a
 /// status line or a log line that already names the Feed, so it never
 /// names the URL itself.
@@ -140,7 +113,7 @@ enum FetchFailure {
     #[error("the body is too large ({bytes} bytes)")]
     TooLarge { bytes: u64 },
     #[error(transparent)]
-    NotAFeed(#[from] ParseFeedError),
+    NotAFeed(#[from] ParseError),
 }
 
 impl FetchFailure {
@@ -153,79 +126,63 @@ impl FetchFailure {
 }
 
 /// The feed to serve when the server answered, or was not asked.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one short-lived value per fetch, so boxing would only add an allocation"
-)]
 enum Served {
     /// A new body, parsed before the cache stored it.
-    Fresh(Document),
+    Fresh(Source),
     /// The cached body, still current: the server confirmed it, or asked
     /// us to keep using it for a while.
     Cached(Body),
 }
 
-/// Fetch the feed at `url` through `http`, using and updating the `cache`.
+/// Fetch `feed` through `http`, using and updating `cache`.
 /// Every cache decision and every timestamp written uses `now`.
 ///
-/// When the server fails for a reason that may pass, the cached feed is
-/// served instead, and [`Fetched::stale_because`] says why.
-///
-/// # Errors
-///
-/// Returns the failure when the feed is Gone, when it failed and the cache
-/// holds nothing to serve, or when a cached body that is still current no
-/// longer parses.
+/// When the server fails for a reason that may pass, this returns the
+/// cached Feed as [`fan_out::Outcome::Stale`]. A Feed that is Gone, that
+/// fails with nothing cached, or whose still-current cached body no longer
+/// parses returns [`fan_out::Outcome::Failed`].
 async fn fetch_feed(
-    url: &Url,
+    feed: &Feed,
     http: &Http,
     cache: &Cache,
     now: Timestamp,
-) -> Result<Fetched, FetchFailure> {
-    let served = match cache.plan(url, now) {
+) -> fan_out::Outcome<Source> {
+    let served = match cache.plan(&feed.url, now) {
         Plan::Serve(body) => Ok(Served::Cached(body)),
-        Plan::Request(validators) => fetch_from_server(url, http, cache, &validators, now).await,
+        Plan::Request(validators) => fetch_from_server(feed, http, cache, &validators, now).await,
     };
-    let document = match served {
-        Ok(Served::Fresh(document)) => document,
+    match served {
+        Ok(Served::Fresh(source)) => fan_out::Outcome::Done(source),
         // The server sent no new body, so a cached body that no longer
         // parses leaves nothing to serve. During a Retry window, asking the
         // server anyway would ignore what it asked for.
-        Ok(Served::Cached(body)) => parse(&body)?,
-        Err(failure) if failure.is_gone() => return Err(failure),
+        Ok(Served::Cached(body)) => match source::parse(&body, feed) {
+            Ok(source) => fan_out::Outcome::Done(source),
+            Err(e) => fan_out::Outcome::Failed(e.to_string()),
+        },
+        Err(failure) if failure.is_gone() => fan_out::Outcome::Failed(failure.to_string()),
         // A cached copy that does not parse cannot fill in, and the failure
         // that sent us to the cache is the one worth reporting.
-        Err(failure) => {
-            return match cache.fallback(url).and_then(|body| parse(&body).ok()) {
-                Some(document) => Ok(Fetched {
-                    document,
-                    stale_because: Some(failure),
-                }),
-                None => Err(failure),
-            };
-        }
-    };
-    Ok(Fetched {
-        document,
-        stale_because: None,
-    })
-}
-
-/// Parse a feed body. A body passes this before the cache records it, but
-/// a body loaded from disk may not parse, as after a parser upgrade.
-fn parse(body: &[u8]) -> Result<Document, FetchFailure> {
-    Ok(parser::parse(body)?)
+        Err(failure) => match cache
+            .fallback(&feed.url)
+            .and_then(|body| source::parse(&body, feed).ok())
+        {
+            Some(source) => fan_out::Outcome::Stale(source, failure.to_string()),
+            None => fan_out::Outcome::Failed(failure.to_string()),
+        },
+    }
 }
 
 /// Ask the server for the feed, record its answer in the cache, and say
 /// which feed the answer leaves to serve.
 async fn fetch_from_server(
-    url: &Url,
+    feed: &Feed,
     http: &Http,
     cache: &Cache,
     validators: &Validators,
     now: Timestamp,
 ) -> Result<Served, FetchFailure> {
+    let url = &feed.url;
     let mut headers = Vec::with_capacity(2);
     if let Some(last_modified) = &validators.last_modified {
         headers.push(("if-modified-since", last_modified.as_str()));
@@ -272,9 +229,9 @@ async fn fetch_from_server(
         if body.is_empty() {
             return Err(FetchFailure::Empty);
         }
-        let document = parse(&body)?;
+        let source = source::parse(&body, feed)?;
         cache.record(url, Outcome::Fresh { body, validators }, now);
-        return Ok(Served::Fresh(document));
+        return Ok(Served::Fresh(source));
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         (
             Outcome::RateLimited {
@@ -297,13 +254,13 @@ mod tests {
     use jiff::{SignedDuration, Timestamp, ToSpan};
     use url::Url;
 
-    use super::{
-        DEFAULT_RETRY_WINDOW, FetchFailure, Fetched, MAX_FEED_BYTES, fetch_feed, normalize_etag,
-        retry_deadline,
-    };
+    use super::{DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES, fetch_feed, normalize_etag, retry_deadline};
     use crate::{
         cache::{Cache, Outcome, Plan, Validators},
-        http::{Answer, Http, Request, StatusCode},
+        fan_out,
+        feed_list::Feed,
+        http::{Answer, Http, Request},
+        source::Source,
         test_support::block_on,
     };
 
@@ -433,6 +390,13 @@ mod tests {
         Url::parse("https://feed.example/feed.xml").unwrap()
     }
 
+    fn feed() -> Feed {
+        Feed {
+            url: feed_url(),
+            weight: None,
+        }
+    }
+
     fn validators(etag: Option<&str>, last_modified: Option<&str>) -> Validators {
         Validators {
             etag: etag.map(str::to_string),
@@ -456,33 +420,47 @@ mod tests {
         cache
     }
 
-    fn title(fetched: &Fetched) -> &str {
-        &fetched
-            .document
-            .title
-            .as_ref()
-            .expect("feed has a title")
-            .content
+    fn title(source: &Source) -> &str {
+        source
+            .articles()
+            .first()
+            .expect("feed has an article")
+            .source_title()
+    }
+
+    fn expect_done(outcome: fan_out::Outcome<Source>) -> Source {
+        match outcome {
+            fan_out::Outcome::Done(source) => source,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    fn expect_failed(outcome: fan_out::Outcome<Source>) -> String {
+        match outcome {
+            fan_out::Outcome::Failed(cause) => cause,
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     // Fetch with a cache that holds a feed titled "cached" with etag v1,
     // against a server that gives `answer`.
-    async fn fetch_over_cached(answer: Answer) -> (Result<Fetched, FetchFailure>, Cache) {
+    async fn fetch_over_cached(answer: Answer) -> (fan_out::Outcome<Source>, Cache) {
         let cache = cache_holding("cached", validators(Some("\"v1\""), None));
         let http = Http::create_null([(feed_url(), answer)]);
-        (fetch_feed(&feed_url(), &http, &cache, now()).await, cache)
+        (fetch_feed(&feed(), &http, &cache, now()).await, cache)
     }
 
-    // The cache serves its copy, says why with a failure `is_cause`
+    // The cache serves its copy, says why with a reason `is_cause`
     // accepts, and keeps its Validators for the next run.
     fn assert_served_stale(
-        result: &Result<Fetched, FetchFailure>,
+        outcome: &fan_out::Outcome<Source>,
         cache: &Cache,
-        is_cause: impl Fn(&FetchFailure) -> bool,
+        is_cause: impl Fn(&str) -> bool,
     ) {
-        let fetched = result.as_ref().expect("served the cached feed");
-        assert_eq!(title(fetched), "cached");
-        let cause = fetched.stale_because.as_ref().expect("served as Stale");
+        let fan_out::Outcome::Stale(source, cause) = outcome else {
+            panic!("expected Stale, got {outcome:?}");
+        };
+        assert_eq!(title(source), "cached");
         assert!(is_cause(cause), "{cause:?}");
         assert_eq!(
             cache.plan(&feed_url(), now()),
@@ -509,10 +487,8 @@ mod tests {
         let http = Http::create_null([(feed_url(), Answer::status(304))]);
         let requests = http.track_requests();
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("served cache on 304");
-        assert_eq!(title(&feed), "cached");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(title(&source), "cached");
         assert_eq!(
             requests.data(),
             [request(&[
@@ -528,9 +504,7 @@ mod tests {
         // RFC 7232 allows a 304 to rotate the validators it confirms.
         let http = Http::create_null([(feed_url(), Answer::status(304).header("etag", "\"new\""))]);
 
-        fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("served cache on 304");
+        expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
         assert_eq!(
             cache.plan(&feed_url(), now()),
             Plan::Request(validators(Some("\"new\""), None))
@@ -554,9 +528,7 @@ mod tests {
         let requests = http.track_requests();
 
         for run in [t0 + 2.hours(), t0 + 2.hours() + 1.second()] {
-            fetch_feed(&feed_url(), &http, &cache, run)
-                .await
-                .unwrap_or_else(|e| panic!("run at {run} served cache on 304: {e}"));
+            expect_done(fetch_feed(&feed(), &http, &cache, run).await);
         }
         // Two runs, two requests: a 304 ends the rate limit just as a 200
         // does, so the second run must ask the server again.
@@ -573,10 +545,8 @@ mod tests {
         )]);
         let cache = Cache::default();
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("fetched fresh feed");
-        assert_eq!(title(&feed), "fresh");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(title(&source), "fresh");
         assert_eq!(
             cache.plan(&feed_url(), now()),
             Plan::Request(validators(
@@ -596,20 +566,16 @@ mod tests {
             .to_vec();
         body.push(0xE9);
         body.extend_from_slice(
-            br"</title><link>https://x.example/</link><description>d</description></channel></rss>",
+            br"</title><link>https://x.example/</link><description>d</description><item><title>post</title><link>https://x.example/post</link><pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate></item></channel></rss>",
         );
         let http = Http::create_null([(feed_url(), vec![Answer::ok(body), Answer::status(304)])]);
         let cache = Cache::default();
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("parsed latin-1 feed");
-        assert_eq!(title(&feed), "caf\u{e9}");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(title(&source), "caf\u{e9}");
 
         // The cached bytes must reparse identically on a later 304.
-        let again = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("served cache on 304");
+        let again = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
         assert_eq!(title(&again), "caf\u{e9}");
     }
 
@@ -625,12 +591,12 @@ mod tests {
         )]);
         let cache = Cache::default();
 
-        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
-        assert!(matches!(
-            res,
-            Err(FetchFailure::TooLarge { bytes })
-                if bytes == u64::try_from(MAX_FEED_BYTES).unwrap() + 1
-        ));
+        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        let expected_bytes = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        assert_eq!(
+            cause,
+            format!("the body is too large ({expected_bytes} bytes)")
+        );
         assert_eq!(
             cache.plan(&feed_url(), now()),
             Plan::Request(Validators::default())
@@ -649,11 +615,8 @@ mod tests {
         )]);
         let cache = Cache::default();
 
-        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
-        assert!(matches!(
-            res,
-            Err(FetchFailure::TooLarge { bytes }) if bytes == announced
-        ));
+        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(cause, format!("the body is too large ({announced} bytes)"));
         // Nothing that big belongs in the cache either.
         assert_eq!(
             cache.plan(&feed_url(), now()),
@@ -664,21 +627,14 @@ mod tests {
     #[tokio::test]
     async fn a_failed_request_serves_the_cache() {
         let (result, cache) = fetch_over_cached(Answer::send_error("connection refused")).await;
-        assert_served_stale(
-            &result,
-            &cache,
-            |f| matches!(f, FetchFailure::Transport(e) if e.to_string() == "connection refused"),
-        );
+        assert_served_stale(&result, &cache, |cause| cause == "connection refused");
     }
 
     #[tokio::test]
     async fn a_failed_request_with_nothing_cached_is_an_error() {
         let http = Http::create_null([(feed_url(), Answer::send_error("connection refused"))]);
-        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
-        assert!(
-            matches!(&res, Err(FetchFailure::Transport(e)) if e.to_string() == "connection refused"),
-            "{res:?}"
-        );
+        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
+        assert_eq!(cause, "connection refused");
     }
 
     #[tokio::test]
@@ -689,11 +645,7 @@ mod tests {
                 .transfer_error("connection reset"),
         )
         .await;
-        assert_served_stale(
-            &result,
-            &cache,
-            |f| matches!(f, FetchFailure::Transport(e) if e.to_string() == "connection reset"),
-        );
+        assert_served_stale(&result, &cache, |cause| cause == "connection reset");
     }
 
     // A 200 that carries an HTML error page instead of a feed must not
@@ -706,24 +658,22 @@ mod tests {
             Answer::ok("<html><body>Service Unavailable</body></html>").header("etag", "\"v2\""),
         )
         .await;
-        assert_served_stale(&result, &cache, |f| matches!(f, FetchFailure::NotAFeed(_)));
+        assert_served_stale(&result, &cache, |cause| cause.contains("unable to parse"));
     }
 
     #[tokio::test]
     async fn an_empty_200_serves_the_cache_and_keeps_it() {
         let (result, cache) = fetch_over_cached(Answer::ok("").header("etag", "\"v2\"")).await;
-        assert_served_stale(&result, &cache, |f| matches!(f, FetchFailure::Empty));
+        assert_served_stale(&result, &cache, |cause| cause == "the body is empty");
     }
 
     #[tokio::test]
     async fn an_oversized_answer_serves_the_cache() {
         let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
         let (result, cache) = fetch_over_cached(Answer::ok("big").content_length(announced)).await;
-        assert_served_stale(
-            &result,
-            &cache,
-            |f| matches!(f, FetchFailure::TooLarge { bytes } if *bytes == announced),
-        );
+        assert_served_stale(&result, &cache, |cause| {
+            cause == format!("the body is too large ({announced} bytes)")
+        });
     }
 
     // Any status that is not a feed, a 304, a 429, or a sign the feed is
@@ -733,11 +683,9 @@ mod tests {
         let code = tc.draw(generators::integers::<u16>().min_value(300).max_value(599));
         tc.assume(![304, 404, 410, 429].contains(&code));
         let (result, cache) = block_on(fetch_over_cached(Answer::status(code)));
-        assert_served_stale(
-            &result,
-            &cache,
-            |f| matches!(f, FetchFailure::Status(status) if status.as_u16() == code),
-        );
+        assert_served_stale(&result, &cache, |cause| {
+            cause == format!("server answered HTTP {code}")
+        });
     }
 
     // A 404 or 410 says the feed is gone. Only the user can fix that, so
@@ -753,9 +701,9 @@ mod tests {
                 Answer::status(code).content_length(huge),
             ] {
                 let (result, _) = fetch_over_cached(answer).await;
-                assert!(
-                    matches!(&result, Err(FetchFailure::Status(status)) if status.as_u16() == code),
-                    "{code}: {result:?}"
+                assert_eq!(
+                    expect_failed(result),
+                    format!("server answered HTTP {code}")
                 );
             }
         }
@@ -765,19 +713,13 @@ mod tests {
     // line, though the cache holds a copy.
     #[tokio::test]
     async fn a_gone_feed_shows_an_error_and_yields_no_source() {
-        use crate::{
-            feed_list::Feed,
-            terminal::{Terminal, Tone},
-        };
+        use crate::terminal::{Terminal, Tone};
 
         let cache = cache_holding("cached", Validators::default());
         let http = Http::create_null([(feed_url(), Answer::status(404))]);
         let terminal = Terminal::create_null(true);
         let lines = terminal.track_lines();
-        let feeds = vec![Feed {
-            url: feed_url(),
-            weight: None,
-        }];
+        let feeds = vec![feed()];
 
         let sources = super::fetch_sources(&http, &terminal, feeds, &cache, now()).await;
 
@@ -801,8 +743,7 @@ mod tests {
                 .content_length(huge),
         )
         .await;
-        let fetched = result.expect("served the cache");
-        assert!(fetched.stale_because.is_none());
+        expect_done(result);
         assert!(matches!(
             cache.plan(&feed_url(), now() + 119.seconds()),
             Plan::Serve(_)
@@ -826,11 +767,8 @@ mod tests {
             .unwrap();
         let http = Http::create_null([(feed_url(), Answer::status(503))]);
 
-        let res = fetch_feed(&feed_url(), &http, &cache, now()).await;
-        assert!(
-            matches!(&res, Err(FetchFailure::Status(status)) if status.as_u16() == 503),
-            "{res:?}"
-        );
+        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(cause, "server answered HTTP 503");
     }
 
     #[tokio::test]
@@ -840,14 +778,14 @@ mod tests {
         let requests = http.track_requests();
         let cache = Cache::default();
 
-        let first = fetch_feed(&feed_url(), &http, &cache, now()).await;
-        assert!(matches!(first, Err(FetchFailure::Empty)));
+        let first = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(first, "the body is empty");
 
         // The empty body must not be cached. If it were, the next fetch
         // would send If-None-Match, the server would say 304, and the run
         // would serve the empty body until the entry aged out of the cache.
-        let second = fetch_feed(&feed_url(), &http, &cache, now()).await;
-        assert!(matches!(second, Err(FetchFailure::Empty)));
+        let second = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(second, "the body is empty");
         assert_eq!(
             requests.data(),
             [request(&[]), request(&[])],
@@ -861,10 +799,8 @@ mod tests {
         let http =
             Http::create_null([(feed_url(), Answer::status(429).header("retry-after", "120"))]);
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("served cache on 429");
-        assert_eq!(title(&feed), "rate-limited");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(title(&source), "rate-limited");
         assert!(matches!(
             cache.plan(&feed_url(), now() + 119.seconds()),
             Plan::Serve(_)
@@ -887,9 +823,7 @@ mod tests {
             Answer::status(429).header("retry-after", &header),
         )]);
 
-        fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("served cache on 429");
+        expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
         assert!(matches!(
             cache.plan(&feed_url(), until - SignedDuration::from_secs(1)),
             Plan::Serve(_)
@@ -912,10 +846,8 @@ mod tests {
         let http = Http::create_null::<Answer>([]);
         let requests = http.track_requests();
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now() + 30.minutes())
-            .await
-            .expect("served the cache");
-        assert_eq!(title(&feed), "cached");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now() + 30.minutes()).await);
+        assert_eq!(title(&source), "cached");
         assert_eq!(requests.data(), []);
     }
 
@@ -938,16 +870,16 @@ mod tests {
         let http = Http::create_null::<Answer>([]);
         let requests = http.track_requests();
 
-        let res = fetch_feed(&feed_url(), &http, &cache, now() + 30.minutes()).await;
-        assert!(matches!(res, Err(FetchFailure::NotAFeed(_))), "{res:?}");
+        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now() + 30.minutes()).await);
+        assert!(cause.contains("unable to parse"), "{cause:?}");
         assert_eq!(requests.data(), []);
     }
 
     #[tokio::test]
     async fn a_429_for_an_unknown_feed_is_a_failure() {
         let http = Http::create_null([(feed_url(), Answer::status(429))]);
-        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
-        assert!(matches!(res, Err(FetchFailure::RateLimitedUncached)));
+        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
+        assert_eq!(cause, "rate limited (HTTP 429) with nothing cached");
     }
 
     // A 304 to a request that sent no Validators confirms nothing the cache
@@ -955,11 +887,8 @@ mod tests {
     #[tokio::test]
     async fn a_304_for_an_unknown_feed_is_a_failure() {
         let http = Http::create_null([(feed_url(), Answer::status(304))]);
-        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
-        assert!(
-            matches!(res, Err(FetchFailure::NotModifiedUncached)),
-            "{res:?}"
-        );
+        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
+        assert_eq!(cause, "server answered HTTP 304, but nothing is cached");
     }
 
     #[tokio::test]
@@ -973,10 +902,8 @@ mod tests {
         )]);
         let cache = Cache::default();
 
-        let feed = fetch_feed(&feed_url(), &http, &cache, now())
-            .await
-            .expect("followed the redirect");
-        assert_eq!(title(&feed), "moved");
+        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        assert_eq!(title(&source), "moved");
         // The cache stays keyed by the URL the user configured, so later runs
         // still find their entry.
         assert_eq!(
@@ -992,10 +919,7 @@ mod tests {
     #[tokio::test]
     async fn unexpected_status_is_an_error() {
         let http = Http::create_null([(feed_url(), Answer::status(500))]);
-        let res = fetch_feed(&feed_url(), &http, &Cache::default(), now()).await;
-        assert!(matches!(
-            res,
-            Err(FetchFailure::Status(StatusCode::INTERNAL_SERVER_ERROR))
-        ));
+        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
+        assert_eq!(cause, "server answered HTTP 500");
     }
 }
