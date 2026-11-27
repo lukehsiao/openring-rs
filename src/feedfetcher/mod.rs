@@ -283,26 +283,30 @@ async fn fetch_from_server(
 
 #[cfg(test)]
 mod tests {
+    use std::{io, path::Path, time::Duration};
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use hegel::generators;
     use jiff::{SignedDuration, Timestamp, ToSpan};
     use url::Url;
 
     use super::{
-        CacheConfig, DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES,
-        cache::{Cache, Outcome, Plan, Validators},
-        fetch_feed, normalize_etag, retry_deadline,
+        CacheConfig, DEFAULT_RETRY_WINDOW, MAX_FEED_BYTES, fetch_sources, normalize_etag,
+        retry_deadline,
     };
     use crate::{
-        fan_out,
         feed_list::Feed,
         fs::Fs,
         http::{Answer, Http, Request},
         source::Source,
-        test_support::block_on,
+        terminal::{Line, Terminal, Tone},
+        test_support::{block_on, warnings_logged},
     };
 
-    // A valid RSS 2.0 feed with a parameterized title, for the tests that
-    // need a body the parser will accept.
+    const CACHE_PATH: &str = "/cache/cache.json";
+
+    // A valid RSS 2.0 feed with a parameterized title, for tests that need a
+    // body the parser accepts.
     fn get_valid_rss_feed(title: &str) -> String {
         format!(
             r#"
@@ -416,45 +420,27 @@ mod tests {
         assert_eq!(normalize_etag(&once), once);
     }
 
-    // Whole fetches against a nulled Http and a real cache: the request
-    // that goes out, and what each answer means for the next run.
-
     fn now() -> Timestamp {
         "2026-01-01T00:00:00Z".parse().unwrap()
+    }
+
+    fn cache_config() -> CacheConfig<'static> {
+        CacheConfig {
+            path: Path::new(CACHE_PATH),
+            max_age: Duration::MAX,
+        }
     }
 
     fn feed_url() -> Url {
         Url::parse("https://feed.example/feed.xml").unwrap()
     }
 
+    fn feed_at(url: Url) -> Feed {
+        Feed { url, weight: None }
+    }
+
     fn feed() -> Feed {
-        Feed {
-            url: feed_url(),
-            weight: None,
-        }
-    }
-
-    fn validators(etag: Option<&str>, last_modified: Option<&str>) -> Validators {
-        Validators {
-            etag: etag.map(str::to_string),
-            last_modified: last_modified.map(str::to_string),
-        }
-    }
-
-    // A cache that already holds a feed titled `title` from an earlier run.
-    fn cache_holding(title: &str, validators: Validators) -> Cache {
-        let cache = Cache::default();
-        cache
-            .record(
-                &feed_url(),
-                Outcome::Fresh {
-                    body: get_valid_rss_feed(title).into_bytes(),
-                    validators,
-                },
-                now(),
-            )
-            .unwrap();
-        cache
+        feed_at(feed_url())
     }
 
     fn title(source: &Source) -> &str {
@@ -465,49 +451,9 @@ mod tests {
             .source_title()
     }
 
-    fn expect_done(outcome: fan_out::Outcome<Source>) -> Source {
-        match outcome {
-            fan_out::Outcome::Done(source) => source,
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    fn expect_failed(outcome: fan_out::Outcome<Source>) -> String {
-        match outcome {
-            fan_out::Outcome::Failed(cause) => cause,
-            other => panic!("expected Failed, got {other:?}"),
-        }
-    }
-
-    // Fetch with a cache that holds a feed titled "cached" with etag v1,
-    // against a server that gives `answer`.
-    async fn fetch_over_cached(answer: Answer) -> (fan_out::Outcome<Source>, Cache) {
-        let cache = cache_holding("cached", validators(Some("\"v1\""), None));
-        let http = Http::create_null([(feed_url(), answer)]);
-        (fetch_feed(&feed(), &http, &cache, now()).await, cache)
-    }
-
-    // The cache serves its copy, says why with a reason `is_cause`
-    // accepts, and keeps its Validators for the next run.
-    fn assert_served_stale(
-        outcome: &fan_out::Outcome<Source>,
-        cache: &Cache,
-        is_cause: impl Fn(&str) -> bool,
-    ) {
-        let fan_out::Outcome::Stale(source, cause) = outcome else {
-            panic!("expected Stale, got {outcome:?}");
-        };
-        assert_eq!(title(source), "cached");
-        assert!(is_cause(cause), "{cause:?}");
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(Some("\"v1\""), None))
-        );
-    }
-
-    fn request(headers: &[(&'static str, &str)]) -> Request {
+    fn request_at(url: Url, headers: &[(&'static str, &str)]) -> Request {
         Request {
-            url: feed_url(),
+            url,
             headers: headers
                 .iter()
                 .map(|&(name, value)| (name, value.to_string()))
@@ -515,82 +461,224 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn sends_validators_and_serves_the_cache_on_304() {
-        let cache = cache_holding(
-            "cached",
-            validators(Some("\"abc123\""), Some("Mon, 01 Jan 2024 00:00:00 GMT")),
-        );
-        let http = Http::create_null([(feed_url(), Answer::status(304))]);
+    fn request(headers: &[(&'static str, &str)]) -> Request {
+        request_at(feed_url(), headers)
+    }
+
+    fn fetched_line(url: &Url) -> Line {
+        Line {
+            word: "Fetched",
+            tone: Tone::Good,
+            detail: url.to_string(),
+        }
+    }
+
+    fn error_line(url: &Url, cause: &str) -> Line {
+        Line {
+            word: "Error",
+            tone: Tone::Bad,
+            detail: format!("{url} ({cause})"),
+        }
+    }
+
+    // Build an on-disk cache JSON entry so tests can seed invalid cached bytes
+    // through `Fs`.
+    fn cache_json(
+        url: &Url,
+        body: &[u8],
+        etag: Option<&str>,
+        fetched_at: Timestamp,
+        retry_until: Option<Timestamp>,
+    ) -> String {
+        serde_json::json!({
+            url.as_str(): {
+                "fetched_at": fetched_at,
+                "retry_until": retry_until,
+                "etag": etag,
+                "last_modified": serde_json::Value::Null,
+                "body": STANDARD.encode(body),
+            }
+        })
+        .to_string()
+    }
+
+    struct FetchRun {
+        sources: Vec<Source>,
+        lines: Vec<Line>,
+    }
+
+    async fn run_fetch(
+        http: &Http,
+        fs: &Fs,
+        feeds: Vec<Feed>,
+        cache: Option<CacheConfig<'_>>,
+        at: Timestamp,
+    ) -> FetchRun {
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+        let sources = fetch_sources(http, fs, &terminal, feeds, cache, at).await;
+        FetchRun {
+            sources,
+            lines: lines.data(),
+        }
+    }
+
+    fn run_fetch_logged(
+        http: &Http,
+        fs: &Fs,
+        feeds: Vec<Feed>,
+        cache: Option<CacheConfig<'_>>,
+        at: Timestamp,
+    ) -> (FetchRun, String) {
+        let mut run = None;
+        let logs = warnings_logged(|| {
+            run = Some(block_on(run_fetch(http, fs, feeds, cache, at)));
+        });
+        (run.expect("warnings_logged runs its closure"), logs)
+    }
+
+    // Seed the cache with a Feed titled "cached" and ETag "v1", then run
+    // `answer` against it. Verify the run serves the cached copy as Stale
+    // and keeps its Validators for the next run.
+    async fn assert_served_stale(answer: Answer, is_cause: impl Fn(&str) -> bool) {
+        let fs = Fs::create_null([]);
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("cached")).header("etag", "\"v1\""),
+                answer,
+                Answer::status(304),
+            ],
+        )]);
         let requests = http.track_requests();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&source), "cached");
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(first.sources.len(), 1);
+        assert_eq!(title(&first.sources[0]), "cached");
+        assert_eq!(first.lines, [fetched_line(&feed_url())]);
+
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(second.sources.len(), 1);
+        assert_eq!(title(&second.sources[0]), "cached");
+        let [line] = second.lines.as_slice() else {
+            panic!("expected one status line, got {:?}", second.lines);
+        };
+        assert_eq!((line.word, line.tone), ("Stale", Tone::Warn));
+        let prefix = format!("{} (", feed_url());
+        let cause = line
+            .detail
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("unexpected stale detail: {:?}", line.detail));
+        assert!(is_cause(cause), "{cause:?}");
+
+        let third = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(third.sources.len(), 1);
+        assert_eq!(title(&third.sources[0]), "cached");
+        assert_eq!(third.lines, [fetched_line(&feed_url())]);
+
         assert_eq!(
             requests.data(),
-            [request(&[
-                ("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT"),
-                ("if-none-match", "\"abc123\"")
-            ])]
+            [
+                request(&[]),
+                request(&[("if-none-match", "\"v1\"")]),
+                request(&[("if-none-match", "\"v1\"")]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stores_normalized_validators_and_serves_the_cache_on_304() {
+        let fs = Fs::create_null([]);
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("fresh"))
+                    .header("etag", "feed-etag")
+                    .header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+                Answer::status(304),
+            ],
+        )]);
+        let requests = http.track_requests();
+
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(first.sources.len(), 1);
+        assert_eq!(title(&first.sources[0]), "fresh");
+        assert_eq!(first.lines, [fetched_line(&feed_url())]);
+
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(second.sources.len(), 1);
+        assert_eq!(title(&second.sources[0]), "fresh");
+        assert_eq!(second.lines, [fetched_line(&feed_url())]);
+
+        assert_eq!(
+            requests.data(),
+            [
+                request(&[]),
+                request(&[
+                    ("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT"),
+                    ("if-none-match", "\"feed-etag\""),
+                ]),
+            ]
         );
     }
 
     #[tokio::test]
     async fn a_304_rotates_the_validators_for_the_next_run() {
-        let cache = cache_holding("cached", validators(Some("\"old\""), None));
-        // RFC 7232 allows a 304 to rotate the validators it confirms.
-        let http = Http::create_null([(feed_url(), Answer::status(304).header("etag", "\"new\""))]);
+        let fs = Fs::create_null([]);
+        // RFC 7232 allows a 304 to rotate the Validators it confirms.
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("cached")).header("etag", "\"old\""),
+                Answer::status(304).header("etag", "\"new\""),
+                Answer::status(304),
+            ],
+        )]);
+        let requests = http.track_requests();
 
-        expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
+        for _ in 0..3 {
+            let run = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+            assert_eq!(run.sources.len(), 1);
+            assert_eq!(title(&run.sources[0]), "cached");
+            assert_eq!(run.lines, [fetched_line(&feed_url())]);
+        }
+
         assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(Some("\"new\""), None))
+            requests.data(),
+            [
+                request(&[]),
+                request(&[("if-none-match", "\"old\"")]),
+                request(&[("if-none-match", "\"new\"")]),
+            ]
         );
     }
 
     #[tokio::test]
     async fn a_304_after_an_expired_retry_window_does_not_reopen_it() {
         let t0 = now();
-        let cache = cache_holding("cached", validators(Some("\"v1\""), None));
-        cache
-            .record(
-                &feed_url(),
-                Outcome::RateLimited {
-                    until: t0 + 1.hour(),
-                },
-                t0,
-            )
-            .unwrap();
-        let http = Http::create_null([(feed_url(), Answer::status(304))]);
-        let requests = http.track_requests();
-
-        for run in [t0 + 2.hours(), t0 + 2.hours() + 1.second()] {
-            expect_done(fetch_feed(&feed(), &http, &cache, run).await);
-        }
-        // Two runs, two requests: a 304 ends the rate limit just as a 200
-        // does, so the second run must ask the server again.
-        assert_eq!(requests.data().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_200_stores_its_validators_for_the_next_run() {
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(
             feed_url(),
-            Answer::ok(get_valid_rss_feed("fresh"))
-                .header("etag", "feed-etag")
-                .header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+            vec![
+                Answer::ok(get_valid_rss_feed("cached")).header("etag", "\"v1\""),
+                Answer::status(429).header("retry-after", "3600"),
+                Answer::status(304),
+                Answer::status(304),
+            ],
         )]);
-        let cache = Cache::default();
+        let requests = http.track_requests();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&source), "fresh");
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(
-                Some("\"feed-etag\""),
-                Some("Mon, 01 Jan 2024 00:00:00 GMT")
-            ))
-        );
+        for at in [t0, t0, t0 + 2.hours(), t0 + 2.hours() + 1.second()] {
+            let run = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), at).await;
+            assert_eq!(run.sources.len(), 1);
+            assert_eq!(title(&run.sources[0]), "cached");
+            assert_eq!(run.lines, [fetched_line(&feed_url())]);
+        }
+
+        // Four runs, four requests: a 304 ends the Retry window just as a
+        // 200 does, so the fourth run asks the server again.
+        assert_eq!(requests.data().len(), 4);
     }
 
     #[tokio::test]
@@ -605,84 +693,114 @@ mod tests {
         body.extend_from_slice(
             br"</title><link>https://x.example/</link><description>d</description><item><title>post</title><link>https://x.example/post</link><pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate></item></channel></rss>",
         );
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), vec![Answer::ok(body), Answer::status(304)])]);
-        let cache = Cache::default();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&source), "caf\u{e9}");
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(first.sources.len(), 1);
+        assert_eq!(title(&first.sources[0]), "caf\u{e9}");
 
-        // The cached bytes must reparse identically on a later 304.
-        let again = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&again), "caf\u{e9}");
+        // The cached bytes must survive disk serialization and reparse
+        // identically on a later 304.
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(second.sources.len(), 1);
+        assert_eq!(title(&second.sources[0]), "caf\u{e9}");
     }
 
     #[tokio::test]
     async fn streamed_bodies_past_the_cap_are_rejected_and_not_cached() {
         // No Content-Length, the shape a chunked or compressed transfer
-        // takes. The header check cannot see these; only the read cap can.
+        // takes. Only the streamed read cap catches this.
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(
             feed_url(),
-            Answer::status(200)
-                .chunks(vec![vec![b'x'; MAX_FEED_BYTES], vec![b'x']])
-                .chunked(),
+            vec![
+                Answer::status(200)
+                    .header("etag", "\"huge\"")
+                    .chunks(vec![vec![b'x'; MAX_FEED_BYTES], vec![b'x']])
+                    .chunked(),
+                Answer::status(503),
+            ],
         )]);
-        let cache = Cache::default();
+        let requests = http.track_requests();
 
-        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
         let expected_bytes = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        assert!(first.sources.is_empty(), "{:?}", first.sources);
         assert_eq!(
-            cause,
-            format!("the body is too large ({expected_bytes} bytes)")
+            first.lines,
+            [error_line(
+                &feed_url(),
+                &format!("the body is too large ({expected_bytes} bytes)")
+            )]
         );
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(Validators::default())
-        );
+
+        // Nothing was cached, so the next run sends no Validators and has no
+        // Stale copy to serve on 503.
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(second.sources.is_empty(), "{:?}", second.sources);
+        assert_eq!(requests.data(), [request(&[]), request(&[])]);
     }
 
     #[tokio::test]
     async fn oversized_feeds_are_rejected_by_their_announced_length() {
         // A urls-file typo that points at a video or other huge file.
         let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(
             feed_url(),
-            Answer::ok(get_valid_rss_feed("huge"))
-                .header("etag", "\"huge\"")
-                .content_length(announced),
+            vec![
+                Answer::ok(get_valid_rss_feed("huge"))
+                    .header("etag", "\"huge\"")
+                    .content_length(announced),
+                Answer::status(503),
+            ],
         )]);
-        let cache = Cache::default();
+        let requests = http.track_requests();
 
-        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(cause, format!("the body is too large ({announced} bytes)"));
-        // Nothing that big belongs in the cache either.
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(first.sources.is_empty(), "{:?}", first.sources);
         assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(Validators::default())
+            first.lines,
+            [error_line(
+                &feed_url(),
+                &format!("the body is too large ({announced} bytes)")
+            )]
         );
+
+        // Nothing that big belongs in the cache either.
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(second.sources.is_empty(), "{:?}", second.sources);
+        assert_eq!(requests.data(), [request(&[]), request(&[])]);
     }
 
     #[tokio::test]
     async fn a_failed_request_serves_the_cache() {
-        let (result, cache) = fetch_over_cached(Answer::send_error("connection refused")).await;
-        assert_served_stale(&result, &cache, |cause| cause == "connection refused");
+        assert_served_stale(Answer::send_error("connection refused"), |cause| {
+            cause == "connection refused"
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn a_failed_request_with_nothing_cached_is_an_error() {
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), Answer::send_error("connection refused"))]);
-        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
-        assert_eq!(cause, "connection refused");
+
+        let run = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(run.sources.is_empty(), "{:?}", run.sources);
+        assert_eq!(run.lines, [error_line(&feed_url(), "connection refused")]);
     }
 
     #[tokio::test]
     async fn a_body_that_stops_arriving_serves_the_cache() {
-        let (result, cache) = fetch_over_cached(
+        assert_served_stale(
             Answer::ok(get_valid_rss_feed("partial"))
                 .header("etag", "\"v2\"")
                 .transfer_error("connection reset"),
+            |cause| cause == "connection reset",
         )
         .await;
-        assert_served_stale(&result, &cache, |cause| cause == "connection reset");
     }
 
     // A 200 that carries an HTML error page instead of a feed must not
@@ -691,104 +809,76 @@ mod tests {
     // until it changed.
     #[tokio::test]
     async fn a_200_that_is_not_a_feed_serves_the_cache_and_keeps_it() {
-        let (result, cache) = fetch_over_cached(
+        assert_served_stale(
             Answer::ok("<html><body>Service Unavailable</body></html>").header("etag", "\"v2\""),
+            |cause| cause.contains("unable to parse"),
         )
         .await;
-        assert_served_stale(&result, &cache, |cause| cause.contains("unable to parse"));
     }
 
     #[tokio::test]
     async fn an_empty_200_serves_the_cache_and_keeps_it() {
-        let (result, cache) = fetch_over_cached(Answer::ok("").header("etag", "\"v2\"")).await;
-        assert_served_stale(&result, &cache, |cause| cause == "the body is empty");
+        assert_served_stale(Answer::ok("").header("etag", "\"v2\""), |cause| {
+            cause == "the body is empty"
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn an_oversized_answer_serves_the_cache() {
         let announced = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
-        let (result, cache) = fetch_over_cached(Answer::ok("big").content_length(announced)).await;
-        assert_served_stale(&result, &cache, |cause| {
-            cause == format!("the body is too large ({announced} bytes)")
-        });
+        assert_served_stale(
+            Answer::ok("big")
+                .header("etag", "\"v2\"")
+                .content_length(announced),
+            |cause| cause == format!("the body is too large ({announced} bytes)"),
+        )
+        .await;
     }
 
     // Any status that is not a feed, a 304, a 429, or a sign the feed is
-    // gone may pass by a later run, so the cached copy fills in.
+    // Gone may pass by a later run, so the cached copy fills in.
     #[hegel::test]
     fn a_failing_status_serves_the_cache(tc: hegel::TestCase) {
         let code = tc.draw(generators::integers::<u16>().min_value(300).max_value(599));
         tc.assume(![304, 404, 410, 429].contains(&code));
-        let (result, cache) = block_on(fetch_over_cached(Answer::status(code)));
-        assert_served_stale(&result, &cache, |cause| {
+        block_on(assert_served_stale(Answer::status(code), |cause| {
             cause == format!("server answered HTTP {code}")
-        });
+        }));
     }
 
-    // A 404 or 410 says the feed is gone. Only the user can fix that, so
+    // A 404 or 410 says the Feed is Gone. Only the user can fix that, so
     // the cached copy must not hide it.
     #[tokio::test]
-    async fn a_gone_feed_is_an_error_even_with_a_cached_copy() {
+    async fn a_gone_feed_shows_an_error_and_yields_no_source() {
         let huge = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
         for code in [404, 410] {
             // An announced body too large to read changes nothing: the
-            // status alone says the feed is gone.
-            for answer in [
+            // status alone says the Feed is Gone.
+            for gone_answer in [
                 Answer::status(code),
                 Answer::status(code).content_length(huge),
             ] {
-                let (result, _) = fetch_over_cached(answer).await;
+                let fs = Fs::create_null([]);
+                let http = Http::create_null([(
+                    feed_url(),
+                    vec![Answer::ok(get_valid_rss_feed("cached")), gone_answer],
+                )]);
+
+                let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+                assert_eq!(first.sources.len(), 1);
+
+                let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+                assert!(second.sources.is_empty(), "{code}: {:?}", second.sources);
                 assert_eq!(
-                    expect_failed(result),
-                    format!("server answered HTTP {code}")
+                    second.lines,
+                    [error_line(
+                        &feed_url(),
+                        &format!("server answered HTTP {code}")
+                    )]
                 );
             }
         }
-    }
-
-    // Across the whole Feed list, a gone Feed yields no Source and an Error
-    // line, though the cache holds a copy.
-    #[tokio::test]
-    async fn a_gone_feed_shows_an_error_and_yields_no_source() {
-        use std::{path::Path, time::Duration};
-
-        use crate::terminal::{Terminal, Tone};
-
-        let fs = Fs::create_null([]);
-        let cache = Some(CacheConfig {
-            path: Path::new("/cache/cache.json"),
-            max_age: Duration::MAX,
-        });
-        let http = Http::create_null([(
-            feed_url(),
-            vec![
-                Answer::ok(get_valid_rss_feed("cached")),
-                Answer::status(404),
-            ],
-        )]);
-
-        let first = super::fetch_sources(
-            &http,
-            &fs,
-            &Terminal::create_null(false),
-            vec![feed()],
-            cache,
-            now(),
-        )
-        .await;
-        assert_eq!(first.len(), 1);
-
-        let terminal = Terminal::create_null(true);
-        let lines = terminal.track_lines();
-        let sources = super::fetch_sources(&http, &fs, &terminal, vec![feed()], cache, now()).await;
-
-        assert!(sources.is_empty(), "{sources:?}");
-        let lines = lines.data();
-        let [line] = lines.as_slice() else {
-            panic!("expected one status line: {lines:?}");
-        };
-        assert_eq!((line.word, line.tone), ("Error", Tone::Bad));
-        assert!(line.detail.starts_with(feed_url().as_str()), "{line:?}");
     }
 
     // A 429 that announces a huge body is still a rate limit: the cache
@@ -796,55 +886,83 @@ mod tests {
     #[tokio::test]
     async fn a_429_announcing_a_huge_body_still_opens_a_retry_window() {
         let huge = u64::try_from(MAX_FEED_BYTES).unwrap() + 1;
-        let (result, cache) = fetch_over_cached(
-            Answer::status(429)
-                .header("retry-after", "120")
-                .content_length(huge),
+        let fs = Fs::create_null([]);
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("cached")),
+                Answer::status(429)
+                    .header("retry-after", "120")
+                    .content_length(huge),
+            ],
+        )]);
+        let requests = http.track_requests();
+
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&first.sources[0]), "cached");
+
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&second.sources[0]), "cached");
+        assert_eq!(second.lines, [fetched_line(&feed_url())]);
+
+        let third = run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now() + 119.seconds(),
         )
         .await;
-        expect_done(result);
-        assert!(matches!(
-            cache.plan(&feed_url(), now() + 119.seconds()),
-            Plan::Serve(_)
-        ));
+        assert_eq!(title(&third.sources[0]), "cached");
+        assert_eq!(third.lines, [fetched_line(&feed_url())]);
+        assert_eq!(requests.data().len(), 2);
     }
 
     // When the cached copy itself does not parse, it cannot fill in, and
     // the error reported is the server's, not the parser's.
-    #[tokio::test]
-    async fn an_unparseable_cached_copy_reports_the_original_failure() {
-        let cache = Cache::default();
-        cache
-            .record(
-                &feed_url(),
-                Outcome::Fresh {
-                    body: b"<html>not a feed</html>".to_vec(),
-                    validators: Validators::default(),
-                },
-                now(),
-            )
-            .unwrap();
+    #[test]
+    fn an_unparseable_cached_copy_reports_the_original_failure() {
+        let seeded = cache_json(
+            &feed_url(),
+            b"<html>not a feed</html>",
+            Some("\"v1\""),
+            now(),
+            None,
+        );
+        let fs = Fs::create_null([(CACHE_PATH, seeded.as_str())]);
         let http = Http::create_null([(feed_url(), Answer::status(503))]);
+        let requests = http.track_requests();
 
-        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(cause, "server answered HTTP 503");
+        let (run, logs) = run_fetch_logged(&http, &fs, vec![feed()], Some(cache_config()), now());
+
+        // Confirm the seeded entry loaded cleanly by checking for zero cache
+        // warnings and the stored ETag on the outbound request.
+        assert_eq!(logs, "");
+        assert_eq!(requests.data(), [request(&[("if-none-match", "\"v1\"")])]);
+        assert!(run.sources.is_empty(), "{:?}", run.sources);
+        assert_eq!(
+            run.lines,
+            [error_line(&feed_url(), "server answered HTTP 503")]
+        );
     }
 
     #[tokio::test]
     async fn an_empty_body_is_not_cached_as_servable() {
         // A misbehaving feed: 200 with an etag but a completely empty body.
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), Answer::ok("").header("etag", "\"empty\""))]);
         let requests = http.track_requests();
-        let cache = Cache::default();
 
-        let first = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(first, "the body is empty");
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(first.sources.is_empty(), "{:?}", first.sources);
+        assert_eq!(first.lines, [error_line(&feed_url(), "the body is empty")]);
 
         // The empty body must not be cached. If it were, the next fetch
         // would send If-None-Match, the server would say 304, and the run
         // would serve the empty body until the entry aged out of the cache.
-        let second = expect_failed(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(second, "the body is empty");
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(second.sources.is_empty(), "{:?}", second.sources);
+        assert_eq!(second.lines, [error_line(&feed_url(), "the body is empty")]);
         assert_eq!(
             requests.data(),
             [request(&[]), request(&[])],
@@ -854,20 +972,58 @@ mod tests {
 
     #[tokio::test]
     async fn a_429_serves_the_cache_until_its_retry_after_passes() {
-        let cache = cache_holding("rate-limited", Validators::default());
-        let http =
-            Http::create_null([(feed_url(), Answer::status(429).header("retry-after", "120"))]);
+        let fs = Fs::create_null([]);
+        let http = Http::create_null([(
+            feed_url(),
+            vec![
+                Answer::ok(get_valid_rss_feed("rate-limited")).header("etag", "\"v1\""),
+                Answer::status(429).header("retry-after", "120"),
+                Answer::ok(get_valid_rss_feed("recovered")),
+            ],
+        )]);
+        let requests = http.track_requests();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&source), "rate-limited");
-        assert!(matches!(
-            cache.plan(&feed_url(), now() + 119.seconds()),
-            Plan::Serve(_)
-        ));
-        assert!(matches!(
-            cache.plan(&feed_url(), now() + 120.seconds()),
-            Plan::Request(_)
-        ));
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&first.sources[0]), "rate-limited");
+
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&second.sources[0]), "rate-limited");
+        assert_eq!(second.lines, [fetched_line(&feed_url())]);
+
+        // Inside the Retry window, fetch_sources serves the cached Feed
+        // without sending a request.
+        let during = run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now() + 119.seconds(),
+        )
+        .await;
+        assert_eq!(title(&during.sources[0]), "rate-limited");
+        assert_eq!(during.lines, [fetched_line(&feed_url())]);
+        assert_eq!(requests.data().len(), 2);
+
+        // After the Retry window expires, fetch_sources asks the server again
+        // with the stored Validators.
+        let after = run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now() + 120.seconds(),
+        )
+        .await;
+        assert_eq!(title(&after.sources[0]), "recovered");
+        assert_eq!(after.lines, [fetched_line(&feed_url())]);
+        assert_eq!(
+            requests.data(),
+            [
+                request(&[]),
+                request(&[("if-none-match", "\"v1\"")]),
+                request(&[("if-none-match", "\"v1\"")]),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -876,129 +1032,221 @@ mod tests {
         let until = now() + 600.seconds();
         let header =
             jiff::fmt::rfc2822::to_string(&until.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
-        let cache = cache_holding("rate-limited", Validators::default());
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(
             feed_url(),
-            Answer::status(429).header("retry-after", &header),
+            vec![
+                Answer::ok(get_valid_rss_feed("rate-limited")),
+                Answer::status(429).header("retry-after", &header),
+                Answer::ok(get_valid_rss_feed("recovered")),
+            ],
         )]);
-
-        expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert!(matches!(
-            cache.plan(&feed_url(), until - SignedDuration::from_secs(1)),
-            Plan::Serve(_)
-        ));
-        assert!(matches!(cache.plan(&feed_url(), until), Plan::Request(_)));
-    }
-
-    #[tokio::test]
-    async fn an_open_retry_window_serves_the_cache_without_a_request() {
-        let cache = cache_holding("cached", Validators::default());
-        cache
-            .record(
-                &feed_url(),
-                Outcome::RateLimited {
-                    until: now() + 1.hour(),
-                },
-                now(),
-            )
-            .unwrap();
-        let http = Http::create_null::<Answer>([]);
         let requests = http.track_requests();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now() + 30.minutes()).await);
-        assert_eq!(title(&source), "cached");
-        assert_eq!(requests.data(), []);
+        let first = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&first.sources[0]), "rate-limited");
+
+        let second = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert_eq!(title(&second.sources[0]), "rate-limited");
+
+        let during = run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            until - SignedDuration::from_secs(1),
+        )
+        .await;
+        assert_eq!(title(&during.sources[0]), "rate-limited");
+        assert_eq!(requests.data().len(), 2);
+
+        let after = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), until).await;
+        assert_eq!(title(&after.sources[0]), "recovered");
+        assert_eq!(requests.data().len(), 3);
     }
 
     // A cached body that no longer parses, as after a parser upgrade, fails
     // the fetch during a Retry window. The server asked not to be asked, so
     // no request goes out.
-    #[tokio::test]
-    async fn an_open_retry_window_over_an_unparseable_body_fails_without_a_request() {
-        let cache = Cache::default();
-        let body = b"not a feed".to_vec();
-        let fresh = Outcome::Fresh {
-            body,
-            validators: Validators::default(),
-        };
-        cache.record(&feed_url(), fresh, now()).unwrap();
-        let until = now() + 1.hour();
-        cache
-            .record(&feed_url(), Outcome::RateLimited { until }, now())
-            .unwrap();
+    #[test]
+    fn an_open_retry_window_over_an_unparseable_body_fails_without_a_request() {
+        let seeded = cache_json(
+            &feed_url(),
+            b"not a feed",
+            None,
+            now(),
+            Some(now() + 1.hour()),
+        );
+        let fs = Fs::create_null([(CACHE_PATH, seeded.as_str())]);
         let http = Http::create_null::<Answer>([]);
         let requests = http.track_requests();
 
-        let cause = expect_failed(fetch_feed(&feed(), &http, &cache, now() + 30.minutes()).await);
-        assert!(cause.contains("unable to parse"), "{cause:?}");
+        let (run, logs) = run_fetch_logged(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now() + 30.minutes(),
+        );
+
+        assert_eq!(logs, "");
         assert_eq!(requests.data(), []);
+        assert!(run.sources.is_empty(), "{:?}", run.sources);
+        let [line] = run.lines.as_slice() else {
+            panic!("expected one status line, got {:?}", run.lines);
+        };
+        assert_eq!((line.word, line.tone), ("Error", Tone::Bad));
+        assert!(line.detail.starts_with(feed_url().as_str()), "{line:?}");
+        assert!(line.detail.contains("unable to parse"), "{line:?}");
     }
 
     #[tokio::test]
-    async fn a_429_for_an_unknown_feed_is_a_failure() {
+    async fn a_429_without_a_cached_copy_is_a_failure() {
+        let expected = error_line(&feed_url(), "rate limited (HTTP 429) with nothing cached");
+
+        // With caching enabled but nothing stored yet.
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), Answer::status(429))]);
-        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
-        assert_eq!(cause, "rate limited (HTTP 429) with nothing cached");
+        let uncached = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(uncached.sources.is_empty(), "{:?}", uncached.sources);
+        assert_eq!(uncached.lines, std::slice::from_ref(&expected));
+
+        // With caching disabled, even a prior 200 leaves nothing cached.
+        let http = Http::create_null([(
+            feed_url(),
+            vec![Answer::ok(get_valid_rss_feed("fresh")), Answer::status(429)],
+        )]);
+        let first = run_fetch(&http, &fs, vec![feed()], None, now()).await;
+        assert_eq!(title(&first.sources[0]), "fresh");
+
+        let no_cache = run_fetch(&http, &fs, vec![feed()], None, now()).await;
+        assert!(no_cache.sources.is_empty(), "{:?}", no_cache.sources);
+        assert_eq!(no_cache.lines, std::slice::from_ref(&expected));
     }
 
     // A 304 to a request that sent no Validators confirms nothing the cache
     // holds. It is not an empty feed.
     #[tokio::test]
     async fn a_304_for_an_unknown_feed_is_a_failure() {
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), Answer::status(304))]);
-        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
-        assert_eq!(cause, "server answered HTTP 304, but nothing is cached");
+
+        let run = run_fetch(&http, &fs, vec![feed()], Some(cache_config()), now()).await;
+        assert!(run.sources.is_empty(), "{:?}", run.sources);
+        assert_eq!(
+            run.lines,
+            [error_line(
+                &feed_url(),
+                "server answered HTTP 304, but nothing is cached"
+            )]
+        );
     }
 
-    #[tokio::test]
-    async fn a_redirected_feed_stays_cached_under_the_requested_url() {
+    #[test]
+    fn a_redirected_feed_warns_and_stays_cached_under_the_requested_url() {
         let moved = Url::parse("https://feed.example/new.xml").unwrap();
-        let http = Http::create_null([(
-            feed_url(),
-            Answer::ok(get_valid_rss_feed("moved"))
-                .header("etag", "\"v1\"")
-                .redirected_to(moved.clone()),
-        )]);
-        let cache = Cache::default();
+        let fs = Fs::create_null([]);
+        let http = Http::create_null([
+            (
+                feed_url(),
+                vec![
+                    Answer::ok(get_valid_rss_feed("moved"))
+                        .header("etag", "\"v1\"")
+                        .redirected_to(moved.clone()),
+                    Answer::status(304),
+                ],
+            ),
+            (moved.clone(), vec![Answer::ok(get_valid_rss_feed("moved"))]),
+        ]);
+        let requests = http.track_requests();
 
-        let source = expect_done(fetch_feed(&feed(), &http, &cache, now()).await);
-        assert_eq!(title(&source), "moved");
-        // The cache stays keyed by the URL the user configured, so later runs
-        // still find their entry.
-        assert_eq!(
-            cache.plan(&feed_url(), now()),
-            Plan::Request(validators(Some("\"v1\""), None))
+        let (first, logs) = run_fetch_logged(&http, &fs, vec![feed()], Some(cache_config()), now());
+        assert_eq!(first.sources.len(), 1);
+        assert_eq!(title(&first.sources[0]), "moved");
+        assert_eq!(first.lines, [fetched_line(&feed_url())]);
+        assert!(
+            logs.contains("feed URL redirects; consider updating it"),
+            "{logs}"
         );
+        assert!(logs.contains(&format!("from={}", feed_url())), "{logs}");
+        assert!(logs.contains(&format!("to={moved}")), "{logs}");
+
+        // The cache stays keyed by the URL the user configured, so later runs
+        // revalidate it while a fetch of the redirect target carries no
+        // Validators.
+        let second = block_on(run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now(),
+        ));
+        assert_eq!(second.sources.len(), 1);
+        assert_eq!(title(&second.sources[0]), "moved");
+
+        let target = block_on(run_fetch(
+            &http,
+            &fs,
+            vec![feed_at(moved.clone())],
+            Some(cache_config()),
+            now(),
+        ));
+        assert_eq!(target.sources.len(), 1);
+        assert_eq!(title(&target.sources[0]), "moved");
+
         assert_eq!(
-            cache.plan(&moved, now()),
-            Plan::Request(Validators::default())
+            requests.data(),
+            [
+                request(&[]),
+                request(&[("if-none-match", "\"v1\"")]),
+                request_at(moved, &[]),
+            ]
         );
     }
 
-    #[tokio::test]
-    async fn unexpected_status_is_an_error() {
+    #[test]
+    fn unexpected_status_is_an_error() {
+        let fs = Fs::create_null([]);
         let http = Http::create_null([(feed_url(), Answer::status(500))]);
-        let cause = expect_failed(fetch_feed(&feed(), &http, &Cache::default(), now()).await);
-        assert_eq!(cause, "server answered HTTP 500");
+
+        let visible = block_on(run_fetch(
+            &http,
+            &fs,
+            vec![feed()],
+            Some(cache_config()),
+            now(),
+        ));
+        assert!(visible.sources.is_empty(), "{:?}", visible.sources);
+        assert_eq!(
+            visible.lines,
+            [error_line(&feed_url(), "server answered HTTP 500")]
+        );
+
+        let logs = warnings_logged(|| {
+            let sources = block_on(fetch_sources(
+                &http,
+                &fs,
+                &Terminal::create_null(false),
+                vec![feed()],
+                Some(cache_config()),
+                now(),
+            ));
+            assert!(sources.is_empty(), "{sources:?}");
+        });
+        assert!(logs.contains("skipping feed: fetch failed"), "{logs}");
+        assert!(logs.contains("server answered HTTP 500"), "{logs}");
     }
 
     // An empty Feed list returns immediately without reading or writing the
     // cache file.
     #[test]
     fn fetch_sources_with_no_feeds_skips_cache_disk_io() {
-        use std::{io, path::Path, time::Duration};
+        let cache_path = Path::new(CACHE_PATH);
+        let cache = Some(cache_config());
 
-        use crate::{terminal::Terminal, test_support::warnings_logged};
-
-        let cache_path = Path::new("/cache/cache.json");
-        let cache = Some(CacheConfig {
-            path: cache_path,
-            max_age: Duration::MAX,
-        });
-
-        let corrupt_fs = Fs::create_null([("/cache/cache.json", "{corrupt")]);
+        let corrupt_fs = Fs::create_null([(CACHE_PATH, "{corrupt")]);
         let logs = warnings_logged(|| {
-            let sources = block_on(super::fetch_sources(
+            let sources = block_on(fetch_sources(
                 &Http::create_null::<Answer>([]),
                 &corrupt_fs,
                 &Terminal::create_null(false),
@@ -1012,7 +1260,7 @@ mod tests {
         assert_eq!(corrupt_fs.read_locked(cache_path).unwrap(), "{corrupt");
 
         let empty_fs = Fs::create_null([]);
-        let sources = block_on(super::fetch_sources(
+        let sources = block_on(fetch_sources(
             &Http::create_null::<Answer>([]),
             &empty_fs,
             &Terminal::create_null(false),
