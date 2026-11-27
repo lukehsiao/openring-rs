@@ -65,9 +65,10 @@ fn causes(e: &reqwest::Error) -> String {
 /// Why [`Response::read_capped`] gave up on a body.
 #[derive(Debug, Error)]
 pub(crate) enum ReadError {
-    /// The body grew past the limit. `bytes` is how much had arrived when
-    /// reading stopped, so it is always more than the limit.
-    #[error("the body grew past the limit ({bytes} bytes)")]
+    /// The body is larger than the limit. `bytes` is the announced
+    /// Content-Length, or the count of bytes that arrived before reading
+    /// stopped. In both cases, `bytes` is larger than the limit.
+    #[error("the body is too large ({bytes} bytes)")]
     TooLarge { bytes: u64 },
     #[error(transparent)]
     Transfer(#[from] TransportError),
@@ -152,16 +153,18 @@ impl Response {
         self.raw.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
-    /// The length the server announced. Chunked and compressed responses
-    /// announce none.
-    pub(crate) fn content_length(&self) -> Option<u64> {
-        self.raw.content_length()
-    }
-
-    /// Read the body, giving up once it grows past `limit` bytes. The cap
-    /// applies to the bytes as they arrive, because Content-Length is absent
-    /// or describes the compressed size for chunked and compressed bodies.
+    /// Read the body and stop if it is larger than `limit` bytes.
+    ///
+    /// Rejects an announced Content-Length above `limit` before reading any
+    /// chunks. Also caps the bytes as they arrive, because chunked and
+    /// compressed bodies announce no usable length.
     pub(crate) async fn read_capped(mut self, limit: usize) -> Result<Vec<u8>, ReadError> {
+        let cap = u64::try_from(limit).unwrap_or(u64::MAX);
+        if let Some(bytes) = self.raw.content_length()
+            && bytes > cap
+        {
+            return Err(ReadError::TooLarge { bytes });
+        }
         let mut body = Vec::new();
         while self.raw.chunk_into(&mut body).await? {
             if body.len() > limit {
@@ -515,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_status_headers_length_and_body() {
+    async fn reports_status_headers_and_body() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
@@ -532,7 +535,6 @@ mod tests {
         assert_eq!(resp.url(), &url);
         // Header lookup ignores case, as HTTP requires.
         assert_eq!(resp.header("ETag"), Some("\"v1\""));
-        assert_eq!(resp.content_length(), Some(5));
         assert_eq!(resp.read_capped(5).await.unwrap(), b"hello");
     }
 
@@ -747,7 +749,10 @@ mod tests {
         let fits = chunks.iter().map(Vec::len).sum::<usize>() <= limit;
         let http = Http::create_null([(
             target.clone(),
-            Answer::status(200).chunks(chunks).transfer_error(&message),
+            Answer::status(200)
+                .chunks(chunks)
+                .chunked()
+                .transfer_error(&message),
         )]);
 
         let result = block_on(async {
@@ -769,6 +774,78 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    // An announced Content-Length past the limit fails before reading any
+    // chunk, so a transfer failure on the body is never reached.
+    #[hegel::test]
+    fn read_capped_rejects_oversized_content_length_before_reading_chunks(tc: hegel::TestCase) {
+        let max_limit = usize::try_from(u64::MAX - 1).unwrap_or(usize::MAX);
+        // Draw half the cases from a 150-byte window so small limits and
+        // tight overshoots get steady coverage. The other branch covers
+        // the full range.
+        let limit = tc.draw(hegel::one_of!(
+            generators::integers::<usize>().max_value(150),
+            generators::integers::<usize>().max_value(max_limit)
+        ));
+        let min_announced = u64::try_from(limit).unwrap() + 1;
+        let announced = tc.draw(hegel::one_of!(
+            generators::integers::<u64>()
+                .min_value(min_announced)
+                .max_value(min_announced.saturating_add(150)),
+            generators::integers::<u64>().min_value(min_announced)
+        ));
+        let target = url("https://a.example/");
+        let http = Http::create_null([(
+            target.clone(),
+            Answer::status(200)
+                .content_length(announced)
+                .transfer_error("chunk was read"),
+        )]);
+
+        let result = block_on(async {
+            http.get(&target, &[])
+                .await
+                .unwrap()
+                .read_capped(limit)
+                .await
+        });
+
+        assert!(
+            matches!(result, Err(ReadError::TooLarge { bytes }) if bytes == announced),
+            "{result:?}"
+        );
+    }
+
+    // A compressed response can announce a Content-Length within the limit
+    // while its decoded chunks still go past it. The cap still stops the read.
+    #[tokio::test]
+    async fn read_capped_caps_streamed_bytes_even_when_content_length_fits() {
+        let target = url("https://a.example/");
+        let http = Http::create_null([(
+            target.clone(),
+            vec![
+                Answer::status(200)
+                    .chunks(vec![vec![b'a'; 6], vec![b'b'; 6]])
+                    .content_length(5),
+                Answer::ok("0123456789").content_length(10),
+            ],
+        )]);
+
+        let too_large = http.get(&target, &[]).await.unwrap().read_capped(10).await;
+        assert!(
+            matches!(too_large, Err(ReadError::TooLarge { bytes: 12 })),
+            "{too_large:?}"
+        );
+
+        let exact = http
+            .get(&target, &[])
+            .await
+            .unwrap()
+            .read_capped(10)
+            .await
+            .unwrap();
+        assert_eq!(exact, b"0123456789");
     }
 
     // Header names match in any case, as HTTP requires, and a value made of
