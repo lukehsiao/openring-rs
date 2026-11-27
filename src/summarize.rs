@@ -97,8 +97,6 @@ async fn fetch_summary(http: &Http, url: &Url) -> Option<String> {
         return None;
     }
 
-    // Content-Length cannot be trusted for chunked or compressed responses,
-    // so the cap applies to the bytes as they arrive.
     let body = match resp.read_capped(MAX_PAGE_BYTES).await {
         Ok(body) => body,
         Err(e) => {
@@ -389,6 +387,33 @@ mod tests {
             "x".repeat(MAX_PAGE_BYTES)
         );
         assert_eq!(summarize(Answer::ok(page).chunked()), None);
+    }
+
+    #[tokio::test]
+    async fn pages_announcing_an_oversized_content_length_yield_no_summary() {
+        let post = post_url();
+        let source_link = Url::parse("https://blog.example/").unwrap();
+        let mut articles = [Article::fixture(
+            &source_link,
+            "Post",
+            post.clone(),
+            jiff::Timestamp::UNIX_EPOCH,
+        )];
+        let page = r#"<html><head><meta name="description" content="Huge."></head></html>"#;
+        let announced = u64::try_from(MAX_PAGE_BYTES).unwrap() + 1;
+        let http = Http::create_null([(
+            post,
+            Answer::ok(page)
+                .header("content-type", "text/html; charset=utf-8")
+                .content_length(announced),
+        )]);
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+
+        fill_missing_summaries(&http, &terminal, &mut articles).await;
+
+        assert!(!articles[0].has_summary());
+        assert!(lines.data().is_empty(), "{:?}", lines.data());
     }
 
     #[test]

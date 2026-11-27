@@ -255,16 +255,6 @@ async fn fetch_from_server(
             FetchFailure::NotModifiedUncached,
         )
     } else if status.is_success() {
-        // Reject grossly oversized bodies before buffering them. Only a
-        // success has a body worth reading, so only it is checked: a 404 or
-        // 429 that announces a huge body still means what its status says.
-        // Chunked and compressed responses announce no usable length, so
-        // the read below enforces the same cap as the bytes arrive.
-        if let Some(bytes) = resp.content_length()
-            && !usize::try_from(bytes).is_ok_and(|b| b <= MAX_FEED_BYTES)
-        {
-            return Err(FetchFailure::TooLarge { bytes });
-        }
         let validators = response_validators(&resp);
         // Keep the raw bytes: pre-decoding to text re-encodes the transfer
         // as UTF-8 while the XML prolog still declares the original charset,
