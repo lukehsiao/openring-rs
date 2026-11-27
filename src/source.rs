@@ -379,41 +379,44 @@ fn build_article(
 
 #[cfg(test)]
 mod tests {
-    use feed_rs::model::{Entry, Feed as Document, Link};
+    use std::num::NonZeroUsize;
+
+    use feed_rs::model::Link;
     use hegel::generators;
     use url::Url;
 
-    use super::{
-        Source, article_order, build_article, project, raw_summary, resolve_entry_link,
-        resolve_source_link, resolve_source_title, sanitize_html,
-    };
+    use super::{ParseError, Source, article_order, parse, project};
     use crate::{feed_list::Feed, test_support::warnings_logged};
 
     const FEED_URL: &str = "https://example.com/feed.xml";
+
+    const SAMPLE_ENTRY: &str = r#"<entry>
+        <title>Sample Post</title>
+        <link href="https://example.com/sample"/>
+        <published>2020-01-01T00:00:00Z</published>
+    </entry>"#;
 
     fn feed_url() -> Url {
         Url::parse(FEED_URL).unwrap()
     }
 
-    // Parse a feed fixture the same way production does.
-    fn parse_feed(xml: &str) -> Document {
-        feed_rs::parser::parse(xml.as_bytes()).unwrap()
-    }
-
-    // Project `xml` as if it were fetched from the unweighted Feed `url`.
-    fn project_at(url: &str, xml: &str) -> Source {
-        let feed = Feed {
+    fn feed(url: &str) -> Feed {
+        Feed {
             url: Url::parse(url).unwrap(),
             weight: None,
-        };
-        project(&parse_feed(xml), feed)
+        }
     }
 
-    fn project_xml(xml: &str) -> Source {
-        project_at(FEED_URL, xml)
+    // Parse raw Feed XML as if fetched from the unweighted Feed at `url`.
+    fn parse_at(url: &str, xml: &str) -> Source {
+        parse(xml.as_bytes(), &feed(url)).unwrap()
     }
 
-    // Wrap entry XML in a minimal Atom feed (title + homepage link present).
+    fn parse_xml(xml: &str) -> Source {
+        parse_at(FEED_URL, xml)
+    }
+
+    // Wrap entry XML in a minimal Atom feed with a title and homepage link.
     fn atom(entries: &str) -> String {
         format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
@@ -426,41 +429,71 @@ mod tests {
         )
     }
 
-    // The first entry of a single-entry Atom fixture, for entry-level helpers.
-    fn first_entry(entry_xml: &str) -> Entry {
-        parse_feed(&atom(entry_xml))
-            .entries
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    fn link(href: &str, rel: Option<&str>) -> Link {
-        Link {
-            href: href.to_owned(),
-            target: None,
-            rel: rel.map(str::to_owned),
-            media_type: None,
-            href_lang: None,
-            title: None,
-            length: None,
+    // Escape XML attribute characters and preserve ASCII whitespace verbatim.
+    fn xml_escape_attr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                '\t' => out.push_str("&#x9;"),
+                '\n' => out.push_str("&#xA;"),
+                '\r' => out.push_str("&#xD;"),
+                _ => out.push(c),
+            }
         }
+        out
     }
 
-    fn entry_with(links: Vec<Link>) -> Entry {
-        Entry {
-            links,
-            ..Entry::default()
-        }
+    #[test]
+    fn parse_valid_feed_projects_source_and_preserves_feed() {
+        let weighted_feed = Feed {
+            url: feed_url(),
+            weight: NonZeroUsize::new(3),
+        };
+        let xml = atom(
+            r#"<entry>
+                <title>First Post</title>
+                <link href="https://example.com/first"/>
+                <published>2020-01-01T00:00:00Z</published>
+                <summary>Hello world</summary>
+            </entry>"#,
+        );
+
+        let source = parse(xml.as_bytes(), &weighted_feed).expect("valid Atom feed parses");
+
+        assert_eq!(source.feed(), &weighted_feed);
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.link().as_str(), "https://example.com/first");
+        assert_eq!(article.title(), "First Post");
+        assert_eq!(article.summary(), Some("Hello world"));
+        assert_eq!(article.source_title(), "Example Blog");
+        assert_eq!(article.source_link().as_str(), "https://example.com/");
+        assert_eq!(article.timestamp().to_string(), "2020-01-01T00:00:00Z");
     }
 
-    // Whatever links an entry carries, its Article link is a web page that
-    // is not the feed itself, and holds nothing that could end a quoted
-    // attribute. A feed controls these links and the bundled template
-    // embeds them through `| safe`, so any other scheme or a stray quote
-    // could run script in the reader's page.
+    #[test]
+    fn parse_rejects_non_feed_bytes() {
+        let err: ParseError =
+            parse(b"<html><body>not a feed</body></html>", &feed(FEED_URL)).unwrap_err();
+        let err_ref: &dyn std::error::Error = &err;
+        assert_ne!(err_ref.to_string(), "");
+    }
+
+    // Whatever links an Entry carries, its Article link is a web page that
+    // is not the Feed itself, and holds nothing that could end a quoted
+    // attribute. A Feed controls these links and the bundled template embeds
+    // them through `| safe`, so any other scheme or a stray quote could run
+    // script in the reader's page.
     #[hegel::test]
     fn entry_links_are_only_web_pages_other_than_the_feed(tc: hegel::TestCase) {
+        use std::fmt::Write as _;
+
         let href = || {
             hegel::one_of!(
                 generators::sampled_from(
@@ -490,7 +523,12 @@ mod tests {
                     .map(str::to_owned)
                     .to_vec()
                 ),
-                generators::text().max_size(24)
+                // Match the XML 1.0 Char production so every draw parses as Atom.
+                generators::text()
+                    .min_codepoint(0x20)
+                    .include_characters("\t\n\r")
+                    .exclude_characters("\u{fffe}\u{ffff}")
+                    .max_size(24)
             )
         };
         let rel = || {
@@ -505,11 +543,25 @@ mod tests {
             ])
         };
         let n = tc.draw(generators::integers::<usize>().max_value(4));
-        let links = (0..n)
-            .map(|_| link(&tc.draw(href()), tc.draw(rel())))
-            .collect();
+        let mut links = String::new();
+        for _ in 0..n {
+            let escaped_href = xml_escape_attr(&tc.draw(href()));
+            match tc.draw(rel()) {
+                Some(rel_val) => {
+                    write!(links, r#"<link rel="{rel_val}" href="{escaped_href}"/>"#).unwrap();
+                }
+                None => {
+                    write!(links, r#"<link href="{escaped_href}"/>"#).unwrap();
+                }
+            }
+        }
+        let entry = format!(
+            "<entry><title>t</title>{links}<published>2020-01-01T00:00:00Z</published></entry>"
+        );
+        let source = parse_xml(&atom(&entry));
 
-        if let Some(url) = resolve_entry_link(&entry_with(links), &feed_url()) {
+        if let Some(article) = source.articles().first() {
+            let url = article.link();
             assert!(matches!(url.scheme(), "http" | "https"), "{url}");
             let mut bare = url.clone();
             bare.set_fragment(None);
@@ -525,209 +577,220 @@ mod tests {
 
     #[test]
     fn a_script_link_never_becomes_the_article_link() {
-        // The only link runs script, so the entry has no usable link.
-        let only_script = entry_with(vec![link(
-            "javascript:\"><img src=x onerror=alert(1)>",
-            Some("alternate"),
-        )]);
-        assert_eq!(resolve_entry_link(&only_script, &feed_url()), None);
+        // The only link runs script, so the Entry has no usable link.
+        let only_script = parse_xml(&atom(
+            r#"<entry>
+                <title>Script Only</title>
+                <link rel="alternate" href="javascript:&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>"#,
+        ));
+        assert!(only_script.articles().is_empty());
 
         // A safe link after it wins instead.
-        let with_page = entry_with(vec![
-            link("javascript:alert(1)", Some("alternate")),
-            link("https://example.com/post", None),
-        ]);
-        assert_eq!(
-            resolve_entry_link(&with_page, &feed_url())
-                .unwrap()
-                .as_str(),
-            "https://example.com/post"
-        );
+        let with_page = parse_xml(&atom(
+            r#"<entry>
+                <title>Fallback</title>
+                <link rel="alternate" href="javascript:alert(1)"/>
+                <link href="https://example.com/post"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>"#,
+        ));
+        let [article] = with_page.articles() else {
+            panic!("expected one article: {:?}", with_page.articles());
+        };
+        assert_eq!(article.link().as_str(), "https://example.com/post");
     }
 
     #[test]
     fn an_entry_link_back_to_the_feed_is_not_a_link_to_the_post() {
-        let entry = entry_with(vec![
-            link("", Some("alternate")),
-            link("#comments", None),
-            link("https://example.com/post", None),
-        ]);
-        assert_eq!(
-            resolve_entry_link(&entry, &feed_url()).unwrap().as_str(),
-            "https://example.com/post"
-        );
+        let source = parse_xml(&atom(
+            r##"<entry>
+                <title>Post</title>
+                <link rel="alternate" href=""/>
+                <link href="#comments"/>
+                <link href="https://example.com/post"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>"##,
+        ));
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.link().as_str(), "https://example.com/post");
     }
 
-    // A feed URL may hold an apostrophe. Links that resolve back to it are
-    // still the feed, not the post.
+    // A Feed URL may hold an apostrophe. Links that resolve back to it are
+    // still the Feed, not the Article.
     #[test]
     fn a_link_back_to_a_feed_url_with_an_apostrophe_is_still_the_feed() {
-        let feed = Url::parse("https://example.com/it's/feed.xml").unwrap();
-        let entry = entry_with(vec![
-            link("", Some("alternate")),
-            link("#top", None),
-            link("feed.xml", None),
-            link("post", None),
-        ]);
-        assert_eq!(
-            resolve_entry_link(&entry, &feed).unwrap().as_str(),
-            "https://example.com/it%27s/post"
+        let source = parse_at(
+            "https://example.com/it's/feed.xml",
+            r##"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title>Example Blog</title>
+                <updated>2020-01-01T00:00:00Z</updated>
+                <entry>
+                    <title>Post</title>
+                    <link rel="alternate" href=""/>
+                    <link href="#top"/>
+                    <link href="feed.xml"/>
+                    <link href="post"/>
+                    <published>2020-01-01T00:00:00Z</published>
+                </entry>
+            </feed>"##,
         );
-
-        // With no usable homepage link, the fallback to the feed URL is
-        // escaped the same way.
-        let mut document = parse_feed(&atom(""));
-        document.links.clear();
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.link().as_str(), "https://example.com/it%27s/post");
+        // Without a usable homepage link, the fallback Feed URL is escaped too.
         assert_eq!(
-            resolve_source_link(&document, &feed).as_str(),
+            article.source_link().as_str(),
             "https://example.com/it%27s/feed.xml"
         );
     }
 
     #[test]
     fn a_bad_alternate_falls_back_to_the_next_content_link() {
-        let entry = entry_with(vec![
-            link("http://[", Some("alternate")),
-            link("https://example.com/post", None),
-        ]);
-        assert_eq!(
-            resolve_entry_link(&entry, &feed_url()).unwrap().as_str(),
-            "https://example.com/post"
-        );
+        let source = parse_xml(&atom(
+            r#"<entry>
+                <title>Post</title>
+                <link rel="alternate" href="http://["/>
+                <link href="https://example.com/post"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>"#,
+        ));
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.link().as_str(), "https://example.com/post");
     }
 
     #[test]
     fn atom_comment_edit_and_enclosure_links_are_never_the_post() {
-        let entry = entry_with(vec![
-            link("https://example.com/post/comments", Some("replies")),
-            link("https://example.com/post/edit", Some("edit")),
-            link("https://example.com/post.mp3", Some("enclosure")),
-        ]);
-        assert_eq!(resolve_entry_link(&entry, &feed_url()), None);
+        let source = parse_xml(&atom(
+            r#"<entry>
+                <title>No Content Link</title>
+                <link rel="replies" href="https://example.com/post/comments"/>
+                <link rel="edit" href="https://example.com/post/edit"/>
+                <link rel="enclosure" href="https://example.com/post.mp3"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>"#,
+        ));
+        assert!(source.articles().is_empty());
+    }
+
+    #[test]
+    fn entry_links_resolve_relative_and_skip_linkless() {
+        let source = parse_xml(&atom(
+            r#"<entry>
+                <title>Absolute</title>
+                <link href="https://other.example/abs"/>
+                <published>2020-01-02T00:00:00Z</published>
+            </entry>
+            <entry>
+                <title>Relative</title>
+                <link href="/rel-path"/>
+                <published>2020-01-01T00:00:00Z</published>
+            </entry>
+            <entry>
+                <title>Linkless</title>
+                <published>2020-01-03T00:00:00Z</published>
+            </entry>"#,
+        ));
+        let links: Vec<&str> = source
+            .articles()
+            .iter()
+            .map(|article| article.link().as_str())
+            .collect();
+        assert_eq!(
+            links,
+            ["https://other.example/abs", "https://example.com/rel-path"]
+        );
+    }
+
+    #[test]
+    fn entry_links_ignore_rss_comment_links() {
+        // feed-rs lists RSS `<comments>` and `wfw:commentRss` as entry links
+        // in document order, so a comments link can come first. The Article
+        // must point at the post itself.
+        let source = parse_xml(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0" xmlns:wfw="http://wellformedweb.org/CommentAPI/">
+                <channel>
+                    <title>t</title>
+                    <link>https://example.com/</link>
+                    <item>
+                        <title>a</title>
+                        <comments>https://example.com/a#comments</comments>
+                        <wfw:commentRss>https://example.com/a/feed</wfw:commentRss>
+                        <link>https://example.com/a</link>
+                        <pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate>
+                    </item>
+                    <item>
+                        <title>b</title>
+                        <comments>https://example.com/b#comments</comments>
+                        <pubDate>Thu, 02 Jan 2020 00:00:00 GMT</pubDate>
+                    </item>
+                </channel>
+            </rss>"#,
+        );
+        let links: Vec<&str> = source
+            .articles()
+            .iter()
+            .map(|article| article.link().as_str())
+            .collect();
+        assert_eq!(links, ["https://example.com/a"]);
     }
 
     #[test]
     fn the_homepage_is_never_a_hub_or_paging_link() {
-        let mut document = parse_feed(&atom(""));
-        document.links = vec![
-            link("https://hub.example/", Some("hub")),
-            link("https://example.com/feed.xml?page=2", Some("next")),
-            link("https://example.com/", None),
-        ];
+        let source = parse_xml(&format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title>Example Blog</title>
+                <link rel="hub" href="https://hub.example/"/>
+                <link rel="next" href="https://example.com/feed.xml?page=2"/>
+                <link href="https://example.com/"/>
+                <updated>2020-01-01T00:00:00Z</updated>
+                {SAMPLE_ENTRY}
+            </feed>"#
+        ));
         assert_eq!(
-            resolve_source_link(&document, &feed_url()).as_str(),
+            source.articles()[0].source_link().as_str(),
             "https://example.com/"
         );
     }
 
-    // A title a reader could not see falls back to the host for a feed,
-    // and makes an entry incomplete.
     #[test]
-    fn invisible_titles_count_as_missing() {
-        for title in [
-            "   ",
-            "&lt;b&gt;&lt;/b&gt;",
-            "&lt;script&gt;x&lt;/script&gt;",
-            "&amp;nbsp;",
-        ] {
-            let feed = parse_feed(&format!(
-                r#"<?xml version="1.0"?>
-                <feed xmlns="http://www.w3.org/2005/Atom">
-                    <title>{title}</title>
-                    <updated>2020-01-01T00:00:00Z</updated>
-                    <entry>
-                        <title>{title}</title>
-                        <link href="https://example.com/post"/>
-                        <published>2020-01-01T00:00:00Z</published>
-                    </entry>
-                </feed>"#
-            ));
-            assert_eq!(
-                resolve_source_title(&feed, &feed_url()),
-                "example.com",
-                "{title:?}"
-            );
-            assert!(
-                build_article(&feed.entries[0], &feed_url(), "Src", &feed_url()).is_none(),
-                "{title:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_out_of_range_published_date_falls_back_to_updated() {
-        // The RSS date parser accepts a five-digit year, past the end of
-        // jiff's range in year 9999.
-        let far = parse_feed(
+    fn source_link_prefers_alternate_then_plain_then_feed_url() {
+        // An explicit alternate link wins over both a self link and an
+        // earlier plain <link>.
+        let alt = parse_xml(
             r#"<?xml version="1.0"?>
-            <rss version="2.0"><channel><title>t</title><link>https://example.com/</link>
-                <item>
+            <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+                <channel>
                     <title>t</title>
-                    <link>https://example.com/post</link>
-                    <pubDate>01 Jan 10000 00:00:00 GMT</pubDate>
-                </item>
-            </channel></rss>"#,
-        );
-        let mut entry = far.entries[0].clone();
-        assert!(
-            entry.published.is_some(),
-            "fixture must carry a parsed date"
-        );
-        entry.updated = Some("2020-01-01T00:00:00Z".parse().unwrap());
-
-        let source_link = Url::parse("https://example.com/").unwrap();
-        let article = build_article(&entry, &feed_url(), "Src", &source_link);
-        assert_eq!(
-            article.map(|a| a.timestamp.to_string()).as_deref(),
-            Some("2020-01-01T00:00:00Z")
-        );
-    }
-
-    // A titleless feed must get a fallback title for any URL a feed can be
-    // fetched from, including IP-address hosts where `Url::domain()` is None.
-    #[hegel::test]
-    fn resolve_source_title_falls_back_for_any_http_host(tc: hegel::TestCase) {
-        use hegel::generators::Generator;
-        let host = tc.draw(hegel::one_of!(
-            generators::domains(),
-            generators::ip_addresses().v4().map(|ip| ip.to_string()),
-            // IPv6 hosts go in brackets inside a URL.
-            generators::ip_addresses().v6().map(|ip| format!("[{ip}]")),
-        ));
-        let url = Url::parse(&format!("http://{host}/feed.xml")).expect("generated host is valid");
-
-        let blank = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title></title>
-                <link href="https://example.com/"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        let title = resolve_source_title(&blank, &url);
-        assert_eq!(title, url.host_str().unwrap());
-    }
-
-    #[test]
-    fn project_source_link_prefers_alternate_then_plain_then_feed_url() {
-        // An explicit alternate link wins over a self link.
-        let alt = parse_feed(
-            r#"<?xml version="1.0"?>
-            <feed xmlns="http://www.w3.org/2005/Atom">
-                <title>t</title>
-                <link rel="self" href="https://example.com/feed.xml"/>
-                <link rel="alternate" href="https://example.com/home"/>
-                <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
+                    <atom:link rel="self" href="https://example.com/feed.xml"/>
+                    <link>https://example.com/plain</link>
+                    <atom:link rel="alternate" href="https://example.com/home"/>
+                    <description>d</description>
+                    <item>
+                        <title>Post</title>
+                        <link>https://example.com/post</link>
+                        <pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate>
+                    </item>
+                </channel>
+            </rss>"#,
         );
         assert_eq!(
-            resolve_source_link(&alt, &feed_url()).as_str(),
+            alt.articles()[0].source_link().as_str(),
             "https://example.com/home"
         );
 
         // An RSS channel's plain <link> has no rel, and it is the homepage
         // even when a self link comes first.
-        let plain = parse_feed(
+        let plain = parse_xml(
             r#"<?xml version="1.0"?>
             <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
                 <channel>
@@ -735,48 +798,55 @@ mod tests {
                     <atom:link rel="self" href="https://example.com/feed.xml"/>
                     <link>https://example.com/plain</link>
                     <description>d</description>
+                    <item>
+                        <title>Post</title>
+                        <link>https://example.com/post</link>
+                        <pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate>
+                    </item>
                 </channel>
             </rss>"#,
         );
         assert_eq!(
-            resolve_source_link(&plain, &feed_url()).as_str(),
+            plain.articles()[0].source_link().as_str(),
             "https://example.com/plain"
         );
 
-        // A related link points somewhere else, so the feed URL stands in.
-        let related = parse_feed(
+        // A related link points somewhere else, so the Feed URL stands in.
+        let related = parse_xml(&format!(
             r#"<?xml version="1.0"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
                 <title>t</title>
                 <link rel="self" href="https://example.com/feed.xml"/>
                 <link rel="related" href="https://example.com/related"/>
                 <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(resolve_source_link(&related, &feed_url()), feed_url());
+                {SAMPLE_ENTRY}
+            </feed>"#
+        ));
+        assert_eq!(related.articles()[0].source_link(), &feed_url());
     }
 
     #[test]
-    fn project_source_link_falls_back_to_feed_url_without_usable_links() {
-        // A titleless feed whose only link is `self` has nothing else to point
-        // at, so the feed URL itself is used. This also guards against a
-        // panic on a missing <title>.
-        let bare = parse_feed(
+    fn source_link_falls_back_to_feed_url_without_usable_links() {
+        // A titleless Feed whose only link is `self` has nothing else to
+        // point at, so the Feed URL itself is used. This also guards against
+        // a panic on a missing <title>.
+        let bare = parse_xml(&format!(
             r#"<?xml version="1.0"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
                 <link rel="self" href="https://example.com/feed.xml"/>
                 <updated>2020-01-01T00:00:00Z</updated>
-            </feed>"#,
-        );
-        assert_eq!(resolve_source_link(&bare, &feed_url()), feed_url());
+                {SAMPLE_ENTRY}
+            </feed>"#
+        ));
+        assert_eq!(bare.articles()[0].source_link(), &feed_url());
     }
 
     // Unparseable hrefs at any step of the source-link chain never stop
-    // projection. The first href that resolves wins, and the feed URL is
-    // the last resort.
+    // projection. The first href that resolves wins, and the Feed URL is
+    // the last resort. feed-rs parsers never populate `title.src`, so this
+    // test sets it on a parsed document directly and calls `project`.
     #[hegel::test]
     fn project_source_link_skips_unparseable_hrefs(tc: hegel::TestCase) {
-        // Each href is valid, unparseable, or not a web page.
         let pick = |good: &'static str| {
             hegel::one_of!(
                 generators::just(Some(good)),
@@ -789,132 +859,169 @@ mod tests {
         let alternate = tc.draw(pick("https://example.com/alt"));
         let other = tc.draw(pick("https://example.com/other"));
 
-        let mut document = parse_feed(&atom(""));
+        let mut document = feed_rs::parser::parse(atom(SAMPLE_ENTRY).as_bytes()).unwrap();
         document.links.clear();
         if let Some(title) = document.title.as_mut() {
             title.src = src.map(str::to_owned);
         }
+        let make_link = |href: &str, rel: Option<&str>| Link {
+            href: href.to_owned(),
+            target: None,
+            rel: rel.map(str::to_owned),
+            media_type: None,
+            href_lang: None,
+            title: None,
+            length: None,
+        };
         if let Some(href) = alternate {
-            document.links.push(link(href, Some("alternate")));
+            document.links.push(make_link(href, Some("alternate")));
         }
         if let Some(href) = other {
-            document.links.push(link(href, None));
+            document.links.push(make_link(href, None));
         }
         let good = |href: Option<&'static str>| href.filter(|h| h.starts_with("https://"));
         let expected = good(src)
             .or(good(alternate))
             .or(good(other))
             .map_or_else(feed_url, |h| Url::parse(h).unwrap());
-        assert_eq!(resolve_source_link(&document, &feed_url()), expected);
+        let source = project(&document, feed(FEED_URL));
+        assert_eq!(source.articles()[0].source_link(), &expected);
     }
 
+    // A title a reader cannot see falls back to the host for a Feed, and
+    // makes an Entry incomplete.
     #[test]
-    fn resolve_entry_link_resolves_relative_and_skips_linkless() {
-        // An absolute link is returned unchanged.
-        let abs = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://other.example/abs"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>"#,
-        );
-        assert_eq!(
-            resolve_entry_link(&abs, &feed_url()).unwrap().as_str(),
-            "https://other.example/abs"
-        );
-
-        // A relative link is resolved against the feed origin.
-        let rel = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="/rel-path"/>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>"#,
-        );
-        assert_eq!(
-            resolve_entry_link(&rel, &feed_url()).unwrap().as_str(),
-            "https://example.com/rel-path"
-        );
-
-        // An entry with no links has no resolvable link; the caller skips it.
-        let none = first_entry(
-            r"<entry>
-                <title>t</title>
-                <published>2020-01-01T00:00:00Z</published>
-            </entry>",
-        );
-        assert_eq!(resolve_entry_link(&none, &feed_url()), None);
+    fn invisible_titles_count_as_missing() {
+        for title in [
+            "   ",
+            "&lt;b&gt;&lt;/b&gt;",
+            "&lt;script&gt;x&lt;/script&gt;",
+            "&amp;nbsp;",
+        ] {
+            let source = parse_xml(&format!(
+                r#"<?xml version="1.0"?>
+                <feed xmlns="http://www.w3.org/2005/Atom">
+                    <title>{title}</title>
+                    <link href="https://example.com/"/>
+                    <updated>2020-01-01T00:00:00Z</updated>
+                    <entry>
+                        <title>{title}</title>
+                        <link href="https://example.com/hidden"/>
+                        <published>2020-01-02T00:00:00Z</published>
+                    </entry>
+                    <entry>
+                        <title>Visible</title>
+                        <link href="https://example.com/visible"/>
+                        <published>2020-01-01T00:00:00Z</published>
+                    </entry>
+                </feed>"#
+            ));
+            let [article] = source.articles() else {
+                panic!(
+                    "expected only the visible entry for {title:?}: {:?}",
+                    source.articles()
+                );
+            };
+            assert_eq!(article.title(), "Visible", "{title:?}");
+            assert_eq!(article.source_title(), "example.com", "{title:?}");
+        }
     }
 
-    #[test]
-    fn resolve_entry_link_ignores_comment_links() {
-        // feed-rs lists RSS `<comments>` and `wfw:commentRss` as entry links,
-        // in document order, so a comments link can come first. The article
-        // must point at the post itself.
-        let feed = parse_feed(
+    // A titleless Feed must get a fallback title for any URL a Feed can be
+    // fetched from, including IP-address hosts where `Url::domain()` is None.
+    #[hegel::test]
+    fn source_title_falls_back_for_any_http_host(tc: hegel::TestCase) {
+        use hegel::generators::Generator;
+        let host = tc.draw(hegel::one_of!(
+            generators::domains(),
+            generators::ip_addresses().v4().map(|ip| ip.to_string()),
+            // IPv6 hosts go in brackets inside a URL.
+            generators::ip_addresses().v6().map(|ip| format!("[{ip}]")),
+        ));
+        let url_str = format!("http://{host}/feed.xml");
+        let url = Url::parse(&url_str).expect("generated host is valid");
+
+        let xml = format!(
             r#"<?xml version="1.0"?>
-            <rss version="2.0" xmlns:wfw="http://wellformedweb.org/CommentAPI/">
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title></title>
+                <link href="https://example.com/"/>
+                <updated>2020-01-01T00:00:00Z</updated>
+                {SAMPLE_ENTRY}
+            </feed>"#
+        );
+        let source = parse_at(&url_str, &xml);
+        assert_eq!(source.articles()[0].source_title(), url.host_str().unwrap());
+    }
+
+    #[test]
+    fn an_out_of_range_published_date_falls_back_to_updated() {
+        // The RSS date parser accepts a five-digit year, past the end of
+        // jiff's range in year 9999.
+        let source = parse_xml(
+            r#"<?xml version="1.0"?>
+            <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
                 <channel>
                     <title>t</title>
                     <link>https://example.com/</link>
                     <item>
-                        <title>a</title>
-                        <comments>https://example.com/a#comments</comments>
-                        <wfw:commentRss>https://example.com/a/feed</wfw:commentRss>
-                        <link>https://example.com/a</link>
-                    </item>
-                    <item>
-                        <title>b</title>
-                        <comments>https://example.com/b#comments</comments>
+                        <title>t</title>
+                        <link>https://example.com/post</link>
+                        <pubDate>01 Jan 10000 00:00:00 GMT</pubDate>
+                        <atom:updated>2020-01-01T00:00:00Z</atom:updated>
                     </item>
                 </channel>
             </rss>"#,
         );
-        let links: Vec<_> = feed
-            .entries
-            .iter()
-            .map(|entry| resolve_entry_link(entry, &feed_url()).map(String::from))
-            .collect();
-        assert_eq!(links, [Some("https://example.com/a".to_owned()), None]);
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.timestamp().to_string(), "2020-01-01T00:00:00Z");
     }
 
     #[test]
-    fn raw_summary_prefers_summary_then_content_then_none() {
-        let summary = first_entry(
+    fn summary_prefers_summary_then_content_then_none() {
+        let source = parse_xml(&atom(
             r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
-                <published>2020-01-01T00:00:00Z</published>
+                <title>Both</title>
+                <link href="https://example.com/both"/>
+                <published>2020-01-03T00:00:00Z</published>
                 <summary>the summary</summary>
-            </entry>"#,
-        );
-        assert_eq!(raw_summary(&summary), Some("the summary"));
-
-        let content_only = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
-                <published>2020-01-01T00:00:00Z</published>
                 <content type="html">&lt;p&gt;body&lt;/p&gt;</content>
-            </entry>"#,
-        );
-        assert!(raw_summary(&content_only).unwrap().contains("body"));
-
-        let neither = first_entry(
-            r#"<entry>
-                <title>t</title>
-                <link href="https://example.com/a"/>
+            </entry>
+            <entry>
+                <title>Content Only</title>
+                <link href="https://example.com/content"/>
+                <published>2020-01-02T00:00:00Z</published>
+                <content type="html">&lt;p&gt;body&lt;/p&gt;</content>
+            </entry>
+            <entry>
+                <title>Neither</title>
+                <link href="https://example.com/neither"/>
                 <published>2020-01-01T00:00:00Z</published>
             </entry>"#,
-        );
-        assert_eq!(raw_summary(&neither), None);
+        ));
+        let summaries: Vec<Option<&str>> = source
+            .articles()
+            .iter()
+            .map(|article| article.summary())
+            .collect();
+        assert_eq!(summaries, [Some("the summary"), Some("<p>body</p>"), None]);
     }
 
     #[test]
-    fn sanitize_html_strips_scripts_keeps_text_and_trims() {
-        let out = sanitize_html("  <p>Safe</p><script>alert(1)</script> Tom &amp; Jerry  ");
-        // ammonia removes the <script> and keeps text entity-escaped, so the
-        // result stays safe even through the template's `| safe` filter.
+    fn summary_sanitization_strips_scripts_keeps_text_and_trims() {
+        let source = parse_xml(&atom(
+            r#"<entry>
+                <title>Post</title>
+                <link href="https://example.com/post"/>
+                <published>2020-01-01T00:00:00Z</published>
+                <summary><![CDATA[  <p>Safe</p><script>alert(1)</script> Tom &amp; Jerry  ]]></summary>
+            </entry>"#,
+        ));
+        let out = source.articles()[0].summary().unwrap();
+        // Ammonia removes `<script>` and keeps text entity-escaped, so the
+        // summary stays safe through the template's `| safe` filter.
         assert!(!out.contains("script"));
         assert!(out.contains("Safe"));
         assert!(out.contains("Tom &amp; Jerry"));
@@ -924,9 +1031,9 @@ mod tests {
     // No input, however it encodes its markup, may come out of sanitization
     // with a live <script> tag. Decoding entities after cleaning would turn
     // harmless text like "&lt;script&gt;" back into real markup, which the
-    // default template then embeds raw via `| safe`.
+    // default template embeds raw via `| safe`.
     #[hegel::test]
-    fn sanitize_html_never_emits_live_markup(tc: hegel::TestCase) {
+    fn sanitized_summaries_never_emit_live_script_markup(tc: hegel::TestCase) {
         let payload = tc.draw(hegel::one_of!(
             generators::just("<script>alert(1)</script>".to_string()),
             generators::just("&lt;script&gt;alert(1)&lt;/script&gt;".to_string()),
@@ -935,17 +1042,34 @@ mod tests {
         ));
         let prefix = tc.draw(generators::text().max_size(16));
         let suffix = tc.draw(generators::text().max_size(16));
-        let out = sanitize_html(&format!("{prefix}{payload}{suffix}"));
-        assert!(
-            !out.to_lowercase().contains("<script"),
-            "live script tag in sanitized output: {out:?}"
-        );
+        let raw = format!("{prefix}{payload}{suffix}");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": "https://jsonfeed.org/version/1.1",
+            "title": "Example Blog",
+            "home_page_url": "https://example.com/",
+            "items": [{
+                "id": "1",
+                "url": "https://example.com/post",
+                "title": "Post",
+                "summary": raw,
+                "date_published": "2020-01-01T00:00:00Z",
+            }],
+        }))
+        .unwrap();
+
+        let source = parse(&bytes, &feed(FEED_URL)).unwrap();
+        if let Some(out) = source.articles()[0].summary() {
+            assert!(
+                !out.to_lowercase().contains("<script"),
+                "live script tag in sanitized output: {out:?}"
+            );
+        }
     }
 
-    // Sanitized text holds no character that could open a tag or end a
-    // quoted attribute, so it is safe anywhere a template puts it.
+    // Sanitized titles hold no character that could open a tag or end a
+    // quoted attribute, so they are safe anywhere a template puts them.
     #[hegel::test]
-    fn sanitize_text_never_emits_markup_or_quotes(tc: hegel::TestCase) {
+    fn sanitized_titles_never_emit_markup_or_quotes(tc: hegel::TestCase) {
         let payload = tc.draw(hegel::one_of!(
             generators::just("\"><img src=x onerror=alert(1)>".to_string()),
             generators::just("' onmouseover='alert(1)".to_string()),
@@ -955,17 +1079,46 @@ mod tests {
         ));
         let prefix = tc.draw(generators::text().max_size(16));
         let suffix = tc.draw(generators::text().max_size(16));
-        let out = super::sanitize_text(&format!("{prefix}{payload}{suffix}"));
-        for c in ['<', '>', '"', '\''] {
-            assert!(!out.contains(c), "{c:?} in sanitized text: {out:?}");
+        let raw = format!("{prefix}{payload}{suffix}");
+        // Add a second plain Entry so the test still checks `source_title`
+        // when `parse` drops the hostile Entry for an empty title.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": "https://jsonfeed.org/version/1.1",
+            "title": raw,
+            "home_page_url": "https://example.com/",
+            "items": [
+                {
+                    "id": "1",
+                    "url": "https://example.com/hostile",
+                    "title": raw,
+                    "date_published": "2020-01-01T00:00:00Z",
+                },
+                {
+                    "id": "2",
+                    "url": "https://example.com/plain",
+                    "title": "Plain",
+                    "date_published": "2020-01-01T00:00:00Z",
+                },
+            ],
+        }))
+        .unwrap();
+
+        let source = parse(&bytes, &feed(FEED_URL)).unwrap();
+        assert!(!source.articles().is_empty());
+        for article in source.articles() {
+            for out in [article.title(), article.source_title()] {
+                for c in ['<', '>', '"', '\''] {
+                    assert!(!out.contains(c), "{c:?} in sanitized text: {out:?}");
+                }
+            }
         }
     }
 
     #[test]
-    fn project_sanitizes_title_and_source_title() {
-        // The XML parser decodes the entities, so the in-memory titles hold
-        // real <script> markup, exactly as a hostile feed would deliver it.
-        let source = project_xml(
+    fn parse_sanitizes_title_and_source_title() {
+        // The XML parser decodes the entities, so the parsed titles hold
+        // real <script> markup, just as a hostile Feed would deliver them.
+        let source = parse_xml(
             r#"<?xml version="1.0" encoding="utf-8"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
                 <title>&lt;script&gt;evil()&lt;/script&gt;Src</title>
@@ -979,73 +1132,18 @@ mod tests {
                 </entry>
             </feed>"#,
         );
-        assert_eq!(source.articles[0].title, "Hello");
-        assert_eq!(source.articles[0].source_title, "Src");
-    }
-
-    #[test]
-    fn project_extracts_basic_fields() {
-        let source = project_xml(&atom(
-            r#"<entry>
-                <title>First Post</title>
-                <link href="https://example.com/first"/>
-                <published>2020-01-01T00:00:00Z</published>
-                <summary>Hello world</summary>
-            </entry>"#,
-        ));
-
-        assert_eq!(source.articles.len(), 1);
-        let a = &source.articles[0];
-        assert_eq!(a.link.as_str(), "https://example.com/first");
-        assert_eq!(a.title, "First Post");
-        assert_eq!(a.summary.as_deref(), Some("Hello world"));
-        assert_eq!(a.source_title, "Example Blog");
-        assert_eq!(a.source_link.as_str(), "https://example.com/");
-    }
-
-    #[test]
-    fn parse_valid_feed_projects_source_and_preserves_feed() {
-        let feed = Feed {
-            url: feed_url(),
-            weight: std::num::NonZeroUsize::new(3),
-        };
-        let xml = atom(
-            r#"<entry>
-                <title>First Post</title>
-                <link href="https://example.com/first"/>
-                <published>2020-01-01T00:00:00Z</published>
-                <summary>Hello world</summary>
-            </entry>"#,
-        );
-
-        let source = super::parse(xml.as_bytes(), &feed).expect("valid Atom feed parses");
-
-        assert_eq!(source.feed(), &feed);
         let [article] = source.articles() else {
             panic!("expected one article: {:?}", source.articles());
         };
-        assert_eq!(article.source_title(), "Example Blog");
-        assert_eq!(article.summary(), Some("Hello world"));
-    }
-
-    #[test]
-    fn parse_rejects_non_feed_bytes() {
-        let feed = Feed {
-            url: feed_url(),
-            weight: None,
-        };
-
-        let err: super::ParseError =
-            super::parse(b"<html><body>not a feed</body></html>", &feed).unwrap_err();
-        let err_ref: &dyn std::error::Error = &err;
-        assert!(!err_ref.to_string().is_empty());
+        assert_eq!(article.title(), "Hello");
+        assert_eq!(article.source_title(), "Src");
     }
 
     // A summary with nothing safe left after sanitizing counts as missing,
     // so the Article's page gets a chance to supply one.
     #[test]
     fn a_summary_with_nothing_safe_left_is_missing() {
-        let source = project_xml(&atom(
+        let source = parse_xml(&atom(
             r#"<entry>
                 <title>Only script</title>
                 <link href="https://example.com/first"/>
@@ -1053,11 +1151,11 @@ mod tests {
                 <summary>&lt;script&gt;alert(1)&lt;/script&gt;</summary>
             </entry>"#,
         ));
-        assert_eq!(source.articles[0].summary, None);
+        assert_eq!(source.articles()[0].summary(), None);
     }
 
     #[test]
-    fn project_warns_once_when_a_feed_yields_nothing() {
+    fn parse_warns_once_when_a_feed_yields_nothing() {
         let xml = atom(
             r"<entry>
                 <title>No Link A</title>
@@ -1070,10 +1168,10 @@ mod tests {
         );
 
         let logs = warnings_logged(|| {
-            assert!(project_xml(&xml).articles.is_empty());
+            assert!(parse_xml(&xml).articles().is_empty());
         });
-        // One aggregated warning naming the feed and the count, not one line
-        // per malformed entry.
+        // One aggregated warning naming the Feed and the count, not one line
+        // per malformed Entry.
         assert_eq!(
             logs.matches("contributed no articles").count(),
             1,
@@ -1083,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn project_is_quiet_about_partial_skips() {
+    fn parse_is_quiet_about_partial_skips() {
         let xml = atom(
             r#"<entry>
                 <title>No Link</title>
@@ -1098,18 +1196,20 @@ mod tests {
         );
 
         let logs = warnings_logged(|| {
-            let source = project_xml(&xml);
-            assert_eq!(source.articles.len(), 1);
-            assert_eq!(source.articles[0].title, "Good");
+            let source = parse_xml(&xml);
+            let [article] = source.articles() else {
+                panic!("expected one article: {:?}", source.articles());
+            };
+            assert_eq!(article.title(), "Good");
         });
-        // A feed that still renders something is not warn-worthy; the
-        // per-entry detail lives at debug level.
+        // A Feed that still renders something does not warn; per-Entry
+        // detail stays at debug level.
         assert_eq!(logs, "", "expected no warnings for a partially usable feed");
     }
 
     #[test]
-    fn project_skips_and_counts_an_entry_with_an_out_of_range_date() {
-        // Year 10000 parses as a feed date but lies past jiff's range, which
+    fn parse_skips_and_counts_an_entry_with_an_out_of_range_date() {
+        // Year 10000 parses as a Feed date but lies past jiff's range, which
         // ends at year 9999. The RSS date parser accepts a five-digit year.
         let xml = r#"<?xml version="1.0"?>
             <rss version="2.0">
@@ -1123,21 +1223,17 @@ mod tests {
                     </item>
                 </channel>
             </rss>"#;
-        assert!(
-            parse_feed(xml).entries[0].published.is_some(),
-            "fixture must carry a parsed date"
-        );
 
         let logs = warnings_logged(|| {
-            assert!(project_xml(xml).articles.is_empty());
+            assert!(parse_xml(xml).articles().is_empty());
         });
         assert!(logs.contains("skipped=1"), "logs: {logs}");
     }
 
-    // Every complete Entry yields exactly one Article, and an Entry missing
-    // its link, title, or date yields none.
+    // Every complete Entry yields one Article, and an Entry missing its
+    // link, title, or date yields none.
     #[hegel::test]
-    fn project_keeps_exactly_the_complete_entries(tc: hegel::TestCase) {
+    fn parse_keeps_exactly_the_complete_entries(tc: hegel::TestCase) {
         use std::fmt::Write as _;
 
         let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(8));
@@ -1164,19 +1260,23 @@ mod tests {
             }
         }
 
-        let source = project_xml(&atom(&entries));
-        let mut got: Vec<String> = source.articles.iter().map(|a| a.link.to_string()).collect();
+        let source = parse_xml(&atom(&entries));
+        let mut got: Vec<String> = source
+            .articles()
+            .iter()
+            .map(|article| article.link().to_string())
+            .collect();
         got.sort_unstable();
         complete.sort_unstable();
         assert_eq!(got, complete);
     }
 
-    // Relative entry hrefs resolve against the feed URL, so every Article
-    // link is absolute with the feed's scheme and a host.
+    // Relative Entry hrefs resolve against the Feed URL, so every Article
+    // link is absolute with the Feed's scheme and a host.
     #[hegel::test]
-    fn project_article_links_are_absolute(tc: hegel::TestCase) {
+    fn parse_article_links_are_absolute(tc: hegel::TestCase) {
         let host = tc.draw(generators::domains());
-        let feed = format!("https://{host}/blog/feed.xml");
+        let feed_str = format!("https://{host}/blog/feed.xml");
         let href = tc.draw(hegel::one_of!(
             generators::just("/post".to_string()),
             generators::just("post".to_string()),
@@ -1186,8 +1286,8 @@ mod tests {
             generators::from_regex(r"[a-z0-9/]{0,12}").fullmatch(true),
         ));
 
-        let source = project_at(
-            &feed,
+        let source = parse_at(
+            &feed_str,
             &atom(&format!(
                 r#"<entry>
                     <title>t</title>
@@ -1196,15 +1296,15 @@ mod tests {
                 </entry>"#
             )),
         );
-        for article in &source.articles {
-            assert_eq!(article.link.scheme(), "https");
-            assert!(article.link.host_str().is_some(), "{}", article.link);
+        for article in source.articles() {
+            assert_eq!(article.link().scheme(), "https");
+            assert!(article.link().host_str().is_some(), "{}", article.link());
         }
     }
 
     // Articles come out sorted, so selection can take a prefix.
     #[hegel::test]
-    fn project_sorts_articles_by_article_order(tc: hegel::TestCase) {
+    fn parse_sorts_articles_by_article_order(tc: hegel::TestCase) {
         use std::fmt::Write as _;
 
         let days = tc.draw(generators::vecs(generators::integers::<u8>().max_value(3)).max_size(8));
@@ -1221,10 +1321,10 @@ mod tests {
             )
             .unwrap();
         }
-        let source = project_xml(&atom(&entries));
+        let source = parse_xml(&atom(&entries));
         assert!(
             source
-                .articles
+                .articles()
                 .windows(2)
                 .all(|w| article_order(&w[0], &w[1]).is_le())
         );
