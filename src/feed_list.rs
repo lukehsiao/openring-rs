@@ -40,7 +40,7 @@ pub enum Error {
 }
 
 /// A web feed the user configured, with its optional Weight.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Feed {
     pub(crate) url: Url,
     pub(crate) weight: Option<NonZeroUsize>,

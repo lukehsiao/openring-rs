@@ -1,17 +1,24 @@
-//! Projection of a fetched document onto its Source and Articles, and the
-//! rules every Article keeps: its text is safe to embed in HTML, and a
-//! Source holds its Articles newest first.
+//! Parsing raw Feed bytes and projecting them onto a Source and its
+//! Articles, and the rules every Article keeps: its text is safe to embed
+//! in HTML, and a Source holds its Articles newest first.
 //!
-//! Nothing in a fetched document can fail the run. A bad link falls back,
+//! This is the only module that touches `feed_rs`. Once bytes parse as a
+//! feed document, nothing in it can fail the run: a bad link falls back,
 //! and an Entry that cannot become an Article is skipped and counted.
 
 use feed_rs::model::{Entry, Feed as Document, Link};
 use jiff::Timestamp;
 use serde::Serialize;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 use url::{Position, Url};
 
 use crate::feed_list::Feed;
+
+/// Raw bytes did not parse as an RSS, Atom, or JSON Feed document.
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub(crate) struct ParseError(feed_rs::parser::ParseFeedError);
 
 /// A fetched Feed with every complete Entry as an Article. Each Article
 /// carries the Source's display title and homepage link.
@@ -91,6 +98,10 @@ impl Source {
         articles.sort_unstable_by(article_order);
         Self { feed, articles }
     }
+
+    pub(crate) fn articles(&self) -> &[Article] {
+        &self.articles
+    }
 }
 
 #[cfg(test)]
@@ -112,16 +123,34 @@ impl Article {
         &self.title
     }
 
+    pub(crate) fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
     pub(crate) fn source_link(&self) -> &Url {
         &self.source_link
     }
+
+    pub(crate) fn source_title(&self) -> &str {
+        &self.source_title
+    }
 }
 
-/// Project a fetched `document` for `feed` onto its Source.
+/// Parse raw Feed bytes and project the document onto its [`Source`].
 ///
 /// Warns once when the document lists Entries but none of them is complete,
-/// so a feed that yields nothing usable does not vanish silently.
-pub(crate) fn project(document: &Document, feed: Feed) -> Source {
+/// so a Feed that yields nothing usable does not vanish silently.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when `body` is not a valid feed document.
+pub(crate) fn parse(body: &[u8], feed: &Feed) -> Result<Source, ParseError> {
+    let document = feed_rs::parser::parse(body).map_err(ParseError)?;
+    Ok(project(&document, feed.clone()))
+}
+
+/// Project a parsed `document` for `feed` onto its Source.
+fn project(document: &Document, feed: Feed) -> Source {
     let title = resolve_source_title(document, &feed.url);
     let link = resolve_source_link(document, &feed.url);
     let mut articles: Vec<Article> = document
@@ -972,6 +1001,44 @@ mod tests {
         assert_eq!(a.summary.as_deref(), Some("Hello world"));
         assert_eq!(a.source_title, "Example Blog");
         assert_eq!(a.source_link.as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn parse_valid_feed_projects_source_and_preserves_feed() {
+        let feed = Feed {
+            url: feed_url(),
+            weight: std::num::NonZeroUsize::new(3),
+        };
+        let xml = atom(
+            r#"<entry>
+                <title>First Post</title>
+                <link href="https://example.com/first"/>
+                <published>2020-01-01T00:00:00Z</published>
+                <summary>Hello world</summary>
+            </entry>"#,
+        );
+
+        let source = super::parse(xml.as_bytes(), &feed).expect("valid Atom feed parses");
+
+        assert_eq!(source.feed(), &feed);
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.source_title(), "Example Blog");
+        assert_eq!(article.summary(), Some("Hello world"));
+    }
+
+    #[test]
+    fn parse_rejects_non_feed_bytes() {
+        let feed = Feed {
+            url: feed_url(),
+            weight: None,
+        };
+
+        let err: super::ParseError =
+            super::parse(b"<html><body>not a feed</body></html>", &feed).unwrap_err();
+        let err_ref: &dyn std::error::Error = &err;
+        assert!(!err_ref.to_string().is_empty());
     }
 
     // A summary with nothing safe left after sanitizing counts as missing,
