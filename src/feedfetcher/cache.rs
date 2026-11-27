@@ -16,38 +16,33 @@
 //! and never parses them, so the caller checks a body before it records it
 //! as [`Outcome::Fresh`].
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{io, path::Path, sync::Arc};
 
 use dashmap::DashMap;
-use directories::ProjectDirs;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use url::Url;
 
+use super::CacheConfig;
 use crate::fs::Fs;
 
 /// A Feed's raw document, shared rather than copied between the cache and
 /// the fetch that serves it. It stays bytes, not text: the feed parser must
 /// see the original encoding, since a latin-1 feed pre-decoded to UTF-8
 /// turns to mojibake when the parser honors the XML prolog.
-pub(crate) type Body = Arc<Vec<u8>>;
+pub(super) type Body = Arc<Vec<u8>>;
 
 /// The `ETag` and `Last-Modified` values a server sent with a Feed.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Validators {
-    pub(crate) etag: Option<String>,
-    pub(crate) last_modified: Option<String>,
+pub(super) struct Validators {
+    pub(super) etag: Option<String>,
+    pub(super) last_modified: Option<String>,
 }
 
 /// What to do about a Feed before fetching it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Plan {
+pub(super) enum Plan {
     /// A Retry window is open: serve this cached body and send nothing.
     Serve(Body),
     /// Send a request carrying these Validators. They are empty when the
@@ -57,7 +52,7 @@ pub(crate) enum Plan {
 
 /// What the server said about a Feed.
 #[derive(Debug)]
-pub(crate) enum Outcome {
+pub(super) enum Outcome {
     /// A new body that parsed as a feed, so it is not empty, with the
     /// Validators that came with it.
     Fresh {
@@ -116,31 +111,24 @@ mod body_base64 {
 /// Every Feed the cache remembers, and where it lives on disk. Clones share
 /// the same entries, so concurrent fetches can each hold one.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Cache {
+pub(super) struct Cache {
     entries: Arc<DashMap<Url, Entry>>,
     /// Where [`Cache::save`] writes. `None` keeps the cache in memory only.
     path: Option<Arc<Path>>,
 }
 
 impl Cache {
-    /// Where the cache lives by default, if the platform has a cache
-    /// directory.
-    pub(crate) fn default_path() -> Option<PathBuf> {
-        ProjectDirs::from("dev", "hsiao", "openring")
-            .map(|dirs| dirs.cache_dir().join("cache.json"))
-    }
-
-    /// Open the cache saved at `path`, dropping entries whose server last
-    /// answered `max_age` or longer before `now`. Without a path, the cache
-    /// starts empty, reads nothing, and saves nothing.
+    /// Open the cache described by `config`, dropping entries whose server last
+    /// answered `max_age` or longer before `now`. When `config` is `None`, the
+    /// cache starts empty, reads nothing, and saves nothing.
     ///
     /// The cache is purely an optimization, so this never fails. A missing
     /// file starts an empty cache quietly. An unreadable or undecodable file
     /// starts an empty cache with a warning, and the next save replaces it.
     /// That includes caches written by older versions in another format,
     /// which is the intended migration.
-    pub(crate) fn open(fs: &Fs, path: Option<&Path>, max_age: Duration, now: Timestamp) -> Self {
-        let Some(path) = path else {
+    pub(super) fn open(fs: &Fs, config: Option<CacheConfig<'_>>, now: Timestamp) -> Self {
+        let Some(CacheConfig { path, max_age }) = config else {
             return Self::default();
         };
         let loaded = fs.read_locked(path).and_then(|text| {
@@ -171,12 +159,12 @@ impl Cache {
     }
 
     /// Save the cache to the path it was opened from, best-effort. Does
-    /// nothing for a cache opened without a path.
+    /// nothing for a cache opened without a config.
     ///
     /// A failed write (read-only cache directory, full disk) only logs a
     /// warning: failing the run here would throw away a whole round of
     /// fetches right before the output is rendered.
-    pub(crate) fn save(&self, fs: &Fs) {
+    pub(super) fn save(&self, fs: &Fs) {
         let Some(path) = &self.path else {
             return;
         };
@@ -189,7 +177,7 @@ impl Cache {
     }
 
     /// What to do about the Feed at `url` before fetching it at `now`.
-    pub(crate) fn plan(&self, url: &Url, now: Timestamp) -> Plan {
+    pub(super) fn plan(&self, url: &Url, now: Timestamp) -> Plan {
         let Some(entry) = self.entries.get(url) else {
             return Plan::Request(Validators::default());
         };
@@ -203,7 +191,7 @@ impl Cache {
     /// Record what the server said about the Feed at `url` at `now`, and
     /// return the body to parse. `None` when the server confirmed or rate
     /// limited a Feed the cache holds nothing for.
-    pub(crate) fn record(&self, url: &Url, outcome: Outcome, now: Timestamp) -> Option<Body> {
+    pub(super) fn record(&self, url: &Url, outcome: Outcome, now: Timestamp) -> Option<Body> {
         match outcome {
             Outcome::Fresh { body, validators } => {
                 let body = Arc::new(body);
@@ -247,7 +235,7 @@ impl Cache {
     /// The body cached for the Feed at `url`, to serve when a fetch fails
     /// for a reason that may pass. This changes nothing, so the entry still
     /// ages out from when the server last answered.
-    pub(crate) fn fallback(&self, url: &Url) -> Option<Body> {
+    pub(super) fn fallback(&self, url: &Url) -> Option<Body> {
         self.entries.get(url).map(|entry| Arc::clone(&entry.body))
     }
 }
@@ -263,7 +251,7 @@ mod tests {
     use jiff::{SignedDuration, Timestamp};
     use url::Url;
 
-    use super::{Body, Cache, Outcome, Plan, Validators};
+    use super::{Body, Cache, CacheConfig, Outcome, Plan, Validators};
     use crate::{fs::Fs, test_support::warnings_logged};
 
     const CACHE_PATH: &str = "/cache/cache.json";
@@ -286,8 +274,12 @@ mod tests {
         }
     }
 
+    fn config(path: &Path, max_age: Duration) -> CacheConfig<'_> {
+        CacheConfig { path, max_age }
+    }
+
     fn open(fs: &Fs, now: Timestamp) -> Cache {
-        Cache::open(fs, Some(Path::new(CACHE_PATH)), Duration::MAX, now)
+        Cache::open(fs, Some(config(Path::new(CACHE_PATH), Duration::MAX)), now)
     }
 
     #[test]
@@ -354,7 +346,7 @@ mod tests {
         let blocker = tempfile::NamedTempFile::new().unwrap();
         let path = blocker.path().join("cache.json");
         let now = at("2026-01-01T00:00:00Z");
-        let cache = Cache::open(&Fs::create(), Some(&path), Duration::MAX, now);
+        let cache = Cache::open(&Fs::create(), Some(config(&path, Duration::MAX)), now);
         cache.record(&url(), fresh(None), now).unwrap();
 
         let logs = warnings_logged(|| cache.save(&Fs::create()));
@@ -367,11 +359,11 @@ mod tests {
         let path = dir.path().join("cache.json");
         let now = at("2026-01-01T00:00:00Z");
         let fs = Fs::create();
-        let cache = Cache::open(&fs, Some(&path), Duration::MAX, now);
+        let cache = Cache::open(&fs, Some(config(&path, Duration::MAX)), now);
         cache.record(&url(), fresh(Some("\"v1\"")), now).unwrap();
 
         cache.save(&fs);
-        let loaded = Cache::open(&fs, Some(&path), Duration::MAX, now);
+        let loaded = Cache::open(&fs, Some(config(&path, Duration::MAX)), now);
         assert_eq!(
             loaded
                 .record(&url(), Outcome::NotModified(Validators::default()), now)
@@ -553,7 +545,11 @@ mod tests {
                 generators::just(Duration::MAX)
             ));
             self.subject.save(&self.fs);
-            self.subject = Cache::open(&self.fs, Some(Path::new(CACHE_PATH)), max_age, self.now);
+            self.subject = Cache::open(
+                &self.fs,
+                Some(config(Path::new(CACHE_PATH), max_age)),
+                self.now,
+            );
 
             // The model keeps an entry only while its server answered less
             // than `max_age` ago.
