@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.7
+
+### Patch Changes
+
+- [#201](https://github.com/lukehsiao/openring-rs/pull/201) [`63e094b`](https://github.com/lukehsiao/openring-rs/commit/63e094b36ccc4a286b0dfc6b493f3024c8572e3d) - **refactor**: replace `OpenringError`'s `FeedMissing`, `FeedUrlError`, and `FeedWeightError` variants with `OpenringError::FeedList`.
+  
+  The `FeedUrlError` and `FeedWeightError` structs are no longer exported from `openring::error`. Feed list diagnostics now live in the private `feed_list` module behind `OpenringError::FeedList`, keeping the rendered messages, spans, help text, and `openring::*` diagnostic codes unchanged.
+
+<pre>
+$ git-stats v0.6.6..v0.6.7
+Author           Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao            10             24       +2683      -1697   +986
+dependabot[bot]        1              4         +19        -19      0
+Total                 11             28       +2702      -1716   +986
+</pre>
+
 ## 0.6.6
 
 ### Patch Changes
