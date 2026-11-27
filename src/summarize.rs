@@ -220,217 +220,433 @@ fn truncate_chars(text: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use hegel::generators;
+    use url::Url;
 
-    use super::*;
-    use crate::{http::Answer, test_support::block_on};
+    use super::{
+        MAX_PAGE_BYTES, MAX_SUMMARY_CHARS, extract_summary, fill_missing_summaries, normalized,
+        truncate_chars,
+    };
+    use crate::{
+        http::{Answer, Http},
+        source::Article,
+        terminal::{Line, Terminal, Tone},
+        test_support::block_on,
+    };
 
-    #[test]
-    fn is_html_accepts_html_content_types() {
-        assert!(is_html(None), "absent header gets the benefit of the doubt");
-        assert!(is_html(Some("text/html")));
-        assert!(is_html(Some("text/html; charset=utf-8")));
-        assert!(is_html(Some("application/xhtml+xml")));
-        assert!(is_html(Some("TEXT/HTML")), "matching is case-insensitive");
-    }
-
-    #[test]
-    fn is_html_rejects_non_html_content_types() {
-        assert!(!is_html(Some("application/json")));
-        assert!(!is_html(Some("image/png")));
-        assert!(!is_html(Some("application/rss+xml")));
-    }
-
-    #[test]
-    fn meta_description_is_preferred_over_body_paragraphs() {
-        let html = r#"<html><head>
-            <meta name="description" content="Meta wins">
-            </head><body><article><p>Body paragraph</p></article></body></html>"#;
-        assert_eq!(extract_summary(html).as_deref(), Some("Meta wins"));
-    }
-
-    #[test]
-    fn standard_description_beats_social_variants() {
-        let html = r#"<html><head>
-            <meta property="og:description" content="OG desc">
-            <meta name="description" content="Standard desc">
-            </head><body></body></html>"#;
-        assert_eq!(extract_summary(html).as_deref(), Some("Standard desc"));
-    }
-
-    #[test]
-    fn og_description_used_when_no_standard_description() {
-        let html = r#"<html><head>
-            <meta property="og:description" content="OG desc">
-            </head><body></body></html>"#;
-        assert_eq!(extract_summary(html).as_deref(), Some("OG desc"));
-    }
-
-    #[test]
-    fn twitter_description_used_as_last_meta_resort() {
-        let html = r#"<html><head>
-            <meta name="twitter:description" content="Tweet desc">
-            </head><body></body></html>"#;
-        assert_eq!(extract_summary(html).as_deref(), Some("Tweet desc"));
-    }
-
-    #[test]
-    fn leading_paragraphs_used_when_no_meta_description() {
-        let html = r"<html><body><article>
-            <p>First   line.</p>
-            <p>Second line.</p>
-            </article></body></html>";
-        assert_eq!(
-            extract_summary(html).as_deref(),
-            Some("First line. Second line.")
-        );
-    }
-
-    #[test]
-    fn article_scope_keeps_navigation_out_of_the_summary() {
-        let html = r"<html><body>
-            <nav><p>Home About Contact</p></nav>
-            <article><p>The actual article body.</p></article>
-            </body></html>";
-        assert_eq!(
-            extract_summary(html).as_deref(),
-            Some("The actual article body.")
-        );
-    }
-
-    #[test]
-    fn script_bodies_do_not_leak_into_the_summary() {
-        let html = r"<html><body>
-            <script>var tracking = 1;</script>
-            <p>Readable text.</p>
-            </body></html>";
-        assert_eq!(extract_summary(html).as_deref(), Some("Readable text."));
-    }
-
-    #[test]
-    fn empty_page_yields_no_summary() {
-        let html = "<html><head></head><body></body></html>";
-        assert_eq!(extract_summary(html), None);
-    }
-
-    #[test]
-    fn whitespace_only_meta_falls_back_to_paragraphs() {
-        let html = r#"<html><head>
-            <meta name="description" content="   ">
-            </head><body><p>Fallback body.</p></body></html>"#;
-        assert_eq!(extract_summary(html).as_deref(), Some("Fallback body."));
-    }
-
-    #[test]
-    fn long_summaries_are_truncated_with_an_ellipsis() {
-        // 1000 characters, well over the cap.
-        let long = "word ".repeat(200);
-        let html = format!(
-            r#"<html><head><meta name="description" content="{long}"></head><body></body></html>"#
-        );
-        let summary = extract_summary(&html).expect("meta description present");
-        assert!(summary.chars().count() <= MAX_SUMMARY_CHARS);
-        assert!(summary.ends_with('…'));
-    }
-
-    #[test]
-    fn empty_paragraphs_are_skipped() {
-        let html = r"<html><body><article>
-            <p></p>
-            <p>   </p>
-            <p>Real content.</p>
-            </article></body></html>";
-        assert_eq!(extract_summary(html).as_deref(), Some("Real content."));
-    }
-
-    #[test]
-    fn paragraph_accumulation_stops_at_the_cap() {
-        // Each paragraph runs 81 characters, so a handful blow past the cap
-        // and accumulation stops early with a truncated result.
-        let para = format!("<p>{}</p>", "lorem ipsum dolor sit amet ".repeat(3));
-        let body = para.repeat(20);
-        let html = format!("<html><body><article>{body}</article></body></html>");
-        let summary = extract_summary(&html).expect("paragraphs present");
-        assert!(summary.chars().count() <= MAX_SUMMARY_CHARS);
-        assert!(summary.ends_with('…'));
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
     }
 
     fn post_url() -> Url {
-        Url::parse("https://blog.example/post").unwrap()
+        url("https://blog.example/post")
     }
 
-    fn summarize(answer: Answer) -> Option<String> {
-        let http = Http::create_null([(post_url(), answer)]);
-        block_on(fetch_summary(&http, &post_url()))
-    }
-
-    #[test]
-    fn an_html_page_yields_its_summary() {
-        let page =
-            r#"<html><head><meta name="description" content="About this post."></head></html>"#;
-        assert_eq!(
-            summarize(Answer::ok(page).header("content-type", "text/html; charset=utf-8"))
-                .as_deref(),
-            Some("About this post.")
-        );
-    }
-
-    #[test]
-    fn non_html_pages_yield_no_summary() {
-        let answer = Answer::ok(r#"{"summary":"nope"}"#).header("content-type", "application/json");
-        assert_eq!(summarize(answer), None);
-    }
-
-    #[test]
-    fn oversized_pages_yield_no_summary() {
-        let page = format!(
-            r#"<html><head><meta name="description" content="Huge."></head><body>{}</body></html>"#,
-            "x".repeat(MAX_PAGE_BYTES)
-        );
-        assert_eq!(summarize(Answer::ok(page).chunked()), None);
-    }
-
-    #[tokio::test]
-    async fn pages_announcing_an_oversized_content_length_yield_no_summary() {
-        let post = post_url();
-        let source_link = Url::parse("https://blog.example/").unwrap();
-        let mut articles = [Article::fixture(
-            &source_link,
+    fn article_at(link: Url) -> Article {
+        Article::fixture(
+            &url("https://blog.example/"),
             "Post",
-            post.clone(),
+            link,
             jiff::Timestamp::UNIX_EPOCH,
-        )];
-        let page = r#"<html><head><meta name="description" content="Huge."></head></html>"#;
-        let announced = u64::try_from(MAX_PAGE_BYTES).unwrap() + 1;
-        let http = Http::create_null([(
-            post,
-            Answer::ok(page)
-                .header("content-type", "text/html; charset=utf-8")
-                .content_length(announced),
-        )]);
+        )
+    }
+
+    fn summary_line(link: &Url) -> Line {
+        Line {
+            word: "Summary",
+            tone: Tone::Good,
+            detail: link.to_string(),
+        }
+    }
+
+    struct SummaryOutcome {
+        summary: Option<String>,
+        lines: Vec<Line>,
+    }
+
+    async fn summarize_one(answer: Answer) -> SummaryOutcome {
+        let post = post_url();
+        let mut articles = [article_at(post.clone())];
+        let http = Http::create_null([(post, answer)]);
         let terminal = Terminal::create_null(true);
         let lines = terminal.track_lines();
 
         fill_missing_summaries(&http, &terminal, &mut articles).await;
 
-        assert!(!articles[0].has_summary());
+        SummaryOutcome {
+            summary: articles[0].summary().map(str::to_owned),
+            lines: lines.data(),
+        }
+    }
+
+    async fn summarize_html(html: impl Into<Vec<u8>>) -> SummaryOutcome {
+        summarize_one(Answer::ok(html).header("content-type", "text/html; charset=utf-8")).await
+    }
+
+    #[tokio::test]
+    async fn skips_articles_that_already_have_a_summary() {
+        let existing_url = url("https://blog.example/existing");
+        let first_missing_url = url("https://blog.example/first");
+        let empty_url = url("https://blog.example/empty");
+        let second_missing_url = url("https://blog.example/second");
+
+        let mut existing = article_at(existing_url.clone());
+        existing.fill_summary("Already present.");
+        let mut articles = [
+            existing,
+            article_at(first_missing_url.clone()),
+            article_at(empty_url.clone()),
+            article_at(second_missing_url.clone()),
+        ];
+
+        let http = Http::create_null([
+            (
+                existing_url,
+                Answer::ok(
+                    r#"<html><head><meta name="description" content="Should not overwrite."></head></html>"#,
+                )
+                .header("content-type", "text/html"),
+            ),
+            (
+                first_missing_url.clone(),
+                Answer::ok(
+                    r#"<html><head><meta name="description" content="First derived."></head></html>"#,
+                )
+                .header("content-type", "text/html"),
+            ),
+            (
+                empty_url.clone(),
+                Answer::ok("<html><body></body></html>").header("content-type", "text/html"),
+            ),
+            (
+                second_missing_url.clone(),
+                Answer::ok("<html><body><p>Second derived.</p></body></html>")
+                    .header("content-type", "text/html"),
+            ),
+        ]);
+        let requests = http.track_requests();
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+
+        fill_missing_summaries(&http, &terminal, &mut articles).await;
+
+        assert_eq!(articles[0].summary(), Some("Already present."));
+        assert_eq!(articles[1].summary(), Some("First derived."));
+        assert_eq!(articles[2].summary(), None);
+        assert_eq!(articles[3].summary(), Some("Second derived."));
+
+        let mut requested: Vec<Url> = requests.data().into_iter().map(|r| r.url).collect();
+        requested.sort();
+        assert_eq!(
+            requested,
+            [
+                empty_url,
+                first_missing_url.clone(),
+                second_missing_url.clone(),
+            ]
+        );
+
+        let mut shown = lines.data();
+        shown.sort_by(|a, b| a.detail.cmp(&b.detail));
+        assert_eq!(
+            shown,
+            [
+                summary_line(&first_missing_url),
+                summary_line(&second_missing_url),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_no_requests_when_every_article_has_a_summary() {
+        let mut first = article_at(url("https://blog.example/one"));
+        first.fill_summary("One.");
+        let mut second = article_at(url("https://blog.example/two"));
+        second.fill_summary("Two.");
+        let mut articles = [first, second];
+
+        let http = Http::create_null::<Answer>([]);
+        let requests = http.track_requests();
+        let terminal = Terminal::create_null(true);
+        let lines = terminal.track_lines();
+
+        fill_missing_summaries(&http, &terminal, &mut articles).await;
+
+        assert_eq!(articles[0].summary(), Some("One."));
+        assert_eq!(articles[1].summary(), Some("Two."));
+        assert!(requests.data().is_empty(), "{:?}", requests.data());
         assert!(lines.data().is_empty(), "{:?}", lines.data());
     }
 
-    #[test]
-    fn unreachable_pages_yield_no_summary() {
-        assert_eq!(summarize(Answer::send_error("connection refused")), None);
+    #[tokio::test]
+    async fn html_escapes_derived_summaries_on_the_article() {
+        let meta = summarize_html(
+            r#"<html><head>
+                <meta name="description" content="Cats &amp; dogs &lt;b&gt;bold&lt;/b&gt;">
+                </head></html>"#,
+        )
+        .await;
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some("Cats &amp; dogs &lt;b&gt;bold&lt;/b&gt;")
+        );
+        assert_eq!(meta.lines, [summary_line(&post_url())]);
+
+        let para = summarize_html(
+            "<html><body><article><p>Use &lt;script&gt;alert(1)&lt;/script&gt; &amp; care.</p></article></body></html>",
+        )
+        .await;
+        assert_eq!(
+            para.summary.as_deref(),
+            Some("Use &lt;script&gt;alert(1)&lt;/script&gt; &amp; care.")
+        );
+        assert_eq!(para.lines, [summary_line(&post_url())]);
     }
 
-    // A page that answers with an error status yields nothing, even when
-    // the error page itself carries a description.
+    #[tokio::test]
+    async fn meta_description_is_preferred_over_body_paragraphs() {
+        let out = summarize_html(
+            r#"<html><head>
+                <meta name="description" content="Meta wins">
+                </head><body><article><p>Body paragraph</p></article></body></html>"#,
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Meta wins"));
+        assert_eq!(out.lines, [summary_line(&post_url())]);
+    }
+
+    #[tokio::test]
+    async fn standard_description_beats_social_variants() {
+        let out = summarize_html(
+            r#"<html><head>
+                <meta property="og:description" content="OG desc">
+                <meta name="twitter:description" content="Tweet desc">
+                <meta name="description" content="Standard desc">
+                </head><body></body></html>"#,
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Standard desc"));
+        assert_eq!(out.lines, [summary_line(&post_url())]);
+    }
+
+    #[tokio::test]
+    async fn og_description_used_when_no_standard_description() {
+        let out = summarize_html(
+            r#"<html><head>
+                <meta name="twitter:description" content="Tweet desc">
+                <meta property="og:description" content="OG desc">
+                </head><body></body></html>"#,
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("OG desc"));
+    }
+
+    #[tokio::test]
+    async fn twitter_description_used_as_last_meta_resort() {
+        let out = summarize_html(
+            r#"<html><head>
+                <meta name="twitter:description" content="Tweet desc">
+                </head><body></body></html>"#,
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Tweet desc"));
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_meta_falls_back_to_paragraphs() {
+        let out = summarize_html(
+            r#"<html><head>
+                <meta name="description" content="   ">
+                </head><body><p>Fallback body.</p></body></html>"#,
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Fallback body."));
+    }
+
+    #[tokio::test]
+    async fn leading_paragraphs_used_when_no_meta_description() {
+        let out = summarize_html(
+            r"<html><body><article>
+                <p>First   line.</p>
+                <p>Second line.</p>
+                </article></body></html>",
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("First line. Second line."));
+        assert_eq!(out.lines, [summary_line(&post_url())]);
+    }
+
+    #[tokio::test]
+    async fn article_scope_keeps_navigation_out_of_the_summary() {
+        let out = summarize_html(
+            r"<html><body>
+                <nav><p>Home About Contact</p></nav>
+                <article><p>The actual article body.</p></article>
+                </body></html>",
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("The actual article body."));
+    }
+
+    #[tokio::test]
+    async fn main_scope_keeps_navigation_out_when_no_article_exists() {
+        let out = summarize_html(
+            r"<html><body>
+                <nav><p>Home About Contact</p></nav>
+                <main><p>The main content.</p></main>
+                </body></html>",
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("The main content."));
+    }
+
+    #[tokio::test]
+    async fn script_bodies_do_not_leak_into_the_summary() {
+        let out = summarize_html(
+            r"<html><body>
+                <script>var tracking = 1;</script>
+                <p>Readable text.</p>
+                </body></html>",
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Readable text."));
+    }
+
+    #[tokio::test]
+    async fn empty_paragraphs_are_skipped() {
+        let out = summarize_html(
+            r"<html><body><article>
+                <p></p>
+                <p>   </p>
+                <p>Real content.</p>
+                </article></body></html>",
+        )
+        .await;
+        assert_eq!(out.summary.as_deref(), Some("Real content."));
+    }
+
+    #[tokio::test]
+    async fn long_summaries_are_truncated_with_an_ellipsis() {
+        // 1000 characters, well over the cap.
+        let long = "word ".repeat(200);
+        let html = format!(
+            r#"<html><head><meta name="description" content="{long}"></head><body></body></html>"#
+        );
+        let out = summarize_html(html).await;
+        let summary = out.summary.expect("meta description present");
+        assert!(summary.chars().count() <= MAX_SUMMARY_CHARS);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn paragraph_accumulation_stops_at_the_cap() {
+        // Each paragraph has 81 characters. Twenty paragraphs exceed the cap,
+        // so accumulation stops early and truncates the result.
+        let para = format!("<p>{}</p>", "lorem ipsum dolor sit amet ".repeat(3));
+        let body = para.repeat(20);
+        let html = format!("<html><body><article>{body}</article></body></html>");
+        let out = summarize_html(html).await;
+        let summary = out.summary.expect("paragraphs present");
+        assert!(summary.chars().count() <= MAX_SUMMARY_CHARS);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn empty_page_yields_no_summary() {
+        let out = summarize_html("<html><head></head><body></body></html>").await;
+        assert_eq!(out.summary, None);
+        assert!(out.lines.is_empty(), "{:?}", out.lines);
+    }
+
+    #[tokio::test]
+    async fn accepts_html_and_absent_content_types() {
+        let page =
+            r#"<html><head><meta name="description" content="About this post."></head></html>"#;
+        for content_type in [
+            None,
+            Some("text/html"),
+            Some("text/html; charset=utf-8"),
+            Some("application/xhtml+xml"),
+            Some("TEXT/HTML"),
+        ] {
+            let answer = match content_type {
+                Some(value) => Answer::ok(page).header("content-type", value),
+                None => Answer::ok(page),
+            };
+            let out = summarize_one(answer).await;
+            assert_eq!(
+                out.summary.as_deref(),
+                Some("About this post."),
+                "{content_type:?}"
+            );
+            assert_eq!(out.lines, [summary_line(&post_url())], "{content_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_html_pages_yield_no_summary() {
+        // Carry a valid HTML description so only Content-Type rejects the page.
+        let page =
+            r#"<html><head><meta name="description" content="Should be ignored."></head></html>"#;
+        for content_type in ["application/json", "image/png", "application/rss+xml"] {
+            let out = summarize_one(Answer::ok(page).header("content-type", content_type)).await;
+            assert_eq!(out.summary, None, "{content_type}");
+            assert!(out.lines.is_empty(), "{content_type}: {:?}", out.lines);
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_pages_yield_no_summary() {
+        let page = format!(
+            r#"<html><head><meta name="description" content="Huge."></head><body>{}</body></html>"#,
+            "x".repeat(MAX_PAGE_BYTES)
+        );
+        let out = summarize_one(
+            Answer::ok(page)
+                .header("content-type", "text/html")
+                .chunked(),
+        )
+        .await;
+        assert_eq!(out.summary, None);
+        assert!(out.lines.is_empty(), "{:?}", out.lines);
+    }
+
+    #[tokio::test]
+    async fn pages_announcing_an_oversized_content_length_yield_no_summary() {
+        let page = r#"<html><head><meta name="description" content="Huge."></head></html>"#;
+        let announced = u64::try_from(MAX_PAGE_BYTES).unwrap() + 1;
+        let out = summarize_one(
+            Answer::ok(page)
+                .header("content-type", "text/html; charset=utf-8")
+                .content_length(announced),
+        )
+        .await;
+        assert_eq!(out.summary, None);
+        assert!(out.lines.is_empty(), "{:?}", out.lines);
+    }
+
+    #[tokio::test]
+    async fn unreachable_pages_yield_no_summary() {
+        let out = summarize_one(Answer::send_error("connection refused")).await;
+        assert_eq!(out.summary, None);
+        assert!(out.lines.is_empty(), "{:?}", out.lines);
+    }
+
+    // A page that answers with an error status yields no summary and prints no
+    // status line, even when the error body holds a description.
     #[hegel::test]
     fn error_statuses_yield_no_summary(tc: hegel::TestCase) {
         let status = tc.draw(generators::integers::<u16>().min_value(400).max_value(599));
         let page = r#"<html><head><meta name="description" content="Not Found"></head></html>"#;
-        assert_eq!(summarize(Answer::status(status).body(page)), None);
+        let out = block_on(summarize_one(
+            Answer::status(status)
+                .header("content-type", "text/html")
+                .body(page),
+        ));
+        assert_eq!(out.summary, None);
+        assert!(out.lines.is_empty(), "{:?}", out.lines);
     }
 
-    // Whatever the page holds, deriving a summary yields text or nothing but
+    // Whatever the page holds, deriving a summary yields text or nothing and
     // never panics.
     #[hegel::test]
     fn extract_summary_never_panics(tc: hegel::TestCase) {
@@ -438,8 +654,8 @@ mod tests {
         let _ = extract_summary(&html);
     }
 
-    // A truncated summary never exceeds the cap, is left untouched when it
-    // already fits, and is marked with an ellipsis when it is cut.
+    // A truncated summary stays within the cap, keeps short text as is, and
+    // ends with an ellipsis when cut.
     #[hegel::test]
     fn truncate_chars_respects_the_cap(tc: hegel::TestCase) {
         let text = tc.draw(generators::text());
