@@ -6,7 +6,10 @@
 //! feed document, nothing in it can fail the run: a bad link falls back,
 //! and an Entry that cannot become an Article is skipped and counted.
 
-use feed_rs::model::{Entry, Feed as Document, Link};
+use feed_rs::{
+    model::{Entry, Feed as Document, Link},
+    parser::{ParseErrorKind, ParseFeedError},
+};
 use jiff::{Timestamp, ZonedDateTime};
 use serde::Serialize;
 use thiserror::Error;
@@ -145,8 +148,206 @@ impl Article {
 ///
 /// Returns [`ParseError`] when `body` is not a valid feed document.
 pub(crate) fn parse(body: &[u8], feed: &Feed) -> Result<Source, ParseError> {
-    let document = feed_rs::parser::parse(body).map_err(ParseError)?;
+    let document = match feed_rs::parser::parse(body) {
+        Ok(document) => document,
+        // Work around feed-rs 3.1.0 failing the entire document on any empty
+        // Atom or iTunes text element (feed-rs/feed-rs#325).
+        Err(ParseFeedError::ParseError(ParseErrorKind::MissingContent {
+            reference: "text",
+            ..
+        })) => {
+            let cleaned = strip_empty_text_elements(body);
+            feed_rs::parser::parse(cleaned.as_slice()).map_err(ParseError)?
+        }
+        Err(err) => return Err(ParseError(err)),
+    };
     Ok(project(&document, feed.clone()))
+}
+
+/// Remove empty or whitespace-only Atom and iTunes text elements from raw XML
+/// bytes while preserving comments, processing instructions, and outer CDATA
+/// blocks. Operates on raw bytes so non-UTF-8 XML encodings stay intact.
+fn strip_empty_text_elements(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+
+    while i < body.len() {
+        let Some(rel) = body[i..].iter().position(|&b| b == b'<') else {
+            out.extend_from_slice(&body[i..]);
+            break;
+        };
+        out.extend_from_slice(&body[i..i + rel]);
+        i += rel;
+
+        // Copy XML comments, CDATA sections, declarations, and closing tags
+        // verbatim so tag-like text inside them is never altered.
+        if let Some(end) = delimited_end(body, i, b"<!--", b"-->")
+            .or_else(|| delimited_end(body, i, b"<![CDATA[", b"]]>"))
+        {
+            out.extend_from_slice(&body[i..end]);
+            i = end;
+            continue;
+        }
+        if matches!(body.get(i + 1), Some(b'?' | b'!' | b'/')) {
+            let end = tag_close(body, i + 2).map_or(body.len(), |p| p + 1);
+            out.extend_from_slice(&body[i..end]);
+            i = end;
+            continue;
+        }
+
+        let Some(tag_end) = tag_close(body, i + 1) else {
+            out.extend_from_slice(&body[i..]);
+            break;
+        };
+        let open_tag = &body[i..=tag_end];
+        let name_end = body[i + 1..tag_end]
+            .iter()
+            .position(|&b| b.is_ascii_whitespace() || b == b'/')
+            .map_or(tag_end, |p| i + 1 + p);
+        let name = &body[i + 1..name_end];
+        let attrs = &body[name_end..tag_end];
+
+        if !is_atom_or_itunes_text_tag(name, attrs) {
+            out.extend_from_slice(open_tag);
+            i = tag_end + 1;
+            continue;
+        }
+
+        if body[tag_end - 1] == b'/' {
+            i = tag_end + 1;
+            continue;
+        }
+
+        if let Some(after_close) = empty_element_close(body, tag_end + 1, name) {
+            i = after_close;
+            continue;
+        }
+
+        out.extend_from_slice(open_tag);
+        i = tag_end + 1;
+    }
+
+    out
+}
+
+/// If `body[start..]` begins with `open`, return the byte index right after
+/// the matching `close`, or `body.len()` if unclosed.
+fn delimited_end(body: &[u8], start: usize, open: &[u8], close: &[u8]) -> Option<usize> {
+    if !body[start..].starts_with(open) {
+        return None;
+    }
+    let search_from = start + open.len();
+    Some(
+        find_bytes(&body[search_from..], close)
+            .map_or(body.len(), |pos| search_from + pos + close.len()),
+    )
+}
+
+/// Find the closing `>` of an XML tag starting at `from`, skipping `>` inside
+/// single- or double-quoted attribute values.
+fn tag_close(body: &[u8], mut i: usize) -> Option<usize> {
+    let mut quote = None;
+    while i < body.len() {
+        let b = body[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            Some(_) | None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `name` is one of the Atom or iTunes text elements routed through
+/// `atom::handle_text` in `feed-rs`, excluding `<content src="..."/>` links.
+fn is_atom_or_itunes_text_tag(name: &[u8], attrs: &[u8]) -> bool {
+    let local = name.rsplit(|&b| b == b':').next().unwrap_or(name);
+    if local == b"content" && has_attr(attrs, b"src") {
+        return false;
+    }
+    matches!(
+        local,
+        b"title" | b"subtitle" | b"summary" | b"rights" | b"content"
+    )
+}
+
+/// Whether `attrs` contains an attribute named `target` (such as `src=`).
+fn has_attr(attrs: &[u8], target: &[u8]) -> bool {
+    let mut i = 0;
+    while i < attrs.len() {
+        while i < attrs.len() && (attrs[i].is_ascii_whitespace() || attrs[i] == b'/') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < attrs.len()
+            && !attrs[i].is_ascii_whitespace()
+            && attrs[i] != b'='
+            && attrs[i] != b'/'
+        {
+            i += 1;
+        }
+        let attr_name = &attrs[name_start..i];
+        while i < attrs.len() && attrs[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < attrs.len() && attrs[i] == b'=' {
+            if attr_name == target {
+                return true;
+            }
+            i += 1;
+            while i < attrs.len() && attrs[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if let Some(&q @ (b'"' | b'\'')) = attrs.get(i) {
+                i += 1;
+                while i < attrs.len() && attrs[i] != q {
+                    i += 1;
+                }
+                if i < attrs.len() {
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// If `body[from..]` holds only ASCII whitespace and empty/whitespace-only
+/// CDATA sections followed by `</name>`, return the byte index right after
+/// that closing tag.
+fn empty_element_close(body: &[u8], mut i: usize, name: &[u8]) -> Option<usize> {
+    loop {
+        while i < body.len() && body[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if body[i..].starts_with(b"<![CDATA[") {
+            let content_start = i + b"<![CDATA[".len();
+            let rel_end = find_bytes(&body[content_start..], b"]]>")?;
+            if !body[content_start..content_start + rel_end]
+                .iter()
+                .all(u8::is_ascii_whitespace)
+            {
+                return None;
+            }
+            i = content_start + rel_end + b"]]>".len();
+            continue;
+        }
+        break;
+    }
+
+    let rest = body[i..].strip_prefix(b"</")?.strip_prefix(name)?;
+    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    if rest.get(ws) == Some(&b'>') {
+        Some(i + 2 + name.len() + ws + 1)
+    } else {
+        None
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Project a parsed `document` for `feed` onto its Source.
@@ -891,28 +1092,30 @@ mod tests {
     // makes an Entry incomplete.
     #[test]
     fn invisible_titles_count_as_missing() {
-        for title in ["   ", "<b></b>", "<script>x</script>", "&nbsp;"] {
-            let feed_json = serde_json::json!({
-                "version": "https://jsonfeed.org/version/1.1",
-                "title": title,
-                "home_page_url": "https://example.com/",
-                "items": [
-                    {
-                        "id": "hidden",
-                        "title": title,
-                        "url": "https://example.com/hidden",
-                        "date_published": "2020-01-02T00:00:00Z",
-                    },
-                    {
-                        "id": "visible",
-                        "title": "Visible",
-                        "url": "https://example.com/visible",
-                        "date_published": "2020-01-01T00:00:00Z",
-                    },
-                ],
-            })
-            .to_string();
-            let source = parse_xml(&feed_json);
+        for title in [
+            "   ",
+            "&lt;b&gt;&lt;/b&gt;",
+            "&lt;script&gt;x&lt;/script&gt;",
+            "&amp;nbsp;",
+        ] {
+            let source = parse_xml(&format!(
+                r#"<?xml version="1.0"?>
+                <feed xmlns="http://www.w3.org/2005/Atom">
+                    <title>{title}</title>
+                    <link href="https://example.com/"/>
+                    <updated>2020-01-01T00:00:00Z</updated>
+                    <entry>
+                        <title>{title}</title>
+                        <link href="https://example.com/hidden"/>
+                        <published>2020-01-02T00:00:00Z</published>
+                    </entry>
+                    <entry>
+                        <title>Visible</title>
+                        <link href="https://example.com/visible"/>
+                        <published>2020-01-01T00:00:00Z</published>
+                    </entry>
+                </feed>"#
+            ));
             let [article] = source.articles() else {
                 panic!(
                     "expected only the visible entry for {title:?}: {:?}",
@@ -941,6 +1144,7 @@ mod tests {
         let xml = format!(
             r#"<?xml version="1.0"?>
             <feed xmlns="http://www.w3.org/2005/Atom">
+                <title></title>
                 <link href="https://example.com/"/>
                 <updated>2020-01-01T00:00:00Z</updated>
                 {SAMPLE_ENTRY}
@@ -948,6 +1152,91 @@ mod tests {
         );
         let source = parse_at(&url_str, &xml);
         assert_eq!(source.articles()[0].source_title(), url.host_str().unwrap());
+    }
+
+    // Regression tests for feed-rs/feed-rs#325: empty Atom or iTunes text
+    // elements (including empty CDATA) must not fail the whole Feed.
+    #[test]
+    fn parse_handles_empty_atom_summary_cdata() {
+        let source = parse_xml(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title>Example</title>
+                <link href="https://example.com/"/>
+                <updated>2024-05-08T00:00:00Z</updated>
+                <entry>
+                    <title>Post</title>
+                    <link href="https://example.com/post"/>
+                    <updated>2024-05-08T00:00:00Z</updated>
+                    <content type="html"><![CDATA[<p>Body copy</p>]]></content>
+                    <summary type="html"><![CDATA[]]></summary>
+                </entry>
+            </feed>"#,
+        );
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.summary(), Some("<p>Body copy</p>"));
+    }
+
+    #[test]
+    fn parse_handles_empty_itunes_summary_cdata() {
+        let source = parse_xml(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+                <channel>
+                    <title>Example Podcast</title>
+                    <link>https://example.com/</link>
+                    <description>Example</description>
+                    <item>
+                        <title>Episode 1</title>
+                        <link>https://example.com/ep1</link>
+                        <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+                        <itunes:summary>
+                            <![CDATA[]]>
+                        </itunes:summary>
+                    </item>
+                </channel>
+            </rss>"#,
+        );
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.title(), "Episode 1");
+    }
+
+    #[test]
+    fn empty_tags_inside_cdata_content_survive_scrubbing() {
+        let source = parse_xml(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+                <title></title>
+                <link href="https://example.com/"/>
+                <updated>2024-05-08T00:00:00Z</updated>
+                <entry>
+                    <title>Post</title>
+                    <link href="https://example.com/post"/>
+                    <updated>2024-05-08T00:00:00Z</updated>
+                    <content type="html"><![CDATA[<div>Keep <summary></summary> text</div>]]></content>
+                    <summary type="html"><![CDATA[]]></summary>
+                </entry>
+            </feed>"#,
+        );
+        let [article] = source.articles() else {
+            panic!("expected one article: {:?}", source.articles());
+        };
+        assert_eq!(article.source_title(), "example.com");
+        assert_eq!(
+            article.summary(),
+            Some("<div>Keep <summary></summary> text</div>")
+        );
+    }
+
+    #[hegel::test]
+    fn strip_empty_text_elements_never_panics_or_grows(tc: hegel::TestCase) {
+        let raw = tc.draw(generators::binary());
+        let cleaned = super::strip_empty_text_elements(&raw);
+        assert!(cleaned.len() <= raw.len());
     }
 
     #[test]
