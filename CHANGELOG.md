@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.8
+
+### Patch Changes
+
+- [#203](https://github.com/lukehsiao/openring-rs/pull/203) [`77309fa`](https://github.com/lukehsiao/openring-rs/commit/77309faec73c8e71d3f8bb321a2dc44f388b3e07) - **fix**: accept feeds containing empty Atom or iTunes text elements.
+  
+  `feed-rs` 3.1.0 fails to parse an entire feed when any Atom or iTunes text element (such as `<summary type="html"><![CDATA[]]></summary>`, `<title></title>`, or `<itunes:summary><![CDATA[]]></itunes:summary>`) is empty or whitespace-only. `openring` now strips those empty elements and retries parsing when `feed-rs` reports missing text, restoring feeds such as Oxide and Friends and Andy Konwinski's blog while [feed-rs/feed-rs#325](https://github.com/feed-rs/feed-rs/issues/325) is pending upstream.
+
+<pre>
+$ git-stats v0.6.7..v0.6.8
+Author      Commits  Changed Files  Insertions  Deletions  Net Δ
+Luke Hsiao        1              2        +320        -24   +296
+Total             1              2        +320        -24   +296
+</pre>
+
 ## 0.6.7
 
 ### Patch Changes
